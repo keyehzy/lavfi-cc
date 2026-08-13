@@ -10,6 +10,7 @@ import unittest
 
 from lavfi_cc.frontend import analyze_filtergraph
 from lavfi_cc.interpreter import interpret_rgba8
+from lavfi_cc.native import NativeKernel
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +148,8 @@ class FFmpegDifferentialTests(unittest.TestCase):
         )
         expected = expected_process.stdout
         observed = interpret_rgba8(analysis.ir, source, width, height)
+        with NativeKernel.compile(analysis.ir) as kernel:
+            native = kernel.process_rgba8(source, width, height)
         self.assertEqual(len(expected), width * height * 4)
         if observed != expected:
             difference = next(
@@ -159,6 +162,19 @@ class FFmpegDifferentialTests(unittest.TestCase):
             self.fail(
                 f"byte difference for {chain!r} at pixel ({x}, {y}) channel "
                 f"{'rgba'[channel]}: interpreter={observed[difference]}, "
+                f"ffmpeg={expected[difference]}"
+            )
+        if native != expected:
+            difference = next(
+                index
+                for index, (actual, oracle) in enumerate(zip(native, expected, strict=True))
+                if actual != oracle
+            )
+            pixel, channel = divmod(difference, 4)
+            x, y = pixel % width, pixel // width
+            self.fail(
+                f"byte difference for {chain!r} at pixel ({x}, {y}) channel "
+                f"{'rgba'[channel]}: native={native[difference]}, "
                 f"ffmpeg={expected[difference]}"
             )
 

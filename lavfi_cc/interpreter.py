@@ -243,8 +243,8 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
         )
     if ir.pixel_format != "rgba8":
         raise InterpreterError(f"unsupported pixel format {ir.pixel_format!r}")
-    if len(ir.operations) < 4:
-        raise InterpreterError("IR must contain a load, at least one stage, and a store")
+    if len(ir.operations) < 2:
+        raise InterpreterError("IR must contain a load and a store")
     if ir.operations[0].kind != "load_rgba8" or ir.operations[-1].kind != "store_rgba8":
         raise InterpreterError("IR must begin with load_rgba8 and end with store_rgba8")
     if ir.operations[0].parameters or ir.operations[-1].parameters:
@@ -308,6 +308,12 @@ def interpret_pixel(ir: PixelIR, pixel: tuple[int, ...] | list[int]) -> Pixel:
     """Interpret one RGBA8 pixel and return its four output channels."""
 
     return _run_pixel(_prepare(ir), _validate_pixel(pixel))
+
+
+def validate_ir(ir: PixelIR) -> None:
+    """Validate that *ir* has the executable RGBA8 reference shape."""
+
+    _prepare(ir)
 
 
 def _byte_view(value: Any, description: str, *, writable: bool) -> memoryview:
