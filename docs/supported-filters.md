@@ -47,18 +47,27 @@ and `height` therefore describe plane 0 only, and the kernel derives each other
 plane's dimensions itself from the layout it was generated for.
 
 That changes what an operation may be. One chroma sample covers several luma
-samples, so there is no single pixel whose four channels an operation could
-mix, and a subsampled layout accepts only channel-independent operations.
-`lut8` and the diagonal `levels_f32_fma` qualify; `colorchannelmixer`'s
-matrix does not. `validate_ir` enforces this for every consumer of the IR, so
-it cannot be bypassed by building the IR directly. In practice no accepted
-cross-channel filter advertises YUV anyway, so the check is a backstop rather
-than a limitation that bites.
+samples, so there is no single pixel whose luma and chroma an operation could
+mix. The rule is not that a subsampled layout accepts only
+channel-independent operations, though — that is too strong, and `hue`'s chroma
+rotation is the counterexample. What a subsampled layout cannot express is a
+mix of channels that have **no sample in common**. Cb and Cr are sampled at
+exactly the same positions in every accepted YUV format, so one loop can hold
+both.
+
+`PixelLayout.sampling_groups` partitions the stored channels by sampling shift,
+each stage declares the channel groups it reads across, and `validate_ir`
+requires each stage group to fit inside one sampling group. `lut8` and the
+diagonal `levels_f32_fma` read one channel each and fit anywhere;
+`chroma_rotate_i32` reads channels 1 and 2 and fits every accepted YUV layout;
+`colorchannelmixer`'s matrix and the `expr_f32` expression read all four and
+are refused on `yuv422p` and `yuv420p`. `validate_ir` enforces this for every
+consumer of the IR, so it cannot be bypassed by building the IR directly.
 
 Code generation and the interpreter follow the same split: a layout whose
 planes share the frame's resolution is walked one pixel at a time with all four
-channels loaded, and a subsampled layout is walked one plane at a time at that
-plane's own resolution.
+channels loaded, and a subsampled layout is walked one sampling group at a time
+at that group's own resolution.
 
 An alpha-less layout loads `a = 0` and stores only the three colour channels.
 That matches upstream: the packed `colorchannelmixer` path omits every alpha
@@ -71,12 +80,14 @@ Two rules follow from the format lists rather than from the pixel maths:
 - A region may only be fused in a format that **every** filter in it
   advertises. Otherwise FFmpeg negotiation inserts a conversion inside the
   region and one kernel is no longer equivalent to the filters it replaced.
-  `colorlevels` and `colorchannelmixer` accept `0rgb`, `0bgr`, `rgb0`, and
-  `bgr0`, which `negate` and `lutrgb` do not, so that family is outside the
-  common subset and is not offered. In the other direction, `negate` is the
-  only accepted filter that advertises YUV at all: `lutrgb`, `colorlevels`, and
-  `colorchannelmixer` are RGB-only, so a YUV run containing one of them is
-  refused rather than fused.
+  `colorlevels`, `colorchannelmixer`, `colorbalance`, `colorcontrast`, and
+  `curves` accept `0rgb`, `0bgr`, `rgb0`, and `bgr0`, which `negate` and
+  `lutrgb` do not, so that family is outside the common subset and is not
+  offered. In the other direction, `negate` is the only accepted filter that
+  advertises both families: `lutrgb`, `colorlevels`, `colorchannelmixer`,
+  `colorbalance`, `colorcontrast`, and `curves` are RGB-only and `lutyuv`,
+  `eq`, and `hue` are YUV-only, so a run mixing the two is refused rather than
+  fused.
 - A region may only be fused in a format it already works in. A pointwise
   filter is not format-agnostic: pinned `negate` over `testsrc2` does not
   produce the same bytes as `format=rgba,negate`. Fusing a run whose working
@@ -86,8 +97,8 @@ The 9–16-bit formats, the YUVA and YUVJ families, and the remaining
 subsampling ratios (`yuv411p`, `yuv410p`, `yuv440p`) are advertised by
 `negate` but are not implemented. See [`roadmap-status.md`](roadmap-status.md).
 
-All four upstream filters advertise `AVFILTER_FLAG_SLICE_THREADS`. A fused
-filter must do the same. These operations are row-local in the accepted subset,
+Every accepted upstream filter advertises `AVFILTER_FLAG_SLICE_THREADS`. A
+fused filter must do the same. These operations are row-local in the accepted subset,
 so changing the row partition must not change pixel values.
 
 On a subsampled layout the partition is not free, though: a slice boundary must
@@ -270,6 +281,138 @@ equivalent to rounding one matrix dot product. Alpha is transformed by the
 fourth row just like RGB. With `pc=none`, preserve amount `pa` is irrelevant.
 All other preserve modes are excluded from the MVP.
 
+## `curves`
+
+Source: `libavfilter/vf_curves.c`.
+
+Both slice functions are one table lookup per colour channel:
+
+```text
+out[c] = graph[c][in[c]]
+```
+
+Alpha is copied. `NB_COMP` is three, so `graph[3]` is the master curve rather
+than an alpha one and no curve ever applies to alpha. `curves` is therefore
+channel-independent and lowers to the same `Lut8` `lutrgb` lowers to.
+
+All of the work is in `config_input`, which turns key points into the tables,
+in `double`:
+
+- `parse_points_str` reads a number, steps over exactly one character, reads
+  another, and steps again, so the separators are positional rather than
+  meaningful. Coordinates outside `[0, 1]` and points that do not strictly
+  increase in `(int)(x * 255)` fail configuration. The compiler reproduces the
+  control flow but accepts only plain decimal literals, where `av_strtod` would
+  also accept SI postfixes — `0.5k` means 500 upstream.
+- `interpolate` is a natural cubic spline: a tridiagonal solve, then
+  `a + b*xx + c*xx*xx + d*xx*xx*xx` per entry, with constant padding outside
+  the first and last key points. `interpolate_pchip` is the monotonic
+  alternative, with `pchip_edge_case` derivatives at the ends and a linear
+  special case for two points.
+- `CLIP` at 8-bit depth is `av_clip_uint8` of a truncating conversion.
+- The master curve is composed on top of every colour channel afterwards,
+  `graph[i][j] = graph[3][graph[i][j]]`, whenever its point string was set at
+  all — by `master`, `m`, `psfile`, or a preset.
+- A preset only fills a component the caller left unset. `all` fills the three
+  colour components, also only where unset, and never the master.
+
+Accepted constraints:
+
+- `psfile` and `plot` are rejected: one reads a file the graph does not
+  contain, the other writes one, and neither is something a kernel does.
+- Naming both spellings of one component — `r` and `red` — is rejected rather
+  than resolved to whichever upstream parsed last.
+- The table depends on whether the compiler fuses a multiply-add. Both
+  evaluations are built and compared for all 256 entries; where they agree the
+  table is portable, and where they do not the host decides. See the note under
+  `colorbalance` below.
+
+## `colorbalance` with `pl=0`
+
+Source: `libavfilter/vf_colorbalance.c`.
+
+The first accepted filter that is not channel-independent. Each colour channel
+is scaled into `[0, 1]`, a per-pixel lightness reads all three, and each output
+reads its own channel and that lightness:
+
+```text
+r = in[R] / 255,  g = in[G] / 255,  b = in[B] / 255
+l = FFMAX3(r, g, b) + FFMIN3(r, g, b)
+out[c] = clip_uint8(lrintf(get_component(c, l, s[c], m[c], h[c]) * 255))
+```
+
+`get_component` adds three separately rounded terms to the channel value and
+clamps with `av_clipf`, where each term is the option scaled by a factor that
+depends only on `l`:
+
+```c
+s *= av_clipf((b - l) * a + 0.5f, 0.f, 1.f) * scale;      /* a = 4.f  */
+m *= av_clipf((l - b) * a + 0.5f, 0.f, 1.f)               /* b = .333f */
+   * av_clipf((1.f - l - b) * a + 0.5f, 0.f, 1.f) * scale; /* scale = .7f */
+h *= av_clipf((l + b - 1) * a + 0.5f, 0.f, 1.f) * scale;
+v += s; v += m; v += h;
+return av_clipf(v, 0.f, 1.f);
+```
+
+Neither a `Lut8` nor a `matrix4x4` expresses this, so it lowers to `expr_f32`,
+a straight-line float32 program that reproduces the operation order above
+exactly. Alpha is copied rather than computed, so the program does not store
+it.
+
+The four multiply-adds all scale by `4.f`. Scaling by a power of two is exact,
+so contracting the multiply into the add rounds the same value once either way
+and the lowering is the same on every host. `expr.multiply_is_exact` is asked
+rather than assumed, with the bound `l` actually reaches.
+
+`pl=1` runs `preservel`, which scales its multiply-adds by a computed
+saturation instead. That is not exact, so the byte would depend on the host;
+the option is rejected.
+
+Option values are floats in `[-1, 1]` and `av_opt_set` fails outside that
+range, so the compiler rejects out-of-range values rather than clamping them.
+
+## `colorcontrast`
+
+Source: `libavfilter/vf_colorcontrast.c`.
+
+Also `expr_f32`, and the filter that forced the IR to describe multiply-add
+fusion. Its `PROCESS` macro pushes each channel along three colour axes,
+weights the results, then restores the input lightness:
+
+```text
+gd = g - (b + r) * .5   bd = b - (r + g) * .5   rd = r - (g + b) * .5
+g0 = g + gd*gm   b0 = b - gd*gm   r0 = r - gd*gm      (and two more axes)
+ng = av_clipf((g0*gmw + g1*byw + g2*rcw) * scale, 0.f, 255.f)
+li = FFMAX3(r,g,b) + FFMIN3(r,g,b)
+lo = FFMAX3(nr,ng,nb) + FFMIN3(nr,ng,nb) + FLT_EPSILON
+out[c] = clip_uint8((int) lerpf(n[c], n[c] * li / lo, preserve))
+```
+
+Channels enter as raw byte values, not scaled into `[0, 1]`, and the clamps are
+against 255. The final conversion truncates toward zero. Alpha is never
+touched.
+
+Eighteen of these are multiply-adds Clang contracts at `-ffp-contract=on`: nine
+axis shifts, six weighted-sum terms, three `lerpf`s. None scales by a power of
+two, so the result differs between a host with a fused multiply-add and one
+without — 147 bytes out of the 50,331,648 the complete RGB domain covers. The
+IR states the eighteen explicitly, as `fma` where the host fuses and as
+separate operations where it does not, and the generated kernel is compiled
+with `-ffp-contract=off` so nothing else is fused. Because the choice changes
+the program, it changes the plan hash, so the two kinds of host never share a
+cached kernel.
+
+`lavfi_cc/target.py` decides which host this is from a machine table rather
+than by probing a compiler, because the analysis-only scanner must not invoke
+one; `LAVFI_CC_FUSED_MULTIPLY_ADD` overrides it, and a test checks the table
+against the real toolchain.
+
+The slice loop is `y < slice_end && sum > FLT_EPSILON`, where `sum` is
+`gmw + byw + rcw`. A weight sum at or below `FLT_EPSILON` leaves the frame
+untouched, whatever the contrast options say, and the three weights default to
+zero. The compiler emits a program that stores nothing there, which the
+identity pass removes.
+
 ## Cross-stage and platform rules
 
 - Each stage reads the previous stage's four quantized bytes, even inside a
@@ -277,7 +420,14 @@ All other preserve modes are excluded from the MVP.
 - Generated floating-point code uses `-fno-fast-math -ffp-contract=off`; the
   explicit `levels_f32_fma` operation must be implemented with an explicit
   correctly-rounded FMA or a materialized 256-entry table rather than relying
-  on ambient compiler contraction.
+  on ambient compiler contraction. The same rule is what lets `expr_f32` say
+  which multiply-adds are fused: every one it does not name as `fma` is
+  guaranteed to round twice.
+- Upstream's own bytes are not portable everywhere. `colorcontrast` and some
+  `curves` key points depend on whether the build target has a fused
+  multiply-add, so the oracle is the pinned binary **on this host**, and a
+  kernel that reproduces it is host-specific by the same amount. The plan hash
+  carries that difference, so nothing is shared across it.
 - The process must use the normal round-to-nearest environment when matching
   upstream `lrint` behavior.
 - The same pinned FFmpeg binary is the oracle on each host. Golden frames are

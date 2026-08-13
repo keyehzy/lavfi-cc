@@ -21,9 +21,11 @@ from lavfi_cc.layouts import get_layout
 
 
 #: One case per code-generation shape: the packed whole-pixel walk with every
-#: lowering, the one-plane-per-loop walk a subsampled layout needs, and the
-#: two-planes-in-one-loop walk hue's chroma rotation forces. The dimensions are
-#: odd so a chroma plane's AV_CEIL_RSHIFT rounding is exercised.
+#: lowering, the one-plane-per-loop walk a subsampled layout needs, the
+#: two-planes-in-one-loop walk hue's chroma rotation forces, and the inline
+#: float32 expression, which is the only shape that calls libm and converts a
+#: float to an integer -- both of which UBSan has something to say about. The
+#: dimensions are odd so a chroma plane's AV_CEIL_RSHIFT rounding is exercised.
 CASES = (
     (
         "format=rgba,negate=components=r+g+b+a,"
@@ -46,6 +48,14 @@ CASES = (
         "hue=h=37.5:s=1.4:b=-0.35,format=yuv420p",
         257,
         5,
+    ),
+    (
+        "format=gbrap,curves=preset=vintage:interp=pchip,"
+        "colorbalance=rs=.3:gm=-.2:bh=.5:bs=-.35,"
+        "colorcontrast=rc=.4:gm=.25:by=-.15:rcw=.9:gmw=.7:byw=.3:pl=.35,"
+        "format=gbrap",
+        257,
+        3,
     ),
 )
 
@@ -83,6 +93,7 @@ def sanitize(clang: str, graph: str, width: int, height: int) -> None:
             str(ROOT / "tests" / "native_sanitizer_harness.c"),
             "-o",
             str(executable),
+            "-lm",
         ]
         subprocess.run(command, check=True)
         environment = os.environ.copy()

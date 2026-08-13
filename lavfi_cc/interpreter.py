@@ -8,6 +8,7 @@ import math
 import struct
 from typing import Any
 
+from .expr import ExprError, ExprProgram
 from .ir import IR_VERSION, Operation, PixelIR
 from .layouts import LAYOUTS, PixelLayout, get_layout
 
@@ -21,6 +22,9 @@ _SUPPORTED_QUANTIZERS = {
     "lookup_u8",
     "truncate_toward_zero_then_saturate",
     "saturate_i32_to_u8",
+    # An expression program carries a quantizer per channel, because its
+    # channels do not have to agree on one.
+    "expression_outputs",
 }
 
 
@@ -139,7 +143,29 @@ class _ChromaRotateStage:
         return (pixel[0], _u8(rotated_u), _u8(rotated_v), pixel[3])
 
 
-Stage = _LutStage | _LevelsStage | _MixerStage | _ChromaRotateStage
+@dataclass(frozen=True)
+class _ExprStage:
+    """One straight-line float32 expression over the whole pixel."""
+
+    program: ExprProgram
+
+    @property
+    def channel_groups(self) -> tuple[tuple[int, ...], ...]:
+        """Every channel the program touches, as one group.
+
+        An expression reads across channels freely, so all of them have to be
+        in hand at once; a layout that samples them at different resolutions
+        cannot supply that and :func:`_check_sampling_groups` refuses it.
+        """
+
+        touched = self.program.channels_read | self.program.channels_written
+        return (tuple(sorted(touched)),)
+
+    def evaluate(self, pixel: Pixel) -> Pixel:
+        return self.program.evaluate(pixel)
+
+
+Stage = _LutStage | _LevelsStage | _MixerStage | _ChromaRotateStage | _ExprStage
 
 
 def _prepare_lut(operation: Operation) -> _LutStage:
@@ -330,6 +356,16 @@ def _prepare_chroma_rotate(operation: Operation) -> _ChromaRotateStage:
     return _ChromaRotateStage(cosine, sine)
 
 
+def _prepare_expr(operation: Operation) -> _ExprStage:
+    if set(operation.parameters) != {"program"}:
+        raise InterpreterError("expr_f32 accepts only the program parameter")
+    try:
+        program = ExprProgram.from_dict(operation.parameters["program"])
+    except ExprError as error:
+        raise InterpreterError(f"invalid expr_f32 program: {error}") from error
+    return _ExprStage(program)
+
+
 def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
     if ir.ir_version != IR_VERSION:
         raise InterpreterError(
@@ -365,6 +401,12 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
             if mode not in {"lookup_u8", "truncate_toward_zero_then_saturate"}:
                 raise InterpreterError(f"lut8 cannot use quantization mode {mode!r}")
             stages.append(_prepare_lut(transform))
+        elif transform.kind == "expr_f32":
+            if mode != "expression_outputs":
+                raise InterpreterError(
+                    f"expr_f32 cannot use quantization mode {mode!r}"
+                )
+            stages.append(_prepare_expr(transform))
         elif transform.kind == "chroma_rotate_i32":
             if mode != "saturate_i32_to_u8":
                 raise InterpreterError(

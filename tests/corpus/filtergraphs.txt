@@ -43,6 +43,17 @@ format=yuv444p,lutyuv=y=val*1.05:u=val*0.95+6:v=val*0.95+6,hue=h=-8
 fps=30,eq=brightness=0.05:contrast=1.1,hue=s=1.2
 format=yuv420p,eq=brightness=0.06,crop=1280:720:0:0,hue=h=12:s=1.15,negate
 
+# --- RGB grading as it is actually written, now that curves, colorbalance, ---
+#     and colorcontrast lower
+format=rgba,curves=preset=vintage,colorbalance=rs=0.1:gm=-0.1:bh=0.15,format=yuv420p
+format=rgba,colorbalance=rs=0.2:bs=-0.15:rh=-0.1:bh=0.2,colorcontrast=rc=0.3:rcw=0.8:gmw=0.4,format=yuv420p
+format=rgb24,curves=m='0/0 0.5/0.55 1/1':r='0/0.05 1/1',negate,colorlevels=rimin=0.04,format=yuv420p
+format=gbrp,colorbalance=rs=0.15:gm=0.1,curves=all='0/0 0.25/0.2 0.75/0.8 1/1',colorchannelmixer=rr=0.95:gg=0.95:bb=0.95,format=yuv420p
+format=rgba,curves=preset=increase_contrast,crop=1280:720:0:0,colorbalance=bh=0.25,colorcontrast=gm=0.2:gmw=0.6:byw=0.3,format=yuv420p
+format=rgba,lutrgb=r=val*1.05,colorbalance=rs=0.1,curves=g='0/0 1/0.95',colorlevels=bimax=0.95,format=yuv420p
+format=rgba,colorcontrast=rc=0.25:gm=-0.15:by=0.1:rcw=0.7:gmw=0.7:byw=0.7:pl=0.5,negate,format=yuv420p
+curves=preset=darker,colorbalance=rs=0.1:bh=0.1,negate
+
 # --- Accepted filters pinned to a format they do not advertise ---------------
 # eq, hue, and lutyuv are YUV-only upstream and lutrgb is RGB-only, so FFmpeg
 # converts around them and the run is not contiguous in one format.
@@ -69,9 +80,9 @@ format=rgba,boxblur=2:1,negate,format=yuv420p
 format=rgba,negate,gblur=sigma=3,lutrgb=r=val*2,format=yuv420p
 format=rgba,unsharp=5:5:1.0,colorlevels=rimin=0.05,format=yuv420p
 drawtext=text='hello':x=10:y=10,format=yuv420p
-format=rgba,curves=preset=vintage,format=yuv420p
-format=rgba,colorbalance=rs=0.1:gm=-0.1,format=yuv420p
-format=rgba,colorcontrast=rc=0.3:gm=-0.2,format=yuv420p
+format=rgba,colortemperature=temperature=5500,negate,format=yuv420p
+format=rgba,vibrance=intensity=0.4,colorlevels=rimin=0.05,format=yuv420p
+format=rgba,negate,selectivecolor=reds=0.1 0 -0.1,lutrgb=r=val*1.1,format=yuv420p
 
 # --- Options inside the subset that are still rejected -----------------------
 format=rgba,colorlevels=rimin=-0.1,negate,format=yuv420p
@@ -79,6 +90,9 @@ format=rgba,colorchannelmixer=rr=0.9:pc=lum,format=yuv420p
 format=rgba,negate=enable='between(t,10,20)',format=yuv420p
 format=rgba,lutrgb=r='if(gt(val,128),255,0)',format=yuv420p
 format=rgba,colorlevels=preserve=lum:rimin=0.1,format=yuv420p
+format=rgba,colorbalance=rs=0.2:pl=1,negate,format=yuv420p
+format=rgba,curves=psfile=grade.acv,negate,format=yuv420p
+format=rgba,curves=r='0/0 1/1':red='0/1 1/0',negate,format=yuv420p
 
 # --- Multiple chains and link labels -----------------------------------------
 [0:v]format=rgba,negate,lutrgb=r=val*1.2,format=yuv420p[v]

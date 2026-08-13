@@ -311,6 +311,9 @@ class KernelCache:
                 "library_suffix": library_suffix(),
             },
             "toolchain": toolchain,
+            # Link libraries are deliberately outside the key: they decide
+            # whether the artifact resolves, never what Clang emits, and the
+            # artifact itself is checksum-validated on every hit.
             "codegen_flags": [*BASE_COMPILER_FLAGS, link_mode],
         }
         serialized = json.dumps(

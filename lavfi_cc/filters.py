@@ -24,10 +24,16 @@ import re
 import struct
 from typing import Any, Callable
 
+from .curves import CurveError
+from .curves import build_table as build_curve_table
+from .curves import compose as compose_curves
+from .curves import parse_points as parse_curve_points
+from .expr import ExprBuilder, ExprProgram, multiply_is_exact
 from .expressions import ExpressionError, build_lut
 from .ir import CHANNELS, Operation, source_ref
 from .layouts import PixelLayout
 from .parser import FilterInvocation
+from .target import UnknownTargetError, target_fuses_multiply_add
 
 
 class LoweringError(ValueError):
@@ -833,6 +839,490 @@ def _lower_colorchannelmixer(
     return Lowered((operation, quantize), canonical)
 
 
+def _expr_operations(
+    program: ExprProgram, invocation: FilterInvocation, index: int
+) -> tuple[Operation, Operation]:
+    """Wrap one expression program in the IR's transform/quantize pair.
+
+    The quantization is per channel and already inside the program, because an
+    expression's channels need not agree on one rule; the mode here only says
+    so.
+    """
+
+    reference = source_ref(index, invocation)
+    return (
+        Operation("expr_f32", {"program": program.as_dict()}, reference),
+        Operation("quantize_rgba8", {"mode": "expression_outputs"}, reference),
+    )
+
+
+#: ``colorbalance``'s nine range options, and which logical channel each drives.
+#:
+#: Upstream names them by the colour axis each one shifts -- ``rs`` is the red
+#: end of the cyan/red range -- and passes them to ``get_component`` in the
+#: order red, green, blue.
+_COLORBALANCE_RANGES = (("r", 0), ("g", 1), ("b", 2))
+_COLORBALANCE_WEIGHTS = (("s", "shadows"), ("m", "midtones"), ("h", "highlights"))
+
+#: ``get_component``'s three constants: ``a``, ``b``, and ``scale``.
+_BALANCE_SLOPE = 4.0
+_BALANCE_PIVOT = 0.333
+_BALANCE_SCALE = 0.7
+
+#: Widest value reaching ``get_component``'s multiply by ``_BALANCE_SLOPE``.
+#:
+#: ``l`` is a sum of two channel values already divided by 255, so it lies in
+#: ``[0, 2]``, and each of the four multiplicands is ``l`` offset by a constant
+#: below one.  Two bounds every one of them.
+_BALANCE_SLOPE_OPERAND_BOUND = 2.0
+
+
+def _colorbalance_program(weights: dict[str, float]) -> ExprProgram:
+    """Transcribe ``vf_colorbalance.c``'s ``get_component`` for all three channels.
+
+    The four multiply-adds below are the only ones upstream contains, and each
+    scales by ``4.f``.  Scaling by a power of two is exact, so contracting the
+    multiply into the add rounds the same value once either way and this
+    program means the same thing whether or not the host fuses -- which is why
+    it takes no target argument.  :func:`multiply_is_exact` is asked rather
+    than asserted in a comment.
+    """
+
+    if not multiply_is_exact(_BALANCE_SLOPE, _BALANCE_SLOPE_OPERAND_BOUND):
+        raise LoweringError(
+            "target_sensitive_balance",
+            "colorbalance's multiply-adds are no longer exact, so whether the "
+            "host fuses them would decide output bytes",
+        )
+
+    builder = ExprBuilder()
+    zero = builder.const(0.0)
+    one = builder.const(1.0)
+    half = builder.const(0.5)
+    slope = builder.const(_BALANCE_SLOPE)
+    pivot = builder.const(_BALANCE_PIVOT)
+    scale = builder.const(_BALANCE_SCALE)
+    maximum = builder.const(255.0)
+
+    def scaled(difference: int) -> int:
+        """``av_clipf((difference) * a + 0.5f, 0.f, 1.f)``."""
+
+        return builder.clipf(
+            builder.add(builder.mul(difference, slope), half), zero, one
+        )
+
+    values = [builder.div(builder.channel(channel), maximum) for channel in range(3)]
+    lightness = builder.add(builder.max3(*values), builder.min3(*values))
+
+    # s *= av_clipf((b - l) * a + 0.5f, 0, 1) * scale
+    shadow_factor = builder.mul(scaled(builder.sub(pivot, lightness)), scale)
+    # m *= av_clipf((l - b) * a + .5, 0, 1) * av_clipf((1 - l - b) * a + .5, 0, 1) * scale
+    midtone_factor = builder.mul(
+        builder.mul(
+            scaled(builder.sub(lightness, pivot)),
+            scaled(builder.sub(builder.sub(one, lightness), pivot)),
+        ),
+        scale,
+    )
+    # h *= av_clipf((l + b - 1) * a + 0.5f, 0, 1) * scale
+    highlight_factor = builder.mul(
+        scaled(builder.sub(builder.add(lightness, pivot), one)), scale
+    )
+    factors = (shadow_factor, midtone_factor, highlight_factor)
+
+    outputs: dict[int, tuple[int, str]] = {}
+    for prefix, channel in _COLORBALANCE_RANGES:
+        value = values[channel]
+        for (suffix, _), factor in zip(_COLORBALANCE_WEIGHTS, factors, strict=True):
+            # v += s, then v += m, then v += h: three separate roundings.
+            weight = builder.const(weights[f"{prefix}{suffix}"])
+            value = builder.add(value, builder.mul(weight, factor))
+        clipped = builder.clipf(value, zero, one)
+        outputs[channel] = (builder.mul(clipped, maximum), "lrintf_saturate_u8")
+    # Alpha is copied rather than computed, so the program never stores it.
+    return builder.build(outputs)
+
+
+def _lower_colorbalance(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    names = {
+        f"{prefix}{suffix}"
+        for prefix, _ in _COLORBALANCE_RANGES
+        for suffix, _ in _COLORBALANCE_WEIGHTS
+    }
+    options = _check_options(invocation, names | {"pl"})
+
+    preserve = options.get("pl")
+    if preserve is not None and _parse_bool(preserve.value, "pl"):
+        raise LoweringError(
+            "unsupported_preserve",
+            "pl=1 runs preservel, whose multiply-adds are not exact, so whether "
+            "the host compiler fuses them would decide output bytes",
+            "pl",
+        )
+
+    weights = {
+        name: _float32(
+            _parse_number(options[name].value, name, -1.0, 1.0)
+            if name in options
+            else 0.0
+        )
+        for name in names
+    }
+    program = _colorbalance_program(weights)
+    canonical = "colorbalance=" + ":".join(
+        f"{prefix}{suffix}={weights[f'{prefix}{suffix}'].hex()}"
+        for prefix, _ in _COLORBALANCE_RANGES
+        for suffix, _ in _COLORBALANCE_WEIGHTS
+    ) + ":pl=0"
+    return Lowered(_expr_operations(program, invocation, index), canonical)
+
+
+#: ``colorcontrast``'s contrast axes, their weights, and the channels each
+#: difference is taken against.
+_COLORCONTRAST_OPTIONS = ("rc", "gm", "by", "rcw", "gmw", "byw", "pl")
+
+#: ``FLT_EPSILON``.  Upstream compares the weight sum against it to decide
+#: whether to touch the frame at all, and adds it to the output lightness so
+#: the division below can never be by zero.
+_FLT_EPSILON = 2.0**-23
+
+
+def _colorcontrast_program(values: dict[str, float], *, fused: bool) -> ExprProgram:
+    """Transcribe ``vf_colorcontrast.c``'s ``PROCESS`` macro.
+
+    Every multiply-add here scales by a user coefficient, so none of them is
+    exact and each one is a place where the host compiler's contraction decides
+    a byte.  ``fused`` says which way this host goes; the eighteen sites below
+    are exactly the ones Clang contracts, checked against a contracted build
+    over the complete ``256^3`` domain.
+    """
+
+    builder = ExprBuilder()
+    zero = builder.const(0.0)
+    maximum = builder.const(255.0)
+    half = builder.const(0.5)
+
+    # Loop-invariant scalars upstream computes once per slice, in float32.
+    green_magenta = builder.const(_float32(values["gm"] * 0.5))
+    blue_yellow = builder.const(_float32(values["by"] * 0.5))
+    red_cyan = builder.const(_float32(values["rc"] * 0.5))
+    green_weight = builder.const(values["gmw"])
+    blue_weight = builder.const(values["byw"])
+    red_weight = builder.const(values["rcw"])
+    total = _float32(_float32(values["gmw"] + values["byw"]) + values["rcw"])
+    scale = builder.const(_float32(1.0 / total))
+    preserve = builder.const(values["pl"])
+    epsilon = builder.const(_FLT_EPSILON)
+
+    def mul_add(left: int, right: int, addend: int) -> int:
+        return builder.multiply_add(left, right, addend, fused=fused)
+
+    def subtract_product(minuend: int, left: int, right: int) -> int:
+        """``minuend - left * right``, fused the way upstream's compiler fuses it."""
+
+        if fused:
+            return builder.fma(builder.neg(left), right, minuend)
+        return builder.sub(minuend, builder.mul(left, right))
+
+    # Channels enter as raw byte values here; unlike colorbalance nothing is
+    # normalized, and the clamps below are against 255 rather than 1.
+    red = builder.channel(0)
+    green = builder.channel(1)
+    blue = builder.channel(2)
+
+    blue_red = builder.mul(builder.add(blue, red), half)
+    green_blue = builder.mul(builder.add(green, blue), half)
+    red_green = builder.mul(builder.add(red, green), half)
+
+    green_difference = builder.sub(green, blue_red)
+    blue_difference = builder.sub(blue, red_green)
+    red_difference = builder.sub(red, green_blue)
+
+    axes = (
+        # (difference, coefficient, which channel the difference adds to)
+        (green_difference, green_magenta, 1),
+        (blue_difference, blue_yellow, 2),
+        (red_difference, red_cyan, 0),
+    )
+    # Each axis pushes one channel along its difference and pulls the other two
+    # back: g0/b0/r0 for green-magenta, then g1/b1/r1, then g2/b2/r2.
+    shifted: list[list[int]] = []
+    for difference, coefficient, toward in axes:
+        row: list[int] = []
+        for channel, base in enumerate((red, green, blue)):
+            if channel == toward:
+                row.append(mul_add(difference, coefficient, base))
+            else:
+                row.append(subtract_product(base, difference, coefficient))
+        shifted.append(row)
+
+    weights = (green_weight, blue_weight, red_weight)
+    mixed: list[int] = []
+    for channel in range(3):
+        # (x0 * gmw + x1 * byw) + x2 * rcw, contracted left to right.
+        first = builder.mul(shifted[1][channel], weights[1])
+        partial = mul_add(shifted[0][channel], weights[0], first)
+        total_terms = mul_add(shifted[2][channel], weights[2], partial)
+        mixed.append(builder.clipf(builder.mul(total_terms, scale), zero, maximum))
+
+    input_lightness = builder.add(
+        builder.max3(red, green, blue), builder.min3(red, green, blue)
+    )
+    output_lightness = builder.add(
+        builder.add(builder.max3(*mixed), builder.min3(*mixed)), epsilon
+    )
+    lightness_factor = builder.div(input_lightness, output_lightness)
+
+    outputs: dict[int, tuple[int, str]] = {}
+    for channel in range(3):
+        restored = builder.mul(mixed[channel], lightness_factor)
+        # lerpf(v0, v1, f) is v0 + (v1 - v0) * f.
+        blended = mul_add(
+            builder.sub(restored, mixed[channel]), preserve, mixed[channel]
+        )
+        outputs[channel] = (blended, "truncate_saturate_u8")
+    return builder.build(outputs)
+
+
+def _lower_colorcontrast(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    options = _check_options(invocation, set(_COLORCONTRAST_OPTIONS))
+    values: dict[str, float] = {}
+    for name in _COLORCONTRAST_OPTIONS:
+        minimum = -1.0 if name in {"rc", "gm", "by"} else 0.0
+        values[name] = _float32(
+            _parse_number(options[name].value, name, minimum, 1.0)
+            if name in options
+            else 0.0
+        )
+
+    total = _float32(_float32(values["gmw"] + values["byw"]) + values["rcw"])
+    canonical = "colorcontrast=" + ":".join(
+        f"{name}={values[name].hex()}" for name in _COLORCONTRAST_OPTIONS
+    )
+    if not total > _FLT_EPSILON:
+        # Upstream's slice loop is "y < slice_end && sum > FLT_EPSILON", so the
+        # frame is left untouched -- which is what the defaults do.
+        program = ExprBuilder().build({})
+        return Lowered(
+            _expr_operations(program, invocation, index), canonical + ":identity=1"
+        )
+
+    try:
+        fused = target_fuses_multiply_add()
+    except UnknownTargetError as error:
+        raise LoweringError("unknown_target", str(error)) from error
+    program = _colorcontrast_program(values, fused=fused)
+    return Lowered(
+        _expr_operations(program, invocation, index),
+        f"{canonical}:fused_multiply_add={int(fused)}",
+    )
+
+
+#: ``curves``' presets, verbatim from ``curves_presets`` in ``vf_curves.c``.
+#:
+#: A preset only fills a component the caller left unset, and it is expanded in
+#: ``curves_init`` before the tables are built, so it is exactly a default for
+#: the four point strings.
+_CURVES_PRESETS: dict[str, dict[str, str]] = {
+    "none": {},
+    "color_negative": {
+        "r": "0.129/1 0.466/0.498 0.725/0",
+        "g": "0.109/1 0.301/0.498 0.517/0",
+        "b": "0.098/1 0.235/0.498 0.423/0",
+    },
+    "cross_process": {
+        "r": "0/0 0.25/0.156 0.501/0.501 0.686/0.745 1/1",
+        "g": "0/0 0.25/0.188 0.38/0.501 0.745/0.815 1/0.815",
+        "b": "0/0 0.231/0.094 0.709/0.874 1/1",
+    },
+    "darker": {"master": "0/0 0.5/0.4 1/1"},
+    "increase_contrast": {
+        "master": "0/0 0.149/0.066 0.831/0.905 0.905/0.98 1/1"
+    },
+    "lighter": {"master": "0/0 0.4/0.5 1/1"},
+    "linear_contrast": {"master": "0/0 0.305/0.286 0.694/0.713 1/1"},
+    "medium_contrast": {"master": "0/0 0.286/0.219 0.639/0.643 1/1"},
+    "negative": {"master": "0/1 1/0"},
+    "strong_contrast": {
+        "master": "0/0 0.301/0.196 0.592/0.6 0.686/0.737 1/1"
+    },
+    "vintage": {
+        "r": "0/0.11 0.42/0.51 1/0.95",
+        "g": "0/0 0.50/0.48 1/1",
+        "b": "0/0.22 0.49/0.44 1/0.8",
+    },
+}
+
+#: The preset names in declaration order, so ``preset=3`` means what it does
+#: upstream, where the option is an int with named constants.
+_CURVES_PRESET_ORDER = (
+    "none",
+    "color_negative",
+    "cross_process",
+    "darker",
+    "increase_contrast",
+    "lighter",
+    "linear_contrast",
+    "medium_contrast",
+    "negative",
+    "strong_contrast",
+    "vintage",
+)
+
+#: ``curves`` gives each component two spellings for one field, so naming both
+#: would silently keep whichever came last.  They are refused instead, the way
+#: ``hue=h`` and ``hue=H`` are.
+_CURVES_COMPONENTS = (
+    ("red", "r", 0),
+    ("green", "g", 1),
+    ("blue", "b", 2),
+    ("master", "m", 3),
+)
+
+_CURVES_INTERPOLATIONS = ("natural", "pchip")
+
+
+def _curves_component_strings(
+    options: dict[str, Any]
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Resolve the four point strings the way ``curves_init`` resolves them.
+
+    An explicit component wins over ``all``, which wins over the preset; the
+    preset is the only one of the three that can set the master curve.
+    """
+
+    points: list[str | None] = [None, None, None, None]
+    for long_name, short_name, slot in _CURVES_COMPONENTS:
+        given = [name for name in (long_name, short_name) if name in options]
+        if len(given) > 1:
+            raise LoweringError(
+                "conflicting_options",
+                f"{long_name} and {short_name} are two spellings of one option, "
+                "so naming both keeps whichever upstream parsed last",
+                short_name,
+            )
+        if given:
+            points[slot] = options[given[0]].value
+
+    every = options.get("all")
+    if every is not None:
+        for slot in range(3):
+            if points[slot] is None:
+                points[slot] = every.value
+
+    preset = options.get("preset")
+    if preset is not None:
+        name = preset.value.strip().lower()
+        if name.isdigit() and int(name) < len(_CURVES_PRESET_ORDER):
+            name = _CURVES_PRESET_ORDER[int(name)]
+        if name not in _CURVES_PRESETS:
+            raise LoweringError(
+                "invalid_value",
+                f"unknown curves preset {preset.value!r}; upstream accepts "
+                + ", ".join(_CURVES_PRESET_ORDER),
+                "preset",
+            )
+        defaults = _CURVES_PRESETS[name]
+        for long_name, _, slot in _CURVES_COMPONENTS:
+            key = "master" if slot == 3 else long_name[0]
+            if points[slot] is None and key in defaults:
+                points[slot] = defaults[key]
+
+    return tuple(points)  # type: ignore[return-value]
+
+
+def _lower_curves(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    """Lower ``curves`` into the four-channel table its slice functions apply.
+
+    ``curves`` is channel-independent: ``dst[x + r] = graph[R][src[x + r]]``,
+    with alpha copied.  All of its difficulty is in ``config_input``, which
+    :mod:`lavfi_cc.curves` reproduces, so the operation this emits is the same
+    ``lut8`` ``lutrgb`` emits.
+    """
+
+    names = {name for long_name, short, _ in _CURVES_COMPONENTS for name in (long_name, short)}
+    # psfile and plot are accepted here only so the refusal below can say why.
+    options = _check_options(
+        invocation, names | {"all", "preset", "interp", "psfile", "plot"}
+    )
+
+    for rejected, reason in (
+        ("psfile", "reads a Photoshop curves file, so the tables are not in the graph"),
+        ("plot", "writes a Gnuplot script, which is a side effect a kernel has not got"),
+    ):
+        if rejected in options:
+            raise LoweringError("runtime_option", f"{rejected} {reason}", rejected)
+
+    interpolation = "natural"
+    given = options.get("interp")
+    if given is not None:
+        interpolation = given.value.strip().lower()
+        if interpolation.isdigit() and int(interpolation) < len(_CURVES_INTERPOLATIONS):
+            interpolation = _CURVES_INTERPOLATIONS[int(interpolation)]
+        if interpolation not in _CURVES_INTERPOLATIONS:
+            raise LoweringError(
+                "invalid_value",
+                f"interp must be natural or pchip, got {given.value!r}",
+                "interp",
+            )
+
+    def resolve_fusion() -> bool:
+        # Only reached by a curve that passes exactly through a byte boundary,
+        # where upstream's own output differs between hosts.
+        try:
+            return target_fuses_multiply_add()
+        except UnknownTargetError as error:
+            raise CurveError(
+                f"this curve passes exactly through a byte boundary, so its "
+                f"table depends on the host: {error}"
+            ) from error
+
+    strings = _curves_component_strings(options)
+    tables: list[tuple[int, ...]] = []
+    try:
+        master = (
+            None
+            if strings[3] is None
+            else build_curve_table(
+                parse_curve_points(strings[3], "master"),
+                interpolation,
+                "master",
+                resolve_fusion,
+            )
+        )
+        for long_name, _, slot in _CURVES_COMPONENTS[:3]:
+            points = parse_curve_points(strings[slot] or "", long_name)
+            table = build_curve_table(
+                points, interpolation, long_name, resolve_fusion
+            )
+            # config_input composes the master on top of every component, and
+            # only when its point string was set at all.
+            tables.append(table if master is None else compose_curves(table, master))
+    except CurveError as error:
+        raise LoweringError("unsupported_curve", str(error)) from error
+
+    # Alpha is copied rather than curved: NB_COMP is three, and graph[3] is the
+    # master curve, not an alpha one.
+    tables.append(_identity_table())
+    operation = Operation(
+        "lut8", {"tables": tuple(tables)}, source_ref(index, invocation)
+    )
+    quantize = Operation(
+        "quantize_rgba8", {"mode": "lookup_u8"}, source_ref(index, invocation)
+    )
+    canonical = "curves=" + ":".join(
+        f"{name}=table:{_table_hash(table)}"
+        for name, table in zip(("r", "g", "b", "a"), tables, strict=True)
+    )
+    return Lowered((operation, quantize), canonical)
+
+
 Lowerer = Callable[[FilterInvocation, int, "PixelLayout | None"], Lowered]
 
 LOWERERS: dict[str, Lowerer] = {
@@ -843,6 +1333,9 @@ LOWERERS: dict[str, Lowerer] = {
     "hue": _lower_hue,
     "colorlevels": _lower_colorlevels,
     "colorchannelmixer": _lower_colorchannelmixer,
+    "colorbalance": _lower_colorbalance,
+    "colorcontrast": _lower_colorcontrast,
+    "curves": _lower_curves,
 }
 
 SUPPORTED_FILTERS = tuple(LOWERERS)
@@ -879,6 +1372,9 @@ FILTER_FORMATS: dict[str, frozenset[str]] = {
     "hue": _YUV8,
     "colorlevels": _RGB8,
     "colorchannelmixer": _RGB8,
+    "colorbalance": _RGB8,
+    "colorcontrast": _RGB8,
+    "curves": _RGB8,
 }
 
 

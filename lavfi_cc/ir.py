@@ -140,6 +140,21 @@ class PixelIR:
                     f"cos={operation.parameters['cosine']} "
                     f"sin={operation.parameters['sine']} (16.16)"
                 )
+            elif operation.kind == "expr_f32":
+                program = operation.parameters["program"]
+                stored = [
+                    names[channel] or CHANNELS[channel]
+                    for channel, output in enumerate(program["outputs"])
+                    if output is not None
+                ]
+                fused = sum(
+                    1 for instruction in program["instructions"] if instruction[0] == "fma"
+                )
+                detail = (
+                    f"{len(program['instructions'])} float32 ops "
+                    f"({fused} fused multiply-add{'s' if fused != 1 else ''}) "
+                    f"-> {'+'.join(stored) if stored else 'nothing'}"
+                )
             elif operation.kind == "quantize_rgba8":
                 detail = f"mode={operation.parameters['mode']}"
             else:

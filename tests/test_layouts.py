@@ -25,14 +25,24 @@ WEEK5_CANDIDATES = (
 )
 
 # One chain per accepted filter plus a combined one, so every RGB layout is
-# exercised against every lowering.
+# exercised against every lowering.  colorbalance and colorcontrast are the
+# cross-channel float32 expressions: both read all three colour channels
+# through a per-pixel lightness term, which no table can express.  curves is
+# channel-independent upstream, so it is a table, but a table built by a cubic
+# spline rather than by an expression.
 RGB_CHAINS = (
     "negate",
     "lutrgb=r=val*1.125-7:g=negval:b='clip(val,13,241)'",
     "colorlevels=rimin=.05:gimax=.9:preserve=none",
     "colorchannelmixer=rr=.9:rg=.1:gg=.8:gb=.2:bb=1:aa=1:pc=none",
+    "colorbalance=rs=.3:gm=-.2:bh=.5:rm=.1:gh=.4:bs=-.35",
+    "colorcontrast=rc=.4:gm=.25:by=-.15:rcw=.9:gmw=.7:byw=.3:pl=.35",
+    "curves=r='0/0 0.5/0.4 1/1':g='0/0.1 1/0.9':b='0/0 0.3/0.5 1/1'",
+    "curves=preset=vintage:interp=pchip",
     "negate,lutrgb=r=val*1.08+2,colorlevels=rimin=.05,"
     "colorchannelmixer=rr=.9:rg=.1:ba=.3",
+    "curves=m='0/0 0.5/0.6 1/1',colorbalance=rs=.2:bh=-.4,"
+    "colorcontrast=rc=.5:rcw=1:gmw=.25,negate",
 )
 
 # negate, lutyuv, eq, and hue are the accepted filters that advertise YUV

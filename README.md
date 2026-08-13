@@ -25,15 +25,23 @@ may only be fused in a format *every* filter in it accepts:
 |---|---|---|
 | `negate` | RGB and YUV | the only one in both families |
 | `lutrgb`, `colorlevels`, `colorchannelmixer` | RGB only | refused in a YUV run |
+| `colorbalance`, `colorcontrast`, `curves` | RGB only | refused in a YUV run |
 | `lutyuv`, `eq`, `hue` | YUV only | refused in an RGB run |
 
 A run mixing the two families is not one run: FFmpeg converts around the odd
 filter out, so no single kernel is equivalent to it.
 
-`hue` rotates Cb into Cr, so it is the one accepted filter that reads across
+`hue` rotates Cb into Cr, so it is the one accepted YUV filter that reads across
 channels on a subsampled layout. That is admissible because the two chroma
 channels are sampled at the same positions; a colour matrix mixing luma with
 chroma is still refused there, since those have no sample in common.
+
+`colorbalance` and `colorcontrast` read all three colour channels through a
+per-pixel lightness term, which no table can express. They lower to `expr_f32`,
+a straight-line float32 expression that states every rounding upstream performs
+— including which multiply-adds its compiler fuses, because on some of these
+filters upstream's own bytes differ between an AArch64 build and a baseline
+x86-64 one. See [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
 Explain and lower a bounded region with:
 

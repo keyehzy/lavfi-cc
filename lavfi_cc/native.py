@@ -25,8 +25,14 @@ BASE_COMPILER_FLAGS = (
     "-O2",
     "-fPIC",
     "-fno-fast-math",
+    # An expression kernel states which multiply-adds are fused by writing
+    # fmaf, so the compiler must not fuse any of the others behind its back.
     "-ffp-contract=off",
 )
+
+#: Libraries the link needs, kept apart from the flags above because they
+#: cannot change the code Clang emits -- only whether it resolves.
+LINK_LIBRARIES = ("-lm",)
 _RUNTIME_DIRECTORY = Path(__file__).resolve().parents[1] / "runtime"
 
 
@@ -96,6 +102,11 @@ def compiler_command(
         str(source_path),
         "-o",
         str(output_path),
+        # An expression kernel calls lrintf and fmaf. Both are single
+        # instructions on a target that has them and correctly rounded libm
+        # routines where they are not, so linking libm is the only requirement
+        # either way. It is part of libSystem on Darwin, where this is inert.
+        *LINK_LIBRARIES,
     )
 
 

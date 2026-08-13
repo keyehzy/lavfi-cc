@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import struct
 from typing import Any
 
+from .expr import ExprProgram
 from .interpreter import validate_ir
 from .ir import Operation, PixelIR
 
@@ -78,11 +79,24 @@ def _identity_chroma_rotate(operation: Operation) -> bool:
     )
 
 
+def _identity_expr(operation: Operation) -> bool:
+    """An expression that stores nothing leaves every channel as it was.
+
+    ``colorcontrast`` reaches this whenever its three weights sum to no more
+    than ``FLT_EPSILON``, which is what upstream's slice loop condition tests
+    and which its defaults satisfy.
+    """
+
+    return ExprProgram.from_dict(operation.parameters["program"]).is_identity
+
+
 def _is_identity(operation: Operation) -> bool:
     if operation.kind == "lut8":
         return _identity_lut(operation)
     if operation.kind == "chroma_rotate_i32":
         return _identity_chroma_rotate(operation)
+    if operation.kind == "expr_f32":
+        return _identity_expr(operation)
     if operation.kind != "matrix4x4":
         return False
     evaluation = operation.parameters["evaluation"]
