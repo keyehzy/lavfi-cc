@@ -101,7 +101,7 @@ class NativeKernelTests(unittest.TestCase):
         cases = (
             "negate=components=r+g+b+a",
             "lutrgb=r=val*1.5-2.75:g=negval:b='clip(val,17,239)':a=val/2",
-            "colorlevels=rimin=1:rimax=0:romin=.9:romax=.1:preserve=none",
+            "colorlevels=rimin=.9:rimax=.1:romin=.8:romax=.2:preserve=none",
             "colorchannelmixer=rr=-2:rg=2:rb=.5:ra=-.5:"
             "gr=1.5:gg=-1.5:gb=.25:ga=.75:"
             "br=-.1:bg=.1:bb=1:ba=0:ar=2:ag=-2:ab=1:aa=.5:pc=none",

@@ -158,20 +158,15 @@ jobs:
           RESULT_DIR: benchmarks/results/ci-${{ matrix.id }}-filter
         run: ./benchmarks/harness/run.sh "$BENCH_MODE"
 
-      - name: Restore benchmark video
+      - name: Generate encoded benchmark fixture
         if: matrix.integration
-        id: video-cache
-        uses: actions/cache@v5
-        with:
-          path: video.mp4
-          key: video-${{ runner.os }}-dQw4w9WgXcQ-mp4-v2
-
-      - name: Download benchmark video
-        if: matrix.integration && steps.video-cache.outputs.cache-hit != 'true'
         run: |
-          python3 -m pip install --disable-pip-version-check yt-dlp
-          export PATH="$(dirname "$LAVFI_CC_FFMPEG"):$PATH"
-          yt-dlp --no-playlist -t mp4 -o "video.mp4" "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ"
+          "$LAVFI_CC_FFMPEG" \
+            -hide_banner -nostdin -loglevel error \
+            -f lavfi -i "testsrc2=size=1280x720:rate=25" \
+            -t "$REAL_DURATION" -an \
+            -c:v mpeg4 -q:v 5 -pix_fmt yuv420p \
+            -y video.mp4
 
       - name: Inspect benchmark video
         if: matrix.integration
@@ -189,6 +184,7 @@ jobs:
         run: |
           python3 scripts/benchmark-real-video.py \
             --input video.mp4 \
+            --start 0 \
             --duration "$REAL_DURATION" \
             --samples "$REAL_SAMPLES" \
             --result-dir benchmarks/results/ci-${{ matrix.id }}-real

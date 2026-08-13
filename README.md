@@ -152,16 +152,23 @@ integration tests, and records filter-only and real-video benchmark artifacts.
 Pushes and pull requests use short benchmark samples; the scheduled run and a
 manual run with `full_benchmarks` enabled use the full sample counts.
 
-The real-video benchmark input is intentionally not committed. Download it and
-reproduce the baseline-versus-fused measurement with:
+The encoded-video benchmark input is intentionally not committed. CI generates
+an encoded MP4 from FFmpeg's deterministic `testsrc2` source, avoiding a
+third-party download and any copyrighted repository or cache asset. Reproduce
+that baseline-versus-fused measurement with:
 
 ```sh
-yt-dlp --no-playlist -t mp4 -o "video.mp4" \
-  "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ"
 ./scripts/build-ffmpeg.sh
 ./scripts/build-ffmpeg-week5.sh
-python3 scripts/benchmark-real-video.py
+.build/ffmpeg-macos/bin/ffmpeg -hide_banner -nostdin -loglevel error \
+  -f lavfi -i "testsrc2=size=1280x720:rate=25" -t 30 -an \
+  -c:v mpeg4 -q:v 5 -pix_fmt yuv420p -y video.mp4
+python3 scripts/benchmark-real-video.py --start 0
 ```
+
+On Linux, replace `ffmpeg-macos` with `ffmpeg-linux`. You can also pass any
+locally owned or suitably licensed input with `--input` for a content-realistic
+benchmark.
 
 The benchmark writes commands, raw logs, metadata, per-run hashes, CSV data,
 and a Markdown summary under `benchmarks/results/`. It fails if the recorded

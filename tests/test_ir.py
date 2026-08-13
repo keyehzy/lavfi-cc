@@ -95,6 +95,10 @@ class EligibilityTests(unittest.TestCase):
         self.assert_code(graph("negate=enable='gte(t,1)'"), "runtime_option")
         self.assert_code(graph("colorlevels=rimin=-0.1"), "frame_global_extrema")
         self.assert_code(graph("colorlevels=rimin=0.1:rimax=0.101"), "degenerate_levels")
+        self.assert_code(
+            graph("colorlevels=rimin=1:rimax=0:romin=.9:romax=.1"),
+            "target_sensitive_levels",
+        )
         self.assert_code(graph("colorchannelmixer=pc=lum"), "unsupported_preserve")
 
     def test_rejects_nondeterministic_or_unsupported_lut_expression(self) -> None:

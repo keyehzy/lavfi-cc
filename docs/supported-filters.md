@@ -100,19 +100,20 @@ binary32 `fmla`, including in its vectorized packed-RGBA loop. IR v2 therefore
 records `levels_f32_fma`: compute the exact product-plus-offset and round once
 to binary32, then truncate toward zero and saturate. This distinction is
 observable for edge configurations; a reversed red range produced 25 under
-the oracle where separately rounding the product would produce 26. R, G, B,
+the oracle where separately rounding the product produced 26 on Linux. The
+frontend rejects a channel as `target_sensitive_levels` when those two legal
+evaluation modes differ after byte quantization. Accepted mappings therefore
+remain portable while IR retains explicit single-rounding semantics. R, G, B,
 and (when present) A use independent ranges. Default points are
-`input_min=output_min=0` and `input_max=output_max=1`. Native Linux correctness
-must still be checked against the pinned Linux build because compiler
-contraction is target-sensitive.
+`input_min=output_min=0` and `input_max=output_max=1`.
 
 Negative input points have special behavior: after point quantization, a
 negative `imin` or `imax` is replaced by the observed per-frame channel minimum
 or maximum. That is frame-global and not a static pixel-local operation. The
 MVP rejects negative input points. It also rejects a quantized `imax == imin`,
 which creates a degenerate coefficient, and accepts only `preserve=none`.
-Reversed but non-equal endpoints are semantically valid and produce a negative
-coefficient.
+Reversed but non-equal endpoints remain eligible when their byte mapping is
+independent of multiply-add contraction.
 
 ## `colorchannelmixer` with `pc=none`
 

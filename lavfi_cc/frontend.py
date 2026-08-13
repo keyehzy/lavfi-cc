@@ -179,6 +179,23 @@ def _float32(value: float) -> float:
     return struct.unpack("!f", struct.pack("!f", value))[0]
 
 
+def _levels_rounding_is_target_independent(
+    input_min: int, output_min: int, coefficient: float
+) -> bool:
+    """Return whether contracted and separate float32 evaluation agree as bytes."""
+
+    def quantize(value: float) -> int:
+        return max(0, min(255, int(value)))
+
+    for pixel in range(256):
+        product = (pixel - input_min) * coefficient
+        contracted = _float32(product + output_min)
+        separate = _float32(_float32(product) + output_min)
+        if quantize(contracted) != quantize(separate):
+            return False
+    return True
+
+
 def _identity_table() -> tuple[int, ...]:
     return tuple(range(256))
 
@@ -291,6 +308,13 @@ def _lower_colorlevels(invocation: FilterInvocation, index: int) -> _Lowered:
                 f"{channel}imax",
             )
         coefficient = _float32((omax - omin) / float(imax - imin))
+        if not _levels_rounding_is_target_independent(imin, omin, coefficient):
+            raise LoweringError(
+                "target_sensitive_levels",
+                f"{channel} channel produces different bytes with contracted and "
+                "separate binary32 multiply-add evaluation",
+                f"{channel}imin",
+            )
         input_min.append(imin)
         input_max.append(imax)
         output_min.append(omin)
