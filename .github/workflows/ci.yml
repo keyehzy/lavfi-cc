@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      full_benchmarks:
+        description: Run the five-sample filter and real-video benchmarks
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux / Clang 16
+            id: linux-clang-16
+            os: ubuntu-24.04
+            platform: linux
+            compiler: clang-16
+            integration: false
+          - name: Linux / Clang 17
+            id: linux-clang-17
+            os: ubuntu-24.04
+            platform: linux
+            compiler: clang-17
+            integration: false
+          - name: Linux / Clang 18
+            id: linux-clang-18
+            os: ubuntu-24.04
+            platform: linux
+            compiler: clang-18
+            integration: true
+          - name: macOS / Apple Clang
+            id: macos-apple-clang
+            os: macos-15
+            platform: macos
+            compiler: /usr/bin/clang
+            integration: true
+          - name: macOS / LLVM Clang 18
+            id: macos-clang-18
+            os: macos-15
+            platform: macos
+            compiler: /opt/homebrew/opt/llvm@18/bin/clang
+            integration: false
+
+    env:
+      CC: ${{ matrix.compiler }}
+      LAVFI_CC_CLANG: ${{ matrix.compiler }}
+      LAVFI_CC_FFMPEG: ${{ github.workspace }}/.build/ffmpeg-${{ matrix.platform }}/bin/ffmpeg
+      LAVFI_CC_WEEK5_FFMPEG: ${{ github.workspace }}/.build/ffmpeg-week5-${{ matrix.platform }}/bin/ffmpeg
+      LAVFI_CC_CACHE_DIR: ${{ runner.temp }}/lavfi-cc-${{ matrix.id }}/kernels
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Ensure selected Clang is available
+        shell: bash
+        run: |
+          if ! command -v "$CC" >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "Linux" ]]; then
+              sudo apt-get update
+              sudo apt-get install --yes "$CC"
+            else
+              brew install llvm@18
+            fi
+          fi
+          "$CC" --version
+          python3 --version
+
+      - name: Restore pinned FFmpeg builds
+        if: matrix.integration
+        id: ffmpeg-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build/ffmpeg-${{ matrix.platform }}
+            .build/ffmpeg-week5-${{ matrix.platform }}
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('.ffmpeg-revision', 'scripts/build-ffmpeg.sh', 'scripts/build-ffmpeg-week5.sh', 'ffmpeg-patch/**') }}
+
+      - name: Build stock and fused FFmpeg
+        if: matrix.integration && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          ./scripts/build-ffmpeg.sh
+          ./scripts/build-ffmpeg-week5.sh
+
+      - name: Verify cached FFmpeg builds
+        if: matrix.integration
+        run: |
+          "$LAVFI_CC_FFMPEG" -version
+          "$LAVFI_CC_WEEK5_FFMPEG" -hide_banner -h filter=fused
+
+      # Without the FFmpeg builds, only the FFmpeg differential/integration
+      # classes skip. Native compilation and cache tests still use this job's
+      # selected Clang.
+      - name: Run correctness suite
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Run generated-kernel sanitizers
+        run: python3 scripts/sanitize-week6.py
+
+      - name: Run native-kernel benchmark
+        run: python3 scripts/benchmark-week4.py
+
+      - name: Run warm-cache benchmark
+        run: python3 scripts/benchmark-week6.py
+
+      - name: Select benchmark depth
+        if: matrix.integration
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" || "${{ inputs.full_benchmarks }}" == "true" ]]; then
+            echo "BENCH_MODE=full" >> "$GITHUB_ENV"
+            echo "BENCH_FRAMES=120" >> "$GITHUB_ENV"
+            echo "REAL_DURATION=30" >> "$GITHUB_ENV"
+            echo "REAL_SAMPLES=5" >> "$GITHUB_ENV"
+          else
+            echo "BENCH_MODE=screen" >> "$GITHUB_ENV"
+            echo "BENCH_FRAMES=6" >> "$GITHUB_ENV"
+            echo "REAL_DURATION=5" >> "$GITHUB_ENV"
+            echo "REAL_SAMPLES=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Benchmark every filter chain
+        if: matrix.integration
+        env:
+          RESULT_DIR: benchmarks/results/ci-${{ matrix.id }}-filter
+        run: ./benchmarks/harness/run.sh "$BENCH_MODE"
+
+      - name: Restore benchmark video
+        if: matrix.integration
+        id: video-cache
+        uses: actions/cache@v5
+        with:
+          path: video.mp4
+          key: video-${{ runner.os }}-dQw4w9WgXcQ-mp4-v1
+
+      - name: Download benchmark video
+        if: matrix.integration && steps.video-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 -m pip install --disable-pip-version-check yt-dlp
+          yt-dlp -t mp4 -o "video.mp4" "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ"
+
+      - name: Inspect benchmark video
+        if: matrix.integration
+        shell: bash
+        run: |
+          test -s video.mp4
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum video.mp4
+          else
+            shasum -a 256 video.mp4
+          fi
+
+      - name: Run real-video baseline and fused benchmark
+        if: matrix.integration
+        run: |
+          python3 scripts/benchmark-real-video.py \
+            --input video.mp4 \
+            --duration "$REAL_DURATION" \
+            --samples "$REAL_SAMPLES" \
+            --result-dir benchmarks/results/ci-${{ matrix.id }}-real
+
+      - name: Upload benchmark results
+        if: matrix.integration && always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks-${{ matrix.id }}
+          path: |
+            benchmarks/results/ci-${{ matrix.id }}-filter
+            benchmarks/results/ci-${{ matrix.id }}-real
+          if-no-files-found: ignore
+          retention-days: 14

@@ -145,6 +145,28 @@ concurrency controls, sanitizer result, and warm-cache measurement are in
 ./scripts/test-week6.sh
 ```
 
+The GitHub Actions workflow runs the native suite with Clang 16, 17, and 18 on
+Linux, and with Apple Clang and LLVM Clang 18 on macOS. The primary compiler on
+each OS also builds both pinned FFmpeg variants, runs all differential and
+integration tests, and records filter-only and real-video benchmark artifacts.
+Pushes and pull requests use short benchmark samples; the scheduled run and a
+manual run with `full_benchmarks` enabled use the full sample counts.
+
+The real-video benchmark input is intentionally not committed. Download it and
+reproduce the baseline-versus-fused measurement with:
+
+```sh
+yt-dlp -t mp4 -o "video.mp4" \
+  "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ"
+./scripts/build-ffmpeg.sh
+./scripts/build-ffmpeg-week5.sh
+python3 scripts/benchmark-real-video.py
+```
+
+The benchmark writes commands, raw logs, metadata, per-run hashes, CSV data,
+and a Markdown summary under `benchmarks/results/`. It fails if the recorded
+baseline and fused MP4 outputs are not byte-exact.
+
 Set `LAVFI_CC_FFMPEG=/path/to/ffmpeg` to select another pinned build. The
 differential tests skip when neither that variable nor the local Week 1 build
 is available.
