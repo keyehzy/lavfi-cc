@@ -182,13 +182,19 @@ def _prepare_levels(operation: Operation) -> _LevelsStage:
 
 def _prepare_mixer(operation: Operation) -> _MixerStage:
     parameters = operation.parameters
-    expected_parameters = {
-        "evaluation",
-        "coefficients",
-        "offsets",
-        "contribution_tables",
-    }
+    evaluation = parameters.get("evaluation")
+    folded = evaluation == "sum_i32_lut_terms"
+    expected_parameters = (
+        {"evaluation", "offsets", "contribution_tables"}
+        if folded
+        else {"evaluation", "coefficients", "offsets", "contribution_tables"}
+    )
     if set(parameters) != expected_parameters:
+        if folded:
+            raise InterpreterError(
+                "folded mixer parameters must be evaluation, offsets, "
+                "and contribution_tables"
+            )
         raise InterpreterError(
             "mixer parameters must be evaluation, coefficients, offsets, "
             "and contribution_tables"
@@ -196,22 +202,32 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
     offsets = _sequence(parameters["offsets"], 4, "mixer offsets")
     if any(_integer(value, "mixer offset") != 0 for value in offsets):
         raise InterpreterError("mixer offsets must be zero")
-    coefficient_rows = _sequence(parameters["coefficients"], 4, "mixer coefficients")
-    coefficients: list[tuple[float, ...]] = []
-    for row_value in coefficient_rows:
-        row = _sequence(row_value, 4, "mixer coefficient row")
-        values: list[float] = []
-        for encoded in row:
-            if not isinstance(encoded, str):
-                raise InterpreterError("mixer coefficients must be hexadecimal strings")
-            try:
-                coefficient = float.fromhex(encoded)
-            except ValueError as error:
-                raise InterpreterError(f"invalid mixer coefficient {encoded!r}") from error
-            if not math.isfinite(coefficient) or not -2.0 <= coefficient <= 2.0:
-                raise InterpreterError("mixer coefficients must be finite and in [-2, 2]")
-            values.append(coefficient)
-        coefficients.append(tuple(values))
+    coefficients: list[tuple[float, ...]] | None = None
+    if not folded:
+        coefficient_rows = _sequence(
+            parameters["coefficients"], 4, "mixer coefficients"
+        )
+        coefficients = []
+        for row_value in coefficient_rows:
+            row = _sequence(row_value, 4, "mixer coefficient row")
+            values: list[float] = []
+            for encoded in row:
+                if not isinstance(encoded, str):
+                    raise InterpreterError(
+                        "mixer coefficients must be hexadecimal strings"
+                    )
+                try:
+                    coefficient = float.fromhex(encoded)
+                except ValueError as error:
+                    raise InterpreterError(
+                        f"invalid mixer coefficient {encoded!r}"
+                    ) from error
+                if not math.isfinite(coefficient) or not -2.0 <= coefficient <= 2.0:
+                    raise InterpreterError(
+                        "mixer coefficients must be finite and in [-2, 2]"
+                    )
+                values.append(coefficient)
+            coefficients.append(tuple(values))
 
     rows = _sequence(parameters["contribution_tables"], 4, "mixer table rows")
     prepared_rows: list[tuple[tuple[int, ...], ...]] = []
@@ -225,12 +241,21 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
                 f"mixer table {output_channel},{input_channel}",
             )
             table = tuple(_integer(entry, "mixer table entry") for entry in entries)
-            expected = tuple(
-                round(value * coefficients[output_channel][input_channel])
-                for value in range(256)
-            )
-            if table != expected:
-                raise InterpreterError("mixer contribution table does not match coefficient")
+            if folded:
+                if any(not -510 <= entry <= 510 for entry in table):
+                    raise InterpreterError(
+                        "folded mixer contribution entries must be in [-510, 510]"
+                    )
+            else:
+                assert coefficients is not None
+                expected = tuple(
+                    round(value * coefficients[output_channel][input_channel])
+                    for value in range(256)
+                )
+                if table != expected:
+                    raise InterpreterError(
+                        "mixer contribution table does not match coefficient"
+                    )
             tables.append(table)
         prepared_rows.append(tuple(tables))
     return _MixerStage(tuple(prepared_rows))
@@ -277,7 +302,10 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
                         f"levels_f32_fma cannot use quantization mode {mode!r}"
                     )
                 stages.append(_prepare_levels(transform))
-            elif evaluation == "sum_i32_terms_rounded_ties_even":
+            elif evaluation in {
+                "sum_i32_terms_rounded_ties_even",
+                "sum_i32_lut_terms",
+            }:
                 if mode != "saturate_i32_to_u8":
                     raise InterpreterError(
                         f"mixer contribution tables cannot use quantization mode {mode!r}"

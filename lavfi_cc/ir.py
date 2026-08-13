@@ -102,11 +102,15 @@ class PixelIR:
                     )
                 detail = " ".join(summaries)
             elif operation.kind == "matrix4x4":
-                detail = (
-                    f"evaluation={operation.parameters['evaluation']} "
-                    f"coefficients={operation.parameters['coefficients']} "
-                    f"offsets={operation.parameters['offsets']}"
-                )
+                evaluation = operation.parameters["evaluation"]
+                if evaluation == "sum_i32_lut_terms":
+                    detail = "evaluation=sum_i32_lut_terms tables=4x4x256"
+                else:
+                    detail = (
+                        f"evaluation={evaluation} "
+                        f"coefficients={operation.parameters['coefficients']} "
+                        f"offsets={operation.parameters['offsets']}"
+                    )
             elif operation.kind == "quantize_rgba8":
                 detail = f"mode={operation.parameters['mode']}"
             else:

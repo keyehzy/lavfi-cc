@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
 import statistics
 import sys
@@ -54,38 +55,66 @@ def main() -> int:
     size = arguments.width * arguments.height * 4
     source = bytearray((index * 73 + 19) & 0xFF for index in range(size))
     interpreted = bytearray(size)
-    native = bytearray(size)
+    uncomposed_native = bytearray(size)
+    optimized_native = bytearray(size)
 
-    compile_started = time.perf_counter()
-    with NativeKernel.compile(ir) as kernel:
-        compile_seconds = time.perf_counter() - compile_started
+    with ExitStack() as stack:
+        compile_started = time.perf_counter()
+        uncomposed_kernel = stack.enter_context(
+            NativeKernel.compile(ir, lut_composition=False)
+        )
+        uncomposed_compile_seconds = time.perf_counter() - compile_started
+        compile_started = time.perf_counter()
+        optimized_kernel = stack.enter_context(NativeKernel.compile(ir))
+        optimized_compile_seconds = time.perf_counter() - compile_started
 
         def run_interpreter() -> None:
             interpret_into(
                 ir, source, interpreted, arguments.width, arguments.height
             )
 
-        def run_native() -> None:
-            kernel.process_into(source, native, arguments.width, arguments.height)
+        def run_uncomposed_native() -> None:
+            uncomposed_kernel.process_into(
+                source, uncomposed_native, arguments.width, arguments.height
+            )
+
+        def run_optimized_native() -> None:
+            optimized_kernel.process_into(
+                source, optimized_native, arguments.width, arguments.height
+            )
 
         run_interpreter()
-        run_native()
-        if native != interpreted:
+        run_uncomposed_native()
+        run_optimized_native()
+        if uncomposed_native != interpreted or optimized_native != interpreted:
             raise SystemExit("native output differs from the reference interpreter")
         interpreter_seconds = _median_seconds(run_interpreter, arguments.samples)
-        native_seconds = _median_seconds(run_native, arguments.samples)
+        uncomposed_native_seconds = _median_seconds(
+            run_uncomposed_native, arguments.samples
+        )
+        native_seconds = _median_seconds(run_optimized_native, arguments.samples)
 
     speedup = interpreter_seconds / native_seconds
+    optimization_speedup = uncomposed_native_seconds / native_seconds
     pixels = arguments.width * arguments.height
     print(f"plan_hash\t{ir.plan_hash}")
     print(f"dimensions\t{arguments.width}x{arguments.height}")
     print(f"samples\t{arguments.samples}")
-    print(f"cold_compile_and_load_ms\t{compile_seconds * 1000:.3f}")
+    print(
+        "uncomposed_cold_compile_and_load_ms\t"
+        f"{uncomposed_compile_seconds * 1000:.3f}"
+    )
+    print(
+        "optimized_cold_compile_and_load_ms\t"
+        f"{optimized_compile_seconds * 1000:.3f}"
+    )
     print(f"interpreter_median_ms\t{interpreter_seconds * 1000:.3f}")
+    print(f"uncomposed_native_median_ms\t{uncomposed_native_seconds * 1000:.3f}")
     print(f"native_median_ms\t{native_seconds * 1000:.3f}")
     print(f"interpreter_mpix_per_s\t{pixels / interpreter_seconds / 1e6:.3f}")
     print(f"native_mpix_per_s\t{pixels / native_seconds / 1e6:.3f}")
     print(f"speedup\t{speedup:.2f}x")
+    print(f"levels_lut_mixer_fusion_speedup\t{optimization_speedup:.2f}x")
     if native_seconds >= interpreter_seconds:
         print("Week 4 performance gate failed: native was not faster", file=sys.stderr)
         return 1

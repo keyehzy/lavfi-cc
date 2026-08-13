@@ -46,10 +46,66 @@ class OptimizationPassTests(unittest.TestCase):
     def test_lut_composition_preserves_intermediate_byte_semantics(self) -> None:
         ir = require_ir(graph("lutrgb=r=val*0.5,lutrgb=r=val*0.5"))
         result = optimize_ir(ir)
-        self.assertEqual(result.changes[1], ("lut_composition", 1))
+        self.assertEqual(result.changes[2], ("lut_composition", 1))
         table = result.ir.operations[1].parameters["tables"][0]
         self.assertEqual(table[3], 0)
         self.assertEqual(table[255], 63)
+
+    def test_levels_materializes_and_composes_with_adjacent_luts(self) -> None:
+        ir = require_ir(
+            graph(
+                "negate=components=r+g+b+a,"
+                "colorlevels=rimin=.1:gimax=.9:preserve=none,"
+                "lutrgb=r=val*.75+3:g=negval"
+            )
+        )
+        result = optimize_ir(ir)
+        self.assertEqual(
+            result.changes,
+            (
+                ("identity_elimination", 0),
+                ("levels_materialization", 1),
+                ("lut_composition", 2),
+                ("lut_mixer_folding", 0),
+            ),
+        )
+        self.assertEqual(len(result.ir.operations), 4)
+        self.assertEqual(result.ir.operations[1].kind, "lut8")
+        source = bytes(
+            channel
+            for value in range(256)
+            for channel in (value, value, value, value)
+        )
+        self.assertEqual(
+            interpret_rgba8(result.ir, source, 256, 1),
+            interpret_rgba8(ir, source, 256, 1),
+        )
+
+    def test_lut_and_levels_fold_into_mixer_tables_exactly(self) -> None:
+        ir = require_ir(
+            graph(
+                "negate,lutrgb=r=val*1.125-7,"
+                "colorlevels=gimin=.1:gimax=.9:gomin=.8:gomax=.2:preserve=none,"
+                "colorchannelmixer=rr=-2:rg=2:rb=.5:ra=-.5:"
+                "gr=1.5:gg=-1.5:gb=.25:ga=.75:"
+                "br=-.1:bg=.1:bb=1:ba=0:ar=2:ag=-2:ab=1:aa=.5:pc=none"
+            )
+        )
+        result = optimize_ir(ir)
+        self.assertEqual(result.changes[1], ("levels_materialization", 1))
+        self.assertEqual(result.changes[2], ("lut_composition", 2))
+        self.assertEqual(result.changes[3], ("lut_mixer_folding", 1))
+        self.assertEqual(len(result.ir.operations), 4)
+        mixer = result.ir.operations[1]
+        self.assertEqual(mixer.parameters["evaluation"], "sum_i32_lut_terms")
+        self.assertNotIn("coefficients", mixer.parameters)
+
+        generator = random.Random(0xF01D)
+        source = bytes(generator.randrange(256) for _ in range(4096 * 4))
+        self.assertEqual(
+            interpret_rgba8(result.ir, source, 4096, 1),
+            interpret_rgba8(ir, source, 4096, 1),
+        )
 
     def test_composition_can_reveal_an_identity(self) -> None:
         ir = require_ir(
@@ -62,7 +118,12 @@ class OptimizationPassTests(unittest.TestCase):
         self.assertEqual(len(result.ir.operations), 2)
         self.assertEqual(
             result.changes,
-            (("identity_elimination", 1), ("lut_composition", 1)),
+            (
+                ("identity_elimination", 1),
+                ("levels_materialization", 0),
+                ("lut_composition", 1),
+                ("lut_mixer_folding", 0),
+            ),
         )
 
     def test_passes_can_be_disabled_independently(self) -> None:
@@ -73,7 +134,12 @@ class OptimizationPassTests(unittest.TestCase):
         self.assertEqual(result.ir.serialize(), ir.serialize())
         self.assertEqual(
             result.changes,
-            (("identity_elimination", 0), ("lut_composition", 0)),
+            (
+                ("identity_elimination", 0),
+                ("levels_materialization", 0),
+                ("lut_composition", 0),
+                ("lut_mixer_folding", 0),
+            ),
         )
 
 
@@ -90,8 +156,27 @@ class CGenerationTests(unittest.TestCase):
         self.assertEqual(first.source, second.source)
         self.assertIn(ir.plan_hash, first.source)
         self.assertIn("lavfi_compiled_kernel", first.source)
-        self.assertIn("materialized levels_f32_fma", first.source)
+        self.assertIn("typedef int16_t lavfi_i16x4", first.source)
+        self.assertIn("packed independently rounded mixer terms", first.source)
+        self.assertNotIn("materialized levels_f32_fma", first.source)
+        self.assertNotIn("[16][256]", first.source)
+        self.assertIn("input 3: direct; no contribution table", first.source)
         self.assertIn("for (int y = 0; y < height; ++y)", first.source)
+
+    def test_sparse_mixer_omits_zero_and_direct_tables(self) -> None:
+        ir = require_ir(
+            graph(
+                "colorchannelmixer=rr=.9:rg=.1:gg=.9:gb=.1:"
+                "bb=.9:br=.1:aa=1:pc=none"
+            )
+        )
+        source = generate_c(ir).source
+        self.assertIn("mixer_0_input_0[256]", source)
+        self.assertIn("mixer_0_input_1[256]", source)
+        self.assertIn("mixer_0_input_2[256]", source)
+        self.assertNotIn("mixer_0_input_3[256]", source)
+        self.assertIn("input 3: direct; no contribution table", source)
+        self.assertIn("n0 += (lavfi_i16x4){0, 0, 0, (int16_t)c3};", source)
 
 
 @unittest.skipUnless(HAS_CLANG, "Week 4 native tests require Clang")

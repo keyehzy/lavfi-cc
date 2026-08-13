@@ -176,7 +176,7 @@ def _add_pass_switches(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-lut-composition",
         action="store_true",
-        help="disable adjacent LUT composition",
+        help="disable levels materialization, LUT composition, and mixer folding",
     )
 
 

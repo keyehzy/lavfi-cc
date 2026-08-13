@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import struct
 from typing import Any
 
 from .interpreter import validate_ir
 from .ir import Operation, PixelIR
+
+
+LEVELS_EVALUATION = "levels_f32_fma"
+MIXER_EVALUATION = "sum_i32_terms_rounded_ties_even"
+FOLDED_MIXER_EVALUATION = "sum_i32_lut_terms"
+MIXER_EVALUATIONS = frozenset((MIXER_EVALUATION, FOLDED_MIXER_EVALUATION))
 
 
 @dataclass(frozen=True)
@@ -63,11 +70,45 @@ def _is_identity(operation: Operation) -> bool:
     if operation.kind != "matrix4x4":
         return False
     evaluation = operation.parameters["evaluation"]
-    if evaluation == "levels_f32_fma":
+    if evaluation == LEVELS_EVALUATION:
         return _identity_levels(operation)
-    if evaluation == "sum_i32_terms_rounded_ties_even":
+    if evaluation in MIXER_EVALUATIONS:
         return _identity_mixer(operation)
     return False
+
+
+def _f32(value: float) -> float:
+    return struct.unpack("=f", struct.pack("=f", value))[0]
+
+
+def _u8(value: int) -> int:
+    return max(0, min(255, value))
+
+
+def materialize_levels_tables(
+    operation: Operation,
+) -> tuple[tuple[int, ...], ...]:
+    """Materialize the exact byte mapping of a validated levels operation."""
+
+    parameters = operation.parameters
+    output: list[tuple[int, ...]] = []
+    for channel in range(4):
+        coefficient = _f32(float.fromhex(parameters["coefficients"][channel][channel]))
+        input_offset = parameters["offsets"][channel]["input"]
+        output_offset = parameters["offsets"][channel]["output"]
+        output.append(
+            tuple(
+                _u8(
+                    int(
+                        _f32(
+                            (value - input_offset) * coefficient + output_offset
+                        )
+                    )
+                )
+                for value in range(256)
+            )
+        )
+    return tuple(output)
 
 
 def _stages(ir: PixelIR) -> list[tuple[Operation, Operation]]:
@@ -95,6 +136,26 @@ def _remove_identities(
 ) -> tuple[list[tuple[Operation, Operation]], int]:
     kept = [stage for stage in stages if not _is_identity(stage[0])]
     return kept, len(stages) - len(kept)
+
+
+def _materialize_levels(
+    stages: list[tuple[Operation, Operation]],
+) -> tuple[list[tuple[Operation, Operation]], int]:
+    output: list[tuple[Operation, Operation]] = []
+    changes = 0
+    for transform, quantize in stages:
+        if (
+            transform.kind == "matrix4x4"
+            and transform.parameters.get("evaluation") == LEVELS_EVALUATION
+        ):
+            transform = Operation(
+                "lut8",
+                {"tables": materialize_levels_tables(transform)},
+                transform.source,
+            )
+            changes += 1
+        output.append((transform, quantize))
+    return output, changes
 
 
 def _compose_luts(
@@ -134,13 +195,65 @@ def _compose_luts(
     return output, compositions
 
 
+def _fold_lut_into_mixer(lut: Operation, mixer: Operation) -> Operation:
+    lut_tables = lut.parameters["tables"]
+    mixer_tables = mixer.parameters["contribution_tables"]
+    tables = tuple(
+        tuple(
+            tuple(
+                mixer_tables[output_channel][input_channel][
+                    lut_tables[input_channel][value]
+                ]
+                for value in range(256)
+            )
+            for input_channel in range(4)
+        )
+        for output_channel in range(4)
+    )
+    return Operation(
+        "matrix4x4",
+        {
+            "evaluation": FOLDED_MIXER_EVALUATION,
+            "offsets": [0, 0, 0, 0],
+            "contribution_tables": tables,
+        },
+        mixer.source,
+    )
+
+
+def _fold_luts_into_mixers(
+    stages: list[tuple[Operation, Operation]],
+) -> tuple[list[tuple[Operation, Operation]], int]:
+    output: list[tuple[Operation, Operation]] = []
+    changes = 0
+    index = 0
+    while index < len(stages):
+        transform, _quantize = stages[index]
+        if index + 1 < len(stages):
+            mixer, mixer_quantize = stages[index + 1]
+            if (
+                transform.kind == "lut8"
+                and mixer.kind == "matrix4x4"
+                and mixer.parameters.get("evaluation") in MIXER_EVALUATIONS
+            ):
+                output.append(
+                    (_fold_lut_into_mixer(transform, mixer), mixer_quantize)
+                )
+                changes += 1
+                index += 2
+                continue
+        output.append(stages[index])
+        index += 1
+    return output, changes
+
+
 def optimize_ir(
     ir: PixelIR,
     *,
     identity_elimination: bool = True,
     lut_composition: bool = True,
 ) -> PassResult:
-    """Run the independently switchable Week 4 optimization passes."""
+    """Run the semantics-preserving pixel optimization passes."""
 
     validate_ir(ir)
     stages = _stages(ir)
@@ -151,10 +264,16 @@ def optimize_ir(
         stages, identity_changes = _remove_identities(stages)
     changes.append(("identity_elimination", identity_changes))
 
+    levels_changes = 0
     composition_changes = 0
+    mixer_folding_changes = 0
     if lut_composition:
+        stages, levels_changes = _materialize_levels(stages)
         stages, composition_changes = _compose_luts(stages)
+        stages, mixer_folding_changes = _fold_luts_into_mixers(stages)
+    changes.append(("levels_materialization", levels_changes))
     changes.append(("lut_composition", composition_changes))
+    changes.append(("lut_mixer_folding", mixer_folding_changes))
 
     # Composition can reveal an identity (for example, two full negations).
     if identity_elimination:
@@ -162,4 +281,6 @@ def optimize_ir(
         identity_changes += newly_removed
         changes[0] = ("identity_elimination", identity_changes)
 
-    return PassResult(_with_stages(ir, stages), tuple(changes))
+    optimized = _with_stages(ir, stages)
+    validate_ir(optimized)
+    return PassResult(optimized, tuple(changes))

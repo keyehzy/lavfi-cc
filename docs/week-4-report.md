@@ -11,25 +11,39 @@ filter-throughput gate.
 
 ## Compiler pipeline
 
-`lavfi_cc.passes` implements the two independently switchable Week 4 passes:
+`lavfi_cc.passes` implements a semantics-preserving optimization pipeline with
+independent identity-elimination and table-fusion switches:
 
 - Identity elimination recognizes identity LUT, levels, and mixer stages while
   preserving metadata effects from the source filters.
+- Levels materialization converts each accepted `levels_f32_fma` mapping into
+  its exact four byte tables before stage optimization.
 - LUT composition replaces each adjacent LUT run with channel-wise table
   composition. Because every input and output is already a byte table entry,
-  this preserves each intermediate quantization boundary. A second identity
-  check removes identities exposed by composition, such as two full negations.
+  this preserves each intermediate quantization boundary.
+- A per-channel LUT directly before a mixer is folded into the mixer
+  contribution tables. The internal `sum_i32_lut_terms` evaluation records
+  that the tables are no longer described by the source matrix coefficients.
+  Mixer-to-mixer composition remains deliberately forbidden because the
+  intermediate saturation is observable.
+
+A second identity check removes identities exposed by composition, such as two
+full negations. `--no-lut-composition` disables levels materialization, LUT
+composition, and LUT-to-mixer folding together.
 
 The source IR plan hash remains the native ABI identity. The optimized IR has a
 separate diagnostic hash, so enabling a semantics-preserving pass cannot cause
 the loader to accept a kernel for a different frontend plan.
 
-`lavfi_cc.codegen` emits deterministic, readable scalar C. LUT operations use
-four 256-entry byte tables. `levels_f32_fma` is materialized as four byte tables
-at generation time, preserving the Week 3 single-rounding result without
-depending on ambient compiler contraction. Mixer stages sum their checked
-16-bit contribution tables into 32-bit temporaries before saturation. One row
-loop handles tightly packed, padded, zero, and negative strides.
+`lavfi_cc.codegen` emits deterministic C. Remaining LUT operations use four
+256-entry byte tables. Mixer data is transposed to
+`[input][value][four-output-contributions]`, using Clang four-lane `int16_t`
+vectors. A general mixer therefore performs four indexed vector loads instead
+of sixteen scalar loads. All-zero input columns allocate no table, while
+zero/identity-only columns such as alpha passthrough are constructed directly.
+The four vectors are summed before per-channel saturation; the maximum possible
+sum is safely inside `int16_t`. One row loop handles tightly packed, padded,
+zero, and negative strides.
 
 The generated translation unit is compiled with:
 
@@ -68,8 +82,8 @@ Run:
 ./scripts/test-week4.sh
 ```
 
-The 55-test suite passed against the local pinned FFmpeg build. Native kernels
-were compared with both the interpreter and raw FFmpeg output for:
+The full suite passes against the local pinned FFmpeg build. Native kernels are
+compared with both the interpreter and raw FFmpeg output for:
 
 - All 11 versioned corpus chains.
 - Four all-channel parameter-edge chains.
@@ -90,7 +104,9 @@ RGBA channel. No differences were observed.
 Environment: macOS 15.7.7 arm64; Apple Clang 17.0.0; pinned FFmpeg `n8.1.2`.
 The checked benchmark uses a deterministic 256x144 RGBA frame and a four-stage
 negate/LUT/levels/mixer chain. It performs one correctness/warm-up invocation
-and reports the median of five preallocated-buffer runs.
+and reports the median of five preallocated-buffer runs. It now reports both an
+uncomposed native kernel and the optimized levels/LUT/mixer kernel, and checks
+both against the interpreter before timing them.
 
 ```text
 cold compile and load       304.276 ms
@@ -98,6 +114,12 @@ interpreter median          114.826 ms       0.321 MPix/s
 native median                 0.112 ms     328.167 MPix/s
 native/interpreter speedup  1022.19x
 ```
+
+After levels/LUT/mixer folding and packed mixer code generation, the same
+checked 256x144 benchmark measured 0.071 ms with composition disabled and
+0.027 ms with it enabled, a 2.63x kernel speedup. A native-only 1920x1080 run
+measured 4.903 ms versus 1.394 ms, or 3.52x. These are local directional
+measurements; CI remains the cross-platform performance record.
 
 The cold compile is below the one-second MVP target, and the native kernel is
 unambiguously faster than the deliberately scalar Python oracle. The large

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import struct
 
 from .ir import Operation, PixelIR
-from .passes import PassResult, optimize_ir
+from .passes import (
+    LEVELS_EVALUATION,
+    MIXER_EVALUATIONS,
+    PassResult,
+    materialize_levels_tables,
+    optimize_ir,
+)
 
 
 @dataclass(frozen=True)
@@ -15,14 +20,6 @@ class GeneratedC:
     plan_hash: str
     optimized_plan_hash: str
     passes: PassResult
-
-
-def _f32(value: float) -> float:
-    return struct.unpack("=f", struct.pack("=f", value))[0]
-
-
-def _u8(value: int) -> int:
-    return max(0, min(255, value))
 
 
 def _format_table(
@@ -39,26 +36,61 @@ def _format_table(
     return lines
 
 
-def _levels_tables(operation: Operation) -> tuple[tuple[int, ...], ...]:
-    parameters = operation.parameters
-    output: list[tuple[int, ...]] = []
-    for channel in range(4):
-        coefficient = _f32(float.fromhex(parameters["coefficients"][channel][channel]))
-        input_offset = parameters["offsets"][channel]["input"]
-        output_offset = parameters["offsets"][channel]["output"]
-        output.append(
-            tuple(
-                _u8(
-                    int(
-                        _f32(
-                            (value - input_offset) * coefficient + output_offset
-                        )
-                    )
-                )
-                for value in range(256)
-            )
+MixerColumn = tuple[tuple[int, int, int, int], ...]
+
+
+def _format_vector_table(name: str, entries: MixerColumn) -> list[str]:
+    lines = [f"static const lavfi_i16x4 {name}[256] = {{"]
+    for start in range(0, 256, 4):
+        values = ", ".join(
+            "{" + ", ".join(str(value) for value in entry) + "}"
+            for entry in entries[start : start + 4]
         )
-    return tuple(output)
+        lines.append(f"    {values},")
+    lines.append("};")
+    return lines
+
+
+def _mixer_columns(operation: Operation) -> tuple[MixerColumn, ...]:
+    tables = operation.parameters["contribution_tables"]
+    return tuple(
+        tuple(
+            tuple(tables[output][input_][value] for output in range(4))
+            for value in range(256)
+        )
+        for input_ in range(4)
+    )
+
+
+def _mixer_column_mode(column: MixerColumn) -> str:
+    zero = (0,) * 256
+    identity = tuple(range(256))
+    output_tables = tuple(
+        tuple(entry[output] for entry in column) for output in range(4)
+    )
+    if all(table == zero for table in output_tables):
+        return "zero"
+    if all(table in (zero, identity) for table in output_tables):
+        return "direct"
+    return "table"
+
+
+def _direct_mixer_vector(input_: int, column: MixerColumn) -> str:
+    zero = (0,) * 256
+    lanes = [
+        "0"
+        if tuple(entry[output] for entry in column) == zero
+        else f"(int16_t)c{input_}"
+        for output in range(4)
+    ]
+    return "(lavfi_i16x4){" + ", ".join(lanes) + "}"
+
+
+def _is_mixer(operation: Operation) -> bool:
+    return (
+        operation.kind == "matrix4x4"
+        and operation.parameters.get("evaluation") in MIXER_EVALUATIONS
+    )
 
 
 def _stage_declarations(stages: list[Operation]) -> list[str]:
@@ -68,23 +100,35 @@ def _stage_declarations(stages: list[Operation]) -> list[str]:
             lines.append(f"/* stage {index}: four independent byte lookup tables */")
             rows = tuple(tuple(row) for row in operation.parameters["tables"])
             lines.extend(_format_table(f"lut_{index}", "uint8_t", rows))
-        elif operation.parameters["evaluation"] == "levels_f32_fma":
+        elif operation.parameters["evaluation"] == LEVELS_EVALUATION:
             lines.append(
                 f"/* stage {index}: materialized levels_f32_fma (single-rounding oracle) */"
             )
             lines.extend(
-                _format_table(f"levels_{index}", "uint8_t", _levels_tables(operation))
+                _format_table(
+                    f"levels_{index}",
+                    "uint8_t",
+                    materialize_levels_tables(operation),
+                )
             )
-        else:
+        elif _is_mixer(operation):
             lines.append(
-                f"/* stage {index}: independently ties-to-even-rounded mixer terms */"
+                f"/* stage {index}: packed independently rounded mixer terms */"
             )
-            rows = tuple(
-                tuple(table)
-                for output_row in operation.parameters["contribution_tables"]
-                for table in output_row
-            )
-            lines.extend(_format_table(f"mixer_{index}", "int16_t", rows))
+            for input_, column in enumerate(_mixer_columns(operation)):
+                mode = _mixer_column_mode(column)
+                if mode == "table":
+                    lines.extend(
+                        _format_vector_table(
+                            f"mixer_{index}_input_{input_}", column
+                        )
+                    )
+                else:
+                    lines.append(
+                        f"/* input {input_}: {mode}; no contribution table */"
+                    )
+        else:
+            raise ValueError(f"unsupported code-generation stage {operation.kind!r}")
         lines.append("")
     return lines
 
@@ -95,21 +139,29 @@ def _stage_body(index: int, operation: Operation) -> list[str]:
             f"            c{channel} = lut_{index}[{channel}][c{channel}];"
             for channel in range(4)
         ]
-    if operation.parameters["evaluation"] == "levels_f32_fma":
+    if operation.parameters["evaluation"] == LEVELS_EVALUATION:
         return [
             f"            c{channel} = levels_{index}[{channel}][c{channel}];"
             for channel in range(4)
         ]
 
-    lines = []
-    for output in range(4):
-        terms = " + ".join(
-            f"mixer_{index}[{output * 4 + input_}][c{input_}]"
-            for input_ in range(4)
-        )
-        lines.append(f"            int32_t n{index}_{output} = {terms};")
+    if not _is_mixer(operation):
+        raise ValueError(f"unsupported code-generation stage {operation.kind!r}")
+
+    lines = [
+        f"            lavfi_i16x4 n{index} = (lavfi_i16x4){{0, 0, 0, 0}};"
+    ]
+    for input_, column in enumerate(_mixer_columns(operation)):
+        mode = _mixer_column_mode(column)
+        if mode == "table":
+            term = f"mixer_{index}_input_{input_}[c{input_}]"
+        elif mode == "direct":
+            term = _direct_mixer_vector(input_, column)
+        else:
+            continue
+        lines.append(f"            n{index} += {term};")
     lines.extend(
-        f"            c{channel} = lavfi_saturate_i32(n{index}_{channel});"
+        f"            c{channel} = lavfi_saturate_i32(n{index}[{channel}]);"
         for channel in range(4)
     )
     return lines
@@ -130,12 +182,7 @@ def generate_c(
     )
     body = passes.ir.operations[1:-1]
     stages = [body[index] for index in range(0, len(body), 2)]
-    uses_mixer = any(
-        operation.kind == "matrix4x4"
-        and operation.parameters["evaluation"]
-        == "sum_i32_terms_rounded_ties_even"
-        for operation in stages
-    )
+    uses_mixer = any(_is_mixer(operation) for operation in stages)
 
     lines = [
         "/* Generated by lavfi-cc. This file is deterministic for its input IR. */",
@@ -147,6 +194,8 @@ def generate_c(
     if uses_mixer:
         lines.extend(
             [
+                "typedef int16_t lavfi_i16x4 __attribute__((ext_vector_type(4)));",
+                "",
                 "static inline uint8_t lavfi_saturate_i32(int32_t value)",
                 "{",
                 "    if (value < 0)",
