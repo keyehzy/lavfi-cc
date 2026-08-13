@@ -51,26 +51,30 @@ What this added over the explicit-boundary path:
 A run is only fused when its format is one the backend implements natively.
 Everything else is reported and refused — see the correctness note above.
 
-## 2. Widen pixel-format reach — done for packed 8-bit, deferred above that
+## 2. Widen pixel-format reach — done for all 8-bit RGB, deferred above that
 
-Supported today: `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, `bgr24`.
+Supported today: packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, `bgr24`, and
+planar `gbrp`, `gbrap`.
 
-The byte offsets in `lavfi_cc/layouts.py` were taken from the pinned binary
-rather than from format descriptors, by converting one known `0x11223344` pixel
-into each format and reading the bytes back.
+The byte offsets and the planar plane order in `lavfi_cc/layouts.py` were taken
+from the pinned binary rather than from format descriptors, by converting one
+known `0x11223344` pixel into each format and reading the bytes back.
 
 The reduction that makes this cheap: the operations are layout-independent, so
-only the load and store ends change. An alpha-less layout loads `a = 0` and
-stores only three components, which is exactly what upstream does — the packed
-`colorchannelmixer` omits every alpha term when `have_alpha` is unset, and the
-other accepted filters treat channels independently, so an alpha lane that is
-never stored cannot affect the stored ones.
+only the load and store ends change. Both families share one addressing scheme
+— a channel lives in some plane at some offset, with samples `step` bytes apart
+— so packed is simply the one-plane case. An alpha-less layout loads `a = 0`
+and stores only three components, which is exactly what upstream does: the
+`colorchannelmixer` templates omit every alpha term when `have_alpha` is unset,
+and the other accepted filters treat channels independently, so an alpha lane
+that is never stored cannot affect the stored ones.
 
-Because all six are one plane addressed by one stride, the kernel ABI did not
-change; only new format identifiers were added, and `vf_fused.c` now negotiates
-the single format its loaded kernel was built for.
+**Kernel ABI 2** replaced the single plane and stride with per-plane arrays
+shaped like `AVFrame`'s `data[]` and `linesize[]`. Packed kernels use index 0
+and ignore the rest, so one entry point and one slice loop now serve both
+families. This is the change item 4 also needs.
 
-Two format-dependent constraints were found and are enforced:
+Three format-dependent constraints were found and are enforced:
 
 - A run may only be fused in a format that *every* filter in it advertises,
   otherwise FFmpeg converts in the middle of the run and one kernel is no longer
@@ -79,11 +83,15 @@ Two format-dependent constraints were found and are enforced:
   family is outside the common subset.
 - `negate=components=…a` on an alpha-less format is a hard configuration
   failure upstream, not a silent no-op, so the compiler rejects it too.
+- `negate_alpha` sets a *plane* mask that only packed RGB ignores. On `gbrap`
+  it really does negate alpha, so the same option means different things in
+  different layouts. The compiler accepts it where it provably has no alpha
+  effect and rejects it on `gbrap`, pointing at `components=r+g+b+a` instead.
+  Supporting it there needs the lowering to become layout-aware, which is a
+  signature change across all four lowerers rather than a semantics question.
 
-**Deferred:** planar `gbrp`/`gbrap` and the 9–16-bit formats. Both need the
-kernel ABI to carry per-plane pointers and strides instead of one plane, which
-is the same ABI change item 4 needs. High-depth additionally needs 65536-entry
-tables and a re-derivation of every quantization rule at that depth.
+**Deferred:** the 9–16-bit formats, which need 65536-entry tables and a
+re-derivation of every quantization rule at that depth.
 
 ## 3. More pointwise filters — not started, with one finding that reshapes it
 
@@ -127,10 +135,12 @@ island fuses in place with no conversion at either boundary, which is what
 FFmpeg already does. Bit-exactness is then against the filters, which is
 tractable, instead of against swscale, which is not.
 
-Prerequisites: the plane-pointer ABI change shared with item 2's planar work,
-plus chroma subsampling in the IR (a `yuv420p` island applies its Y mapping at
-full resolution and its U/V mappings at half, so "one pixel" is no longer one
-loop iteration).
+The plane-pointer prerequisite is now **met**: kernel ABI 2 passes per-plane
+arrays, `vf_fused.c` slices every plane, and `gbrp`/`gbrap` exercise the path
+end to end. What remains specific to YUV is chroma subsampling in the IR — a
+`yuv420p` island applies its Y mapping at full resolution and its U/V mappings
+at half, so "one pixel" is no longer one loop iteration, and `width`/`height`
+can no longer describe every plane the way they do for the RGB layouts.
 
 The scanner already quantifies why this ranks first — see below.
 
@@ -147,23 +157,22 @@ Against the 40-graph corpus in `tests/corpus/filtergraphs.txt`:
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt
   graphs scanned:            40
   islands found:             29
-  islands fusible today:     21
-  frame passes eliminated:   19
-  frame passes blocked:      10
+  islands fusible today:     22
+  frame passes eliminated:   21
+  frame passes blocked:      8
   blocked passes by working format:
     negotiated   6 passes across 6 islands
     yuv420p      2 passes across 1 island
-    gbrp         2 passes across 1 island
 ```
 
 Blockers are ranked by the frame passes they withhold rather than by how often
-they appear, which is what makes the output actionable. On this corpus the
-largest single blocker is islands whose format negotiation decides — the case
-item 4 addresses — followed by planar and YUV formats. That is the evidence
-behind the ordering recommended at the end of this document.
+they appear, which is what makes the output actionable. Every remaining blocked
+pass on this corpus is now either an island whose format negotiation decides or
+a YUV island — both item 4. That is the evidence behind the ordering
+recommended at the end of this document.
 
-Adding `rgb24` support in item 2 moved this corpus from 17 to 19 eliminated
-passes and dropped blocked passes from 12 to 10.
+Item 2's format work moved this corpus from 17 eliminated passes to 19 with
+`rgb24`, then to 21 with planar `gbrp`, dropping blocked passes from 12 to 8.
 
 ## 6. Build-time integration — done for the compiler, unchanged for the patch
 
@@ -198,13 +207,14 @@ silently ignored on rebuild.
 
 ## Recommended order from here
 
-1. **Plane-pointer kernel ABI.** One change unblocks planar `gbrp`/`gbrap`
-   (item 2) and all of item 4. Nothing else in items 2–4 can proceed far
-   without it.
-2. **Planar YUV islands** (item 4), including subsampling. The scanner says
-   negotiated and YUV islands hold the most blocked passes, and this is what
-   makes `lutyuv`, `eq`, and `hue` reachable.
-3. **A cross-channel float IR operation** (item 3), which unlocks
+1. **Planar YUV islands** (item 4), including subsampling. The plane-pointer
+   ABI it needed is done, so what is left is subsampling in the IR. Every
+   blocked pass left on the corpus is one of these, and this is what makes
+   `lutyuv`, `eq`, and `hue` reachable.
+2. **A cross-channel float IR operation** (item 3), which unlocks
    `colorbalance`, `colorcontrast`, and `curves` together rather than one at a
    time.
+3. **Layout-aware lowering**, a small signature change that would let `gbrap`
+   accept `negate_alpha` instead of rejecting it, and that every
+   format-dependent option after it will want.
 4. **High-depth formats**, last: the widest change for the least corpus reach.

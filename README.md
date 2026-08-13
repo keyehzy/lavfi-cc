@@ -1,17 +1,18 @@
 # lavfi-cc
 
 `lavfi-cc` is an experimental compiler for fusing compatible FFmpeg video
-filters into one native kernel over a packed 8-bit RGB frame. The repository
+filters into one native kernel over an 8-bit RGB frame. The repository
 has completed the Week 5 FFmpeg-integration and Week 6 cache/operational-safety
 milestones described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md), plus the reach
 work recorded in [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
-Accepted layouts are `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24`. A
-run is only fused when it already works in one of them: a pointwise filter
-produces different bytes in different pixel formats, so fusing a YUV or
-negotiation-decided run into an RGB kernel would change the output. Runs that
-cannot be fused are reported rather than guessed at.
+Accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and
+`bgr24`, and the planar `gbrp` and `gbrap`. A run is only fused when it already
+works in one of them: a pointwise filter produces different bytes in different
+pixel formats, so fusing a YUV or negotiation-decided run into an RGB kernel
+would change the output. Runs that cannot be fused are reported rather than
+guessed at.
 
 Explain and lower a bounded region with:
 

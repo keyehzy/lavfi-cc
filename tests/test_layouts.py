@@ -56,16 +56,41 @@ def week5_ffmpeg_path() -> Path | None:
 
 
 class LayoutTableTests(unittest.TestCase):
-    def test_offsets_are_a_permutation_within_the_pixel(self) -> None:
+    def test_packed_offsets_are_a_permutation_within_the_pixel(self) -> None:
         for name, layout in LAYOUTS.items():
+            if layout.planar:
+                continue
             with self.subTest(layout=name):
                 offsets = [value for value in layout.offsets if value is not None]
                 self.assertEqual(sorted(offsets), list(range(layout.step)))
+                self.assertEqual(layout.plane_count, 1)
+
+    def test_planar_layouts_use_one_plane_per_channel(self) -> None:
+        for name in ("gbrp", "gbrap"):
+            with self.subTest(layout=name):
+                layout = get_layout(name)
+                self.assertTrue(layout.planar)
+                self.assertEqual(layout.step, 1)
+                planes = [value for value in layout.planes if value is not None]
+                self.assertEqual(sorted(planes), list(range(layout.plane_count)))
+                self.assertTrue(all(offset in (0, None) for offset in layout.offsets))
+        # Plane 0 is green, 1 is blue, 2 is red.
+        self.assertEqual(get_layout("gbrp").planes, (2, 0, 1, None))
 
     def test_alpha_less_layouts_store_only_three_components(self) -> None:
         self.assertEqual(get_layout("rgb24").stored_channels, (0, 1, 2))
         self.assertEqual(get_layout("rgba").stored_channels, (0, 1, 2, 3))
+        self.assertEqual(get_layout("gbrp").stored_channels, (0, 1, 2))
         self.assertFalse(get_layout("bgr24").has_alpha)
+        self.assertTrue(get_layout("gbrap").has_alpha)
+
+    def test_frame_size_covers_every_plane(self) -> None:
+        self.assertEqual(get_layout("rgba").frame_size(4, 2), 32)
+        self.assertEqual(get_layout("rgb24").frame_size(4, 2), 24)
+        self.assertEqual(get_layout("gbrp").frame_size(4, 2), 24)
+        self.assertEqual(get_layout("gbrap").frame_size(4, 2), 32)
+        # Planes of a tightly packed frame sit back to back.
+        self.assertEqual(get_layout("gbrp").plane_origin(2, 4, 2), 16)
 
     def test_unknown_layout_is_rejected(self) -> None:
         with self.assertRaises(KeyError):
@@ -90,6 +115,24 @@ class LayoutAnalysisTests(unittest.TestCase):
             for name in LAYOUTS
         }
         self.assertEqual(len(set(hashes.values())), len(LAYOUTS))
+
+    def test_negate_alpha_is_refused_where_it_would_negate_alpha(self) -> None:
+        # A plane mask means the legacy option really does negate alpha on
+        # planar RGB, unlike packed RGB where the component mask wins.
+        analysis = analyze_filtergraph(
+            "format=gbrap,negate=negate_alpha=1,negate,format=gbrap"
+        )
+        self.assertFalse(analysis.eligible)
+        self.assertEqual(analysis.diagnostics[0].code, "planar_negate_alpha")
+        # Packed RGB ignores it, and gbrp has no alpha plane to negate.
+        for layout in ("rgba", "gbrp"):
+            with self.subTest(layout=layout):
+                self.assertTrue(
+                    analyze_filtergraph(
+                        f"format={layout},negate=negate_alpha=1,negate,"
+                        f"format={layout}"
+                    ).eligible
+                )
 
     def test_negate_alpha_is_refused_on_an_alpha_less_layout(self) -> None:
         # Upstream fails to configure this graph, so the compiler must not
@@ -130,7 +173,7 @@ class LayoutDifferentialTests(unittest.TestCase):
 
     def frame(self, layout: str, seed: int) -> bytes:
         generator = random.Random(seed)
-        size = self.WIDTH * self.HEIGHT * get_layout(layout).step
+        size = get_layout(layout).frame_size(self.WIDTH, self.HEIGHT)
         return bytes(generator.randrange(256) for _ in range(size))
 
     def test_interpreter_matches_ffmpeg_for_every_layout(self) -> None:
@@ -190,13 +233,13 @@ class LayoutEndToEndTests(unittest.TestCase):
             "-pix_fmt", layout, "-f", "rawvideo", "pipe:1",
         ]
 
-    def test_wrapper_is_bit_exact_for_every_packed_layout(self) -> None:
+    def test_wrapper_is_bit_exact_for_every_layout(self) -> None:
         generator = random.Random(0xB17E)
         for name in LAYOUTS:
             layout = get_layout(name)
             source = bytes(
                 generator.randrange(256)
-                for _ in range(self.WIDTH * self.HEIGHT * layout.step)
+                for _ in range(layout.frame_size(self.WIDTH, self.HEIGHT))
             )
             graph = f"format={name},{self.CHAIN},format={name}"
             arguments = self.arguments(name, graph)
@@ -219,7 +262,7 @@ class LayoutEndToEndTests(unittest.TestCase):
                 self.assertEqual(fused.returncode, 0, fused.stderr.decode())
                 self.assertEqual(
                     len(baseline.stdout),
-                    self.WIDTH * self.HEIGHT * layout.step,
+                    layout.frame_size(self.WIDTH, self.HEIGHT),
                 )
                 self.assertEqual(fused.stdout, baseline.stdout)
 

@@ -409,45 +409,65 @@ def interpret_into(
     if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
         raise InterpreterError("height must be a positive integer")
     layout = get_layout(ir.layout)
-    row_bytes = width * layout.step
+    row_bytes = layout.row_bytes(width)
     source_stride = row_bytes if source_stride is None else source_stride
     destination_stride = row_bytes if destination_stride is None else destination_stride
     source_view = _byte_view(source, "source", writable=False)
     destination_view = _byte_view(destination, "destination", writable=True)
     if source_view.obj is destination_view.obj:
         raise InterpreterError("source and destination must use distinct buffers")
-    _validate_layout(
-        len(source_view), source_offset, source_stride, row_bytes, height, "source"
-    )
-    _validate_layout(
-        len(destination_view),
-        destination_offset,
-        destination_stride,
-        row_bytes,
-        height,
-        "destination",
-    )
+    # Planes of a tightly packed frame sit back to back, which is the layout
+    # FFmpeg's rawvideo muxer writes and the one callers pass in.
+    for plane in range(layout.plane_count):
+        _validate_layout(
+            len(source_view),
+            source_offset + layout.plane_origin(plane, width, height),
+            source_stride,
+            row_bytes,
+            height,
+            f"source plane {plane}",
+        )
+        _validate_layout(
+            len(destination_view),
+            destination_offset + layout.plane_origin(plane, width, height),
+            destination_stride,
+            row_bytes,
+            height,
+            f"destination plane {plane}",
+        )
 
     stages = _prepare(ir)
     step = layout.step
-    offsets = layout.offsets
     stored = layout.stored_channels
+    # Per channel: the byte its plane starts at, and its offset in a sample.
+    reads = tuple(
+        None
+        if layout.plane(channel) is None
+        else (
+            layout.plane_origin(layout.plane(channel), width, height),
+            layout.offset(channel),
+        )
+        for channel in range(4)
+    )
     for y in range(height):
         source_row = source_offset + y * source_stride
         destination_row = destination_offset + y * destination_stride
         for x in range(width):
-            source_pixel = source_row + x * step
             # An absent alpha loads as zero, matching upstream's have_alpha=0 path.
             pixel: Pixel = tuple(  # type: ignore[assignment]
-                source_view[source_pixel + offsets[channel]]
-                if offsets[channel] is not None
-                else 0
+                0
+                if reads[channel] is None
+                else source_view[
+                    source_row + reads[channel][0] + x * step + reads[channel][1]
+                ]
                 for channel in range(4)
             )
             output = _run_pixel(stages, pixel)
-            destination_pixel = destination_row + x * step
             for channel in stored:
-                destination_view[destination_pixel + offsets[channel]] = output[channel]
+                origin, offset = reads[channel]  # type: ignore[misc]
+                destination_view[
+                    destination_row + origin + x * step + offset
+                ] = output[channel]
 
 
 def interpret_rgba8(ir: PixelIR, source: Any, width: int, height: int) -> bytes:
@@ -457,7 +477,7 @@ def interpret_rgba8(ir: PixelIR, source: Any, width: int, height: int) -> bytes:
         raise InterpreterError("width must be a positive integer")
     if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
         raise InterpreterError("height must be a positive integer")
-    expected = width * height * get_layout(ir.layout).step
+    expected = get_layout(ir.layout).frame_size(width, height)
     source_view = _byte_view(source, "source", writable=False)
     if len(source_view) != expected:
         raise InterpreterError(

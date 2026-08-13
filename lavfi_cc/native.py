@@ -17,7 +17,7 @@ from .ir import PixelIR
 from .layouts import DEFAULT_LAYOUT, get_layout
 
 
-KERNEL_ABI_VERSION = 1
+KERNEL_ABI_VERSION = 2
 PIXEL_FORMAT_RGBA8 = 1
 BASE_COMPILER_FLAGS = (
     "-std=c11",
@@ -166,12 +166,18 @@ def compile_kernel(
     )
 
 
+MAX_PLANES = 4
+
+_PlanePointers = ctypes.POINTER(ctypes.c_uint8) * MAX_PLANES
+_PlaneStrides = ctypes.c_ssize_t * MAX_PLANES
+
+# ABI 2 passes plane arrays shaped like AVFrame's data[] and linesize[].
 _ProcessFunction = ctypes.CFUNCTYPE(
     None,
-    ctypes.POINTER(ctypes.c_uint8),
-    ctypes.c_ssize_t,
-    ctypes.POINTER(ctypes.c_uint8),
-    ctypes.c_ssize_t,
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+    ctypes.POINTER(ctypes.c_ssize_t),
+    ctypes.POINTER(ctypes.POINTER(ctypes.c_uint8)),
+    ctypes.POINTER(ctypes.c_ssize_t),
     ctypes.c_int,
     ctypes.c_int,
 )
@@ -348,7 +354,7 @@ class NativeKernel:
     ) -> None:
         width = _positive_integer(width, "width")
         height = _positive_integer(height, "height")
-        row_bytes = width * self.step
+        row_bytes = self.layout.row_bytes(width)
         source_stride = row_bytes if source_stride is None else source_stride
         destination_stride = (
             row_bytes if destination_stride is None else destination_stride
@@ -357,17 +363,29 @@ class NativeKernel:
         destination_view = _byte_view(destination, "destination", writable=True)
         if source_view.obj is destination_view.obj:
             raise KernelExecutionError("source and destination must use distinct buffers")
-        _validate_layout(
-            len(source_view), source_offset, source_stride, row_bytes, height, "source"
-        )
-        _validate_layout(
-            len(destination_view),
-            destination_offset,
-            destination_stride,
-            row_bytes,
-            height,
-            "destination",
-        )
+        # Planes of a tightly packed frame sit back to back, as rawvideo writes
+        # them. A packed layout has exactly one.
+        origins = [
+            self.layout.plane_origin(plane, width, height)
+            for plane in range(self.layout.plane_count)
+        ]
+        for plane, origin in enumerate(origins):
+            _validate_layout(
+                len(source_view),
+                source_offset + origin,
+                source_stride,
+                row_bytes,
+                height,
+                f"source plane {plane}",
+            )
+            _validate_layout(
+                len(destination_view),
+                destination_offset + origin,
+                destination_stride,
+                row_bytes,
+                height,
+                f"destination plane {plane}",
+            )
 
         source_type = ctypes.c_uint8 * len(source_view)
         if source_view.readonly:
@@ -376,21 +394,31 @@ class NativeKernel:
             source_array = source_type.from_buffer(source_view)
         destination_type = ctypes.c_uint8 * len(destination_view)
         destination_array = destination_type.from_buffer(destination_view)
-        source_pointer = ctypes.cast(
-            ctypes.byref(source_array, source_offset), ctypes.POINTER(ctypes.c_uint8)
-        )
-        destination_pointer = ctypes.cast(
-            ctypes.byref(destination_array, destination_offset),
-            ctypes.POINTER(ctypes.c_uint8),
-        )
+
+        source_planes = _PlanePointers()
+        destination_planes = _PlanePointers()
+        source_strides = _PlaneStrides()
+        destination_strides = _PlaneStrides()
+        for plane, origin in enumerate(origins):
+            source_planes[plane] = ctypes.cast(
+                ctypes.byref(source_array, source_offset + origin),
+                ctypes.POINTER(ctypes.c_uint8),
+            )
+            destination_planes[plane] = ctypes.cast(
+                ctypes.byref(destination_array, destination_offset + origin),
+                ctypes.POINTER(ctypes.c_uint8),
+            )
+            source_strides[plane] = source_stride
+            destination_strides[plane] = destination_stride
+
         process = self._process
         if process is None:
             raise KernelExecutionError("kernel is closed")
         process(
-            destination_pointer,
-            destination_stride,
-            source_pointer,
-            source_stride,
+            destination_planes,
+            destination_strides,
+            source_planes,
+            source_strides,
             width,
             height,
         )
@@ -398,7 +426,7 @@ class NativeKernel:
     def process_rgba8(self, source: Any, width: int, height: int) -> bytes:
         width = _positive_integer(width, "width")
         height = _positive_integer(height, "height")
-        expected = width * height * self.step
+        expected = self.layout.frame_size(width, height)
         source_view = _byte_view(source, "source", writable=False)
         if len(source_view) != expected:
             raise KernelExecutionError(

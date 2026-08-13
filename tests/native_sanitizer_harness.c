@@ -53,10 +53,18 @@ int main(int argc, char **argv)
         lavfi_compiled_kernel.pixel_format != LAVFI_PIXEL_FORMAT_RGBA8 ||
         !lavfi_compiled_kernel.plan_hash || !lavfi_compiled_kernel.process)
         return 2;
-    lavfi_compiled_kernel.process(
-        actual, (ptrdiff_t)width * 4,
-        source, (ptrdiff_t)width * 4,
-        width, height);
+    {
+        /* RGBA8 is packed, so only plane 0 is used; the rest stay null so a
+         * kernel that touched them would fault under the sanitizers. */
+        unsigned char *destination_planes[LAVFI_KERNEL_MAX_PLANES] = { actual };
+        const unsigned char *source_planes[LAVFI_KERNEL_MAX_PLANES] = { source };
+        ptrdiff_t strides[LAVFI_KERNEL_MAX_PLANES] = { (ptrdiff_t)width * 4 };
+
+        lavfi_compiled_kernel.process(
+            destination_planes, strides,
+            source_planes, strides,
+            width, height);
+    }
     if (memcmp(actual, expected, source_size)) {
         fprintf(stderr, "sanitized kernel output differs from interpreter\n");
         return 1;

@@ -23,41 +23,47 @@
 #include "libavutil/error.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
 #include "filters.h"
 #include "formats.h"
 #include "video.h"
 
-#define LAVFI_KERNEL_ABI_VERSION 1u
+/* Mirrors runtime/kernel_abi.h. ABI 2 passes per-plane arrays shaped like
+ * AVFrame's data[] and linesize[], so packed and planar kernels share one
+ * entry point and one slice loop here. */
+#define LAVFI_KERNEL_ABI_VERSION 2u
+#define LAVFI_KERNEL_MAX_PLANES 4
 
-/* Packed 8-bit RGB layouts, mirroring runtime/kernel_abi.h. Every one of them
- * is a single plane addressed by one stride, so they all share this filter's
- * slice loop and no ABI change was needed to add them. */
-#define LAVFI_PIXEL_FORMAT_RGBA8 1u
-#define LAVFI_PIXEL_FORMAT_BGRA8 2u
-#define LAVFI_PIXEL_FORMAT_ARGB8 3u
-#define LAVFI_PIXEL_FORMAT_ABGR8 4u
-#define LAVFI_PIXEL_FORMAT_RGB24 5u
-#define LAVFI_PIXEL_FORMAT_BGR24 6u
+#define LAVFI_PIXEL_FORMAT_RGBA8  1u
+#define LAVFI_PIXEL_FORMAT_BGRA8  2u
+#define LAVFI_PIXEL_FORMAT_ARGB8  3u
+#define LAVFI_PIXEL_FORMAT_ABGR8  4u
+#define LAVFI_PIXEL_FORMAT_RGB24  5u
+#define LAVFI_PIXEL_FORMAT_BGR24  6u
+#define LAVFI_PIXEL_FORMAT_GBRP8  7u
+#define LAVFI_PIXEL_FORMAT_GBRAP8 8u
 
 static enum AVPixelFormat kernel_pixel_format(uint32_t identifier)
 {
     switch (identifier) {
-    case LAVFI_PIXEL_FORMAT_RGBA8: return AV_PIX_FMT_RGBA;
-    case LAVFI_PIXEL_FORMAT_BGRA8: return AV_PIX_FMT_BGRA;
-    case LAVFI_PIXEL_FORMAT_ARGB8: return AV_PIX_FMT_ARGB;
-    case LAVFI_PIXEL_FORMAT_ABGR8: return AV_PIX_FMT_ABGR;
-    case LAVFI_PIXEL_FORMAT_RGB24: return AV_PIX_FMT_RGB24;
-    case LAVFI_PIXEL_FORMAT_BGR24: return AV_PIX_FMT_BGR24;
-    default:                       return AV_PIX_FMT_NONE;
+    case LAVFI_PIXEL_FORMAT_RGBA8:  return AV_PIX_FMT_RGBA;
+    case LAVFI_PIXEL_FORMAT_BGRA8:  return AV_PIX_FMT_BGRA;
+    case LAVFI_PIXEL_FORMAT_ARGB8:  return AV_PIX_FMT_ARGB;
+    case LAVFI_PIXEL_FORMAT_ABGR8:  return AV_PIX_FMT_ABGR;
+    case LAVFI_PIXEL_FORMAT_RGB24:  return AV_PIX_FMT_RGB24;
+    case LAVFI_PIXEL_FORMAT_BGR24:  return AV_PIX_FMT_BGR24;
+    case LAVFI_PIXEL_FORMAT_GBRP8:  return AV_PIX_FMT_GBRP;
+    case LAVFI_PIXEL_FORMAT_GBRAP8: return AV_PIX_FMT_GBRAP;
+    default:                        return AV_PIX_FMT_NONE;
     }
 }
 
 typedef void (*LavfiProcessFunction)(
-    uint8_t *dst,
-    ptrdiff_t dst_stride,
-    const uint8_t *src,
-    ptrdiff_t src_stride,
+    uint8_t *const *dst,
+    const ptrdiff_t *dst_stride,
+    const uint8_t *const *src,
+    const ptrdiff_t *src_stride,
     int width,
     int height);
 
@@ -77,6 +83,7 @@ typedef struct FusedContext {
 
     void *library;
     const LavfiCompiledKernel *kernel;
+    int nb_planes;
 } FusedContext;
 
 typedef struct ThreadData {
@@ -246,12 +253,25 @@ static int filter_slice(AVFilterContext *ctx, void *arg,
     const ThreadData *td = arg;
     const int start = ff_slice_pos(td->out->height, jobnr, nb_jobs);
     const int end = ff_slice_pos(td->out->height, jobnr + 1, nb_jobs);
+    const uint8_t *src[LAVFI_KERNEL_MAX_PLANES] = { NULL };
+    uint8_t *dst[LAVFI_KERNEL_MAX_PLANES] = { NULL };
+    ptrdiff_t src_stride[LAVFI_KERNEL_MAX_PLANES] = { 0 };
+    ptrdiff_t dst_stride[LAVFI_KERNEL_MAX_PLANES] = { 0 };
+
+    /* No advertised format is chroma-subsampled, so every plane is sliced at
+     * the same row and the kernel sees one height for all of them. */
+    for (int plane = 0; plane < s->nb_planes; plane++) {
+        src[plane] = td->in->data[plane] +
+                     (ptrdiff_t)start * td->in->linesize[plane];
+        dst[plane] = td->out->data[plane] +
+                     (ptrdiff_t)start * td->out->linesize[plane];
+        src_stride[plane] = td->in->linesize[plane];
+        dst_stride[plane] = td->out->linesize[plane];
+    }
 
     s->kernel->process(
-        td->out->data[0] + (ptrdiff_t)start * td->out->linesize[0],
-        td->out->linesize[0],
-        td->in->data[0] + (ptrdiff_t)start * td->in->linesize[0],
-        td->in->linesize[0],
+        dst, dst_stride,
+        src, src_stride,
         td->out->width,
         end - start);
     return 0;
@@ -308,10 +328,24 @@ static int query_formats(const AVFilterContext *ctx,
     return ff_set_pixel_formats_from_list2(ctx, cfg_in, cfg_out, pix_fmts);
 }
 
+static int config_input(AVFilterLink *inlink)
+{
+    AVFilterContext *ctx = inlink->dst;
+    FusedContext *s = ctx->priv;
+
+    s->nb_planes = av_pix_fmt_count_planes(inlink->format);
+    if (s->nb_planes < 1 || s->nb_planes > LAVFI_KERNEL_MAX_PLANES) {
+        av_log(ctx, AV_LOG_ERROR, "unsupported plane count %d\n", s->nb_planes);
+        return AVERROR(EINVAL);
+    }
+    return 0;
+}
+
 static const AVFilterPad inputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = config_input,
         .filter_frame = filter_frame,
     },
 };

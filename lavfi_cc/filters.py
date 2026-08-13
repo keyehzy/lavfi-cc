@@ -379,13 +379,15 @@ SUPPORTED_FILTERS = tuple(LOWERERS)
 #: a format the backend actually implements.  ``colorlevels`` and
 #: ``colorchannelmixer`` additionally accept the ``0rgb``/``rgb0`` family that
 #: ``negate`` and ``lutrgb`` do not, so it is outside the common subset.
-_PACKED_RGB8 = frozenset({"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24"})
+_RGB8 = frozenset(
+    {"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24", "gbrp", "gbrap"}
+)
 
 RGB8_FILTER_FORMATS: dict[str, frozenset[str]] = {
-    "negate": _PACKED_RGB8,
-    "lutrgb": _PACKED_RGB8,
-    "colorlevels": _PACKED_RGB8,
-    "colorchannelmixer": _PACKED_RGB8,
+    "negate": _RGB8,
+    "lutrgb": _RGB8,
+    "colorlevels": _RGB8,
+    "colorchannelmixer": _RGB8,
 }
 
 
@@ -401,22 +403,40 @@ def filter_supports_rgb8(name: str, pixel_format: str) -> bool:
 def _validate_negate_for_layout(
     invocation: FilterInvocation, layout: PixelLayout
 ) -> None:
-    """Reject an explicit alpha request on a layout that has no alpha.
+    """Check the two ways ``negate`` depends on the pixel format.
 
-    Upstream validates the component mask against the format at configuration
-    time and fails the graph outright, but only when the mask was given
-    explicitly; the default mask skips the check.
+    Upstream validates an explicit component mask against the format at
+    configuration time and fails the graph outright; the default mask skips
+    that check.  Separately, ``negate_alpha`` sets a *plane* mask, which packed
+    RGB ignores in favour of its component mask but planar RGB obeys, so the
+    legacy option really does negate alpha on ``gbrap``.
     """
 
-    option = invocation.named_options().get("components")
-    if option is None or layout.has_alpha:
-        return
-    if "a" in option.value.split("+"):
+    options = invocation.named_options()
+    components = options.get("components")
+    if components is not None and not layout.has_alpha:
+        if "a" in components.value.split("+"):
+            raise LoweringError(
+                "component_not_available",
+                f"negate cannot select alpha in {layout.name!r}, which has no "
+                "alpha channel; upstream fails to configure this graph",
+                "components",
+            )
+
+    negate_alpha = options.get("negate_alpha")
+    if (
+        negate_alpha is not None
+        and components is None
+        and layout.planar
+        and layout.has_alpha
+        and _parse_bool(negate_alpha.value, "negate_alpha")
+    ):
         raise LoweringError(
-            "component_not_available",
-            f"negate cannot select alpha in {layout.name!r}, which has no alpha "
-            "channel; upstream fails to configure this graph",
-            "components",
+            "planar_negate_alpha",
+            f"negate_alpha sets a plane mask, so it negates alpha in "
+            f"{layout.name!r} unlike in packed RGB; spell the intent as "
+            "components=r+g+b+a instead",
+            "negate_alpha",
         )
 
 

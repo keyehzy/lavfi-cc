@@ -12,11 +12,27 @@ changes inside the region are rejected.
 
 ## Pixel layouts
 
-The accepted layouts are `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24`.
-They differ only in which byte of a pixel holds which component and whether
-alpha exists, so the IR is layout-independent and always sees logical RGBA.
-`lavfi_cc/layouts.py` records the byte offsets, which were read out of the
-pinned binary by converting one known `0x11223344` RGBA pixel into each format.
+The accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`,
+and `bgr24`, and the planar `gbrp` and `gbrap`. They differ only in which byte
+holds which component and whether alpha exists, so the IR is
+layout-independent and always sees logical RGBA.
+
+One addressing scheme covers both families. A logical channel lives in a plane
+at a byte offset within each sample group, and consecutive samples are `step`
+bytes apart:
+
+```text
+address = plane_base + y * plane_stride + x * step + offset
+```
+
+A packed layout has one plane, a step of three or four, and a distinct offset
+per channel. A planar layout has one plane per channel, a step of one, and
+every offset zero. `lavfi_cc/layouts.py` records both, read out of the pinned
+binary by converting one known `0x11223344` RGBA pixel into each format; that
+is where `gbrp`'s green, blue, red plane order comes from.
+
+No accepted layout is chroma-subsampled, so a kernel's `width` and `height`
+describe every plane it touches.
 
 An alpha-less layout loads `a = 0` and stores only R, G, and B. That matches
 upstream: the packed `colorchannelmixer` path omits every alpha term when
@@ -36,9 +52,8 @@ Two rules follow from the format lists rather than from the pixel maths:
   produce the same bytes as `format=rgba,negate`. Fusing a run whose working
   format is unknown or unsupported would change output, so it is refused.
 
-Planar (`gbrp`, `gbrap`) and 9–16-bit RGB formats are advertised by all four
-filters but are not implemented; they need per-plane pointers in the kernel
-ABI. See [`roadmap-status.md`](roadmap-status.md).
+The 9–16-bit RGB formats are advertised by all four filters but are not
+implemented. See [`roadmap-status.md`](roadmap-status.md).
 
 All four upstream filters advertise `AVFILTER_FLAG_SLICE_THREADS`. A fused
 filter must do the same. These operations are row-local in the accepted subset,
@@ -68,8 +83,26 @@ accepts the option; it must not infer the behavior suggested by the option name.
 An explicit component mask is validated against the format at configuration
 time, and a request for a component the format lacks fails the graph outright
 ("Requested components not available"). The default mask skips that check. The
-compiler therefore rejects `components=…a` on `rgb24` and `bgr24` rather than
-treating it as a no-op, so it accepts exactly the graphs upstream accepts.
+compiler therefore rejects `components=…a` on `rgb24`, `bgr24`, and `gbrp`
+rather than treating it as a no-op, so it accepts exactly the graphs upstream
+accepts.
+
+`negate_alpha` sets a **plane** mask, and that mask is only ignored for packed
+RGB, which uses its separate component mask instead. Planar RGB obeys it, so
+the same option means different things depending on the layout. Over one
+`R=0x11 G=0x22 B=0x33 A=0x44` pixel in this pinned revision:
+
+```text
+rgba   negate                -> ee dd cc 44     alpha unchanged
+rgba   negate=negate_alpha=1 -> ee dd cc 44     alpha unchanged
+gbrap  negate                -> dd cc ee 44     alpha unchanged
+gbrap  negate=negate_alpha=1 -> dd cc ee bb     alpha negated
+```
+
+The compiler accepts the option on packed layouts, where it provably has no
+alpha effect, and on `gbrp`, which has no alpha plane. It rejects it on
+`gbrap`, where honouring it would require the lowering to be layout-aware;
+`components=r+g+b+a` states that intent unambiguously and is accepted.
 
 Accepted MVP constraints:
 

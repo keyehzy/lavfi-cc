@@ -76,14 +76,14 @@ class SummaryTests(unittest.TestCase):
         summary = summarize(
             [
                 scan_graph("format=yuv420p,negate,negate,negate,negate"),
-                scan_graph("format=gbrp,negate,negate"),
+                scan_graph("format=yuv444p,negate,negate"),
                 scan_graph("format=rgba,negate,negate"),
             ]
         )
         self.assertEqual(summary.graphs, 3)
         self.assertEqual(summary.eliminated_passes, 1)
         self.assertEqual(summary.blocked_passes, 4)
-        # yuv420p withholds three passes against gbrp's one, so it ranks first.
+        # yuv420p withholds three passes against yuv444p's one, so it ranks first.
         self.assertEqual(
             summary.blocked_passes_by_format.most_common(1), [("yuv420p", 3)]
         )

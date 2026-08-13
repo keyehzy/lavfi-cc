@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .ir import Operation, PixelIR
-from .layouts import get_layout
+from .layouts import PixelLayout, get_layout
 from .passes import (
     LEVELS_EVALUATION,
     MIXER_EVALUATIONS,
@@ -86,6 +86,17 @@ def _direct_mixer_vector(input_: int, column: MixerColumn) -> str:
         for output in range(4)
     ]
     return "(lavfi_i16x4){" + ", ".join(lanes) + "}"
+
+
+def _sample_index(layout: PixelLayout, channel: int) -> str:
+    """Render the index of one channel's byte within its plane row."""
+
+    offset = layout.offset(channel)
+    assert offset is not None
+    if layout.step == 1:
+        return "x" if offset == 0 else f"x + {offset}"
+    scaled = f"x * {layout.step}"
+    return scaled if offset == 0 else f"{scaled} + {offset}"
 
 
 def _is_mixer(operation: Operation) -> bool:
@@ -210,37 +221,52 @@ def generate_c(
             ]
         )
     layout = get_layout(ir.layout)
+    used_planes = sorted({layout.plane(channel) for channel in layout.stored_channels})
     lines.extend(_stage_declarations(stages))
+    kind = "planar" if layout.planar else "packed"
     lines.extend(
         [
-            f"/* byte layout: {layout.name} (step {layout.step}) */",
+            f"/* byte layout: {layout.name} ({kind}, {layout.plane_count} plane"
+            f"{'s' if layout.plane_count != 1 else ''}, step {layout.step}) */",
             "static void process_rgba8(",
-            "    uint8_t *dst, ptrdiff_t dst_stride,",
-            "    const uint8_t *src, ptrdiff_t src_stride,",
+            "    uint8_t *const *dst, const ptrdiff_t *dst_stride,",
+            "    const uint8_t *const *src, const ptrdiff_t *src_stride,",
             "    int width, int height)",
             "{",
             "    for (int y = 0; y < height; ++y) {",
-            "        const uint8_t *source_row = src + (ptrdiff_t)y * src_stride;",
-            "        uint8_t *destination_row = dst + (ptrdiff_t)y * dst_stride;",
-            "        for (int x = 0; x < width; ++x) {",
-            f"            const uint8_t *source = source_row + (ptrdiff_t)x * {layout.step};",
-            f"            uint8_t *destination = destination_row + (ptrdiff_t)x * {layout.step};",
         ]
     )
+    for plane in used_planes:
+        lines.append(
+            f"        const uint8_t *source_row_{plane} = "
+            f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
+        )
+        lines.append(
+            f"        uint8_t *destination_row_{plane} = "
+            f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
+        )
+    lines.append("        for (int x = 0; x < width; ++x) {")
     for channel in range(4):
-        offset = layout.offset(channel)
-        if offset is None:
+        plane = layout.plane(channel)
+        if plane is None:
             # Upstream reads no alpha for these layouts and contributes none.
             lines.append(f"            uint8_t c{channel} = 0;")
         else:
-            lines.append(f"            uint8_t c{channel} = source[{offset}];")
+            index = _sample_index(layout, channel)
+            lines.append(
+                f"            uint8_t c{channel} = source_row_{plane}[{index}];"
+            )
     for index, operation in enumerate(stages):
         lines.append("")
         lines.append(f"            /* stage {index} */")
         lines.extend(_stage_body(index, operation))
     lines.append("")
     for channel in layout.stored_channels:
-        lines.append(f"            destination[{layout.offset(channel)}] = c{channel};")
+        plane = layout.plane(channel)
+        index = _sample_index(layout, channel)
+        lines.append(
+            f"            destination_row_{plane}[{index}] = c{channel};"
+        )
     lines.extend(
         [
             "        }",
