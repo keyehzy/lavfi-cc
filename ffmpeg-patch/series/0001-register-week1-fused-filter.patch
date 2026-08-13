@@ -1,0 +1,24 @@
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index f714d29..767cfc3 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -330,6 +330,7 @@ OBJS-$(CONFIG_FREEZEFRAMES_FILTER)           += vf_freezeframes.o
+ OBJS-$(CONFIG_FREI0R_FILTER)                 += vf_frei0r.o
+ OBJS-$(CONFIG_FSPP_FILTER)                   += vf_fspp.o vf_fsppdsp.o qp_table.o
+ OBJS-$(CONFIG_FSYNC_FILTER)                  += vf_fsync.o
++OBJS-$(CONFIG_FUSED_FILTER)                  += vf_fused.o
+ OBJS-$(CONFIG_GBLUR_FILTER)                  += vf_gblur.o
+ OBJS-$(CONFIG_GBLUR_VULKAN_FILTER)           += vf_gblur_vulkan.o vulkan.o vulkan_filter.o
+ OBJS-$(CONFIG_GEQ_FILTER)                    += vf_geq.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 6d70649..dd539d7 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -307,6 +307,7 @@ extern const FFFilter ff_vf_freezeframes;
+ extern const FFFilter ff_vf_frei0r;
+ extern const FFFilter ff_vf_fspp;
+ extern const FFFilter ff_vf_fsync;
++extern const FFFilter ff_vf_fused;
+ extern const FFFilter ff_vf_gblur;
+ extern const FFFilter ff_vf_gblur_vulkan;
+ extern const FFFilter ff_vf_geq;

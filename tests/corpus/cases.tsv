@@ -1,0 +1,12 @@
+# id	width	height	pattern	filter chain inside the RGBA boundaries
+black-negate	1	1	black	negate
+white-negate	2	3	white	negate
+alpha-negate	3	5	rgba_ramp	negate=components=r+g+b+a
+ramp-lut	7	9	rgba_ramp	lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val
+ramp-levels	8	7	rgba_ramp	colorlevels=rimin=0.04:gimin=0.02:bimin=0.06:rimax=0.96:gimax=0.98:bimax=0.94:romin=0.01:bomin=0.02:preserve=none
+ramp-mixer	15	11	rgba_ramp	colorchannelmixer=rr=0.90:rg=0.08:rb=0.02:ra=0.01:gr=0.03:gg=0.94:gb=0.03:ga=0.01:br=0.04:bg=0.06:bb=0.90:ba=0.01:ar=0.02:ag=0.01:ab=0.01:aa=0.96:pc=none
+testsrc-pair	16	13	testsrc	negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val
+testsrc-four	17	15	testsrc	negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val,colorlevels=rimin=0.04:gimin=0.02:bimin=0.06:rimax=0.96:gimax=0.98:bimax=0.94:preserve=none,colorchannelmixer=rr=0.90:rg=0.08:rb=0.02:gr=0.03:gg=0.94:gb=0.03:br=0.04:bg=0.06:bb=0.90:pc=none
+checker-four-lut	63	17	checker	negate,lutrgb=r=val*1.05:g=val*0.97+3:b=val*0.92+8,negate,lutrgb=r=val*0.91+9:g=val*1.03:b=val*0.96+4
+checker-eight-balanced	64	18	checker	negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val,colorlevels=rimin=0.04:gimin=0.02:bimin=0.06:rimax=0.96:gimax=0.98:bimax=0.94:preserve=none,colorchannelmixer=rr=0.90:rg=0.08:rb=0.02:gr=0.03:gg=0.94:gb=0.03:br=0.04:bg=0.06:bb=0.90:pc=none,negate,lutrgb=r=val*0.91+9:g=val*1.03:b=val*0.96+4,colorlevels=rimin=0.02:gimin=0.03:bimin=0.01:rimax=0.98:gimax=0.97:bimax=0.99:preserve=none,colorchannelmixer=rr=0.92:rg=0.06:rb=0.02:gr=0.02:gg=0.95:gb=0.03:br=0.03:bg=0.05:bb=0.92:pc=none
+checker-eight-lut	65	19	checker	negate,lutrgb=r=val*1.05:g=val*0.97+3:b=val*0.92+8,negate,lutrgb=r=val*0.91+9:g=val*1.03:b=val*0.96+4,negate,lutrgb=r=val*1.02+1:g=val*0.95+5:b=val*0.98+2,negate,lutrgb=r=val*0.93+7:g=val*1.01+1:b=val*0.94+6

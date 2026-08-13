@@ -1,0 +1,12 @@
+# id	stages	description	filter chain inside the RGBA boundaries
+control_rgba	0	RGBA conversion control	null
+single_negate	1	Invert RGB while passing alpha	negate
+single_lut	1	Independent nonlinear-looking channel LUTs	lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val
+single_levels	1	Static per-channel levels	colorlevels=rimin=0.04:gimin=0.02:bimin=0.06:rimax=0.96:gimax=0.98:bimax=0.94:romin=0.01:bomin=0.02:preserve=none
+single_mixer	1	Cross-channel RGB matrix	colorchannelmixer=rr=0.90:rg=0.08:rb=0.02:gr=0.03:gg=0.94:gb=0.03:br=0.04:bg=0.06:bb=0.90:pc=none
+pair_negate_lut	2	Smallest LUT-friendly fusion candidate	negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val
+pair_levels_mixer	2	Adjacent arithmetic stages	colorlevels=rimin=0.04:gimin=0.02:bimin=0.06:rimax=0.96:gimax=0.98:bimax=0.94:preserve=none,colorchannelmixer=rr=0.90:rg=0.08:rb=0.02:gr=0.03:gg=0.94:gb=0.03:br=0.04:bg=0.06:bb=0.90:pc=none
+four_balanced	4	One stage of every supported filter	negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val,colorlevels=rimin=0.04:gimin=0.02:bimin=0.06:rimax=0.96:gimax=0.98:bimax=0.94:preserve=none,colorchannelmixer=rr=0.90:rg=0.08:rb=0.02:gr=0.03:gg=0.94:gb=0.03:br=0.04:bg=0.06:bb=0.90:pc=none
+four_lut_heavy	4	Four table-based full-frame passes	negate,lutrgb=r=val*1.05:g=val*0.97+3:b=val*0.92+8,negate,lutrgb=r=val*0.91+9:g=val*1.03:b=val*0.96+4
+eight_balanced	8	Balanced chain repeated twice	negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val,colorlevels=rimin=0.04:gimin=0.02:bimin=0.06:rimax=0.96:gimax=0.98:bimax=0.94:preserve=none,colorchannelmixer=rr=0.90:rg=0.08:rb=0.02:gr=0.03:gg=0.94:gb=0.03:br=0.04:bg=0.06:bb=0.90:pc=none,negate,lutrgb=r=val*0.91+9:g=val*1.03:b=val*0.96+4,colorlevels=rimin=0.02:gimin=0.03:bimin=0.01:rimax=0.98:gimax=0.97:bimax=0.99:preserve=none,colorchannelmixer=rr=0.92:rg=0.06:rb=0.02:gr=0.02:gg=0.95:gb=0.03:br=0.03:bg=0.05:bb=0.92:pc=none
+eight_lut_heavy	8	Eight LUT-compatible full-frame passes	negate,lutrgb=r=val*1.05:g=val*0.97+3:b=val*0.92+8,negate,lutrgb=r=val*0.91+9:g=val*1.03:b=val*0.96+4,negate,lutrgb=r=val*1.02+1:g=val*0.95+5:b=val*0.98+2,negate,lutrgb=r=val*0.93+7:g=val*1.01+1:b=val*0.94+6

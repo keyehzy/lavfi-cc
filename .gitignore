@@ -1,0 +1,7 @@
+.DS_Store
+.build/
+.work/
+benchmarks/results/*/
+tests/corpus/baseline/*/
+!benchmarks/results/.gitkeep
+!tests/corpus/baseline/.gitkeep

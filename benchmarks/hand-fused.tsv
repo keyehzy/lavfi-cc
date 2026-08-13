@@ -1,0 +1,3 @@
+# id	stages	description	filter chain inside the RGBA boundaries
+baseline_negate_lut	2	Pinned upstream negate plus lutrgb	negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12:a=val
+hand_fused_negate_lut	1	Hardcoded Week 1 fused filter	fused

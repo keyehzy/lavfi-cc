@@ -40,6 +40,8 @@ Stretch target: 2x filter-only speedup for a six-filter chain.
 - Fixed frame dimensions during a run.
 - Packed 8-bit `RGBA` as the internal pixel format.
 - Linux x86-64.
+- macOS arm64 as a supported development and correctness platform; performance
+  gates remain authoritative only on native Linux x86-64.
 - Native kernel generation through an installed Clang toolchain.
 - Persistent on-disk kernel cache.
 - The following initial filter subset:
@@ -197,6 +199,11 @@ typedef struct {
 
 Compile it with Clang into a shared library. Start with conservative optimization flags and explicitly disable transformations that could change FFmpeg rounding behavior. Inspect generated assembly and add vectorization hints only after correctness is locked down.
 
+The backend selects the native library format without exposing it in the IR:
+`.dylib` with `-dynamiclib` on macOS and `.so` with `-shared` on Linux. Initial
+flags on both platforms include `-std=c11 -O2 -fPIC -fno-fast-math
+-ffp-contract=off`; loading uses `RTLD_NOW | RTLD_LOCAL`.
+
 Why generate C for the MVP:
 
 - It avoids building an assembler or bringing LLVM into the FFmpeg process.
@@ -215,6 +222,8 @@ The filter:
 - Checks ABI version, pixel format, and plan hash before executing it.
 - Allocates the output frame through normal FFmpeg APIs.
 - Calls the compiled row/frame function using FFmpeg-provided buffers and strides.
+- Advertises `AVFILTER_FLAG_SLICE_THREADS`, divides work into row ranges through
+  FFmpeg's worker executor, and invokes the unchanged kernel ABI once per slice.
 - Preserves frame metadata, timestamps, color metadata, and side data exactly as a normal pointwise filter would.
 - Refuses world-writable kernel files and unexpected cache locations.
 
@@ -229,6 +238,7 @@ Cache keys must include:
 - Kernel ABI version.
 - FFmpeg version or compatible ABI identifier.
 - Target architecture and relevant CPU features.
+- Target triple and native dynamic-library format.
 - Clang version and code-generation flags.
 
 Write compiled artifacts atomically. Cache directories and files must be private to the current user. A corrupt or mismatched entry is deleted and rebuilt; it is never executed.
@@ -243,6 +253,10 @@ For each test case:
 2. Run the ordinary FFmpeg chain and write raw RGBA frames.
 3. Run the fused chain and write raw RGBA frames.
 4. Compare byte-for-byte and report the first frame, pixel, and channel that differs.
+
+Correctness is measured against the same pinned FFmpeg build on each platform.
+Raw-frame goldens are platform-scoped and are not assumed to be portable between
+macOS and Linux where floating-point evaluation or the C runtime may differ.
 
 The test matrix should cover:
 
@@ -281,6 +295,10 @@ Measure one, two, four, and eight filter stages at 1080p and 4K. Capture:
 - Bytes copied or an estimated memory-bandwidth figure.
 
 Use `ffmpeg -benchmark`, `perf stat`, and a dedicated benchmark harness that records full commands, versions, warmup policy, and raw results.
+
+Benchmark both `-filter_threads 1` and the host's normal logical-CPU count.
+macOS directional profiling uses Instruments or `xctrace`; authoritative cycle,
+instruction, and cache-miss counters still come from Linux `perf stat`.
 
 Go/no-go gate: a four-stage supported baseline must be meaningfully slower than a one-stage equivalent and show evidence of memory traffic or filter execution as the bottleneck. If it does not, revisit the filter subset before building the JIT.
 
