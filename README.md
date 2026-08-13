@@ -1,8 +1,8 @@
 # lavfi-cc
 
 `lavfi-cc` is an experimental compiler for fusing compatible FFmpeg video
-filters into one native RGBA8 kernel. The repository has completed the Week 2
-frontend and IR milestone described in
+filters into one native RGBA8 kernel. The repository has completed the Week 3
+reference-interpreter milestone described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md).
 
 Explain and lower a bounded region with:
@@ -15,8 +15,21 @@ Explain and lower a bounded region with:
 The command exits with status 0 for an eligible region and 2 for a parse or
 eligibility rejection. Add `--json` to obtain the canonical IR, source map,
 plan hash, diagnostics, and planned filtergraph rewrite as structured output.
-The rewrite is explanatory in Week 2; native compilation and execution arrive
-in later milestones.
+The rewrite remains explanatory until native compilation and FFmpeg integration
+arrive in later milestones.
+
+Run the reference interpreter over one or more tightly packed raw RGBA8 frames:
+
+```sh
+./lavfi-cc interpret \
+  --vf "format=rgba,negate,lutrgb=r=val*1.08+2,format=rgba" \
+  --width 1920 --height 1080 \
+  --input input.rgba --output output.rgba
+```
+
+Omit `--input` or `--output` to use standard input or standard output. Input
+must contain only complete `width * height * 4` byte frames. The Python API also
+supports padded and negative frame strides through `interpret_into`.
 
 The checked-in Week 1 tooling deliberately uses one pinned FFmpeg build as both
 the benchmark subject and semantic oracle:
@@ -50,6 +63,14 @@ differential suite with:
 
 ```sh
 ./scripts/test-week2.sh
+```
+
+Week 3's scalar interpreter, quantization findings, and zero-difference oracle
+matrix are in [`docs/week-3-report.md`](docs/week-3-report.md). Run the current
+suite with:
+
+```sh
+./scripts/test-week3.sh
 ```
 
 Set `LAVFI_CC_FFMPEG=/path/to/ffmpeg` to select another pinned build. The

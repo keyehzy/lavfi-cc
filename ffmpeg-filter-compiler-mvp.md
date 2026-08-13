@@ -199,6 +199,11 @@ typedef struct {
 
 Compile it with Clang into a shared library. Start with conservative optimization flags and explicitly disable transformations that could change FFmpeg rounding behavior. Inspect generated assembly and add vectorization hints only after correctness is locked down.
 
+`levels_f32_fma` is an explicit contracted IR operation discovered during the
+Week 3 Apple-Clang oracle pass. Even with ambient contraction disabled, the C
+backend must preserve that operation with `fmaf` or a materialized 256-entry
+table. Other arithmetic may not be silently contracted or reassociated.
+
 The backend selects the native library format without exposing it in the IR:
 `.dylib` with `-dynamiclib` on macOS and `.so` with `-shared` on Linux. Initial
 flags on both platforms include `-std=c11 -O2 -fPIC -fno-fast-math

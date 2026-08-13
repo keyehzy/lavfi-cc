@@ -10,7 +10,7 @@ from typing import Any
 from .parser import SourceSpan
 
 
-IR_VERSION = 1
+IR_VERSION = 2
 CHANNELS = ("r", "g", "b", "a")
 
 

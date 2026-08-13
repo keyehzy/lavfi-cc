@@ -69,7 +69,7 @@ class IRTests(unittest.TestCase):
     def test_serialization_is_canonical_json(self) -> None:
         ir = require_ir(graph("negate"))
         decoded = json.loads(ir.serialize())
-        self.assertEqual(decoded["ir_version"], 1)
+        self.assertEqual(decoded["ir_version"], 2)
         self.assertNotIn("source", ir.serialize().decode("ascii"))
         self.assertEqual(ir.serialize(), ir.serialize())
 

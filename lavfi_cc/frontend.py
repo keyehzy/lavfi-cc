@@ -308,7 +308,7 @@ def _lower_colorlevels(invocation: FilterInvocation, index: int) -> _Lowered:
     operation = Operation(
         "matrix4x4",
         {
-            "evaluation": "levels_f32",
+            "evaluation": "levels_f32_fma",
             "coefficients": matrix,
             "offsets": offsets,
             "input_max": input_max,
@@ -455,7 +455,7 @@ def _find_region(graph: Filtergraph) -> tuple[tuple[int, int] | None, list[Diagn
         return None, [
             Diagnostic(
                 "ambiguous_regions",
-                "multiple RGBA regions were found; the Week 2 frontend requires exactly one",
+                "multiple RGBA regions were found; the frontend requires exactly one",
             )
         ]
     if not unique_candidates:

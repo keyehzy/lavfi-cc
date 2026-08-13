@@ -88,16 +88,23 @@ coeff = (float) ((omax - omin) / (double) (imax - imin))
 
 With the default round-to-nearest floating-point environment, `lrint` resolves
 halfway cases using ties-to-even. The coefficient is stored as `float`. The
-packed 8-bit pixel path then computes:
+packed 8-bit pixel path is written upstream as:
 
 ```text
 value = (in[c] - imin) * coeff + omin
 out[c] = clamp((int) value, 0, 255)
 ```
 
-The implicit float-to-int conversion truncates toward zero before saturation.
-R, G, B, and (when present) A use independent ranges. Default points are
-`input_min=output_min=0` and `input_max=output_max=1`.
+The pinned Apple-Clang 17 arm64 build contracts the multiply and add to one
+binary32 `fmla`, including in its vectorized packed-RGBA loop. IR v2 therefore
+records `levels_f32_fma`: compute the exact product-plus-offset and round once
+to binary32, then truncate toward zero and saturate. This distinction is
+observable for edge configurations; a reversed red range produced 25 under
+the oracle where separately rounding the product would produce 26. R, G, B,
+and (when present) A use independent ranges. Default points are
+`input_min=output_min=0` and `input_max=output_max=1`. Native Linux correctness
+must still be checked against the pinned Linux build because compiler
+contraction is target-sensitive.
 
 Negative input points have special behavior: after point quantization, a
 negative `imin` or `imax` is replaced by the observed per-frame channel minimum
@@ -140,8 +147,10 @@ All other preserve modes are excluded from the MVP.
 
 - Each stage reads the previous stage's four quantized bytes, even inside a
   fused loop.
-- Generated floating-point code uses `-fno-fast-math -ffp-contract=off`; it may
-  not contract, reassociate, or remove conversions.
+- Generated floating-point code uses `-fno-fast-math -ffp-contract=off`; the
+  explicit `levels_f32_fma` operation must be implemented with an explicit
+  correctly-rounded FMA or a materialized 256-entry table rather than relying
+  on ambient compiler contraction.
 - The process must use the normal round-to-nearest environment when matching
   upstream `lrint` behavior.
 - The same pinned FFmpeg binary is the oracle on each host. Golden frames are

@@ -1,7 +1,22 @@
-"""Week 2 frontend and pixel IR for lavfi-cc."""
+"""Frontend, pixel IR, and reference interpreter for lavfi-cc."""
 
 from .frontend import Analysis, analyze_filtergraph, require_ir
+from .interpreter import (
+    InterpreterError,
+    interpret_into,
+    interpret_pixel,
+    interpret_rgba8,
+)
 from .ir import PixelIR
 
-__all__ = ["Analysis", "PixelIR", "analyze_filtergraph", "require_ir"]
-__version__ = "0.2.0"
+__all__ = [
+    "Analysis",
+    "InterpreterError",
+    "PixelIR",
+    "analyze_filtergraph",
+    "interpret_into",
+    "interpret_pixel",
+    "interpret_rgba8",
+    "require_ir",
+]
+__version__ = "0.3.0"
