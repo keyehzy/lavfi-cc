@@ -64,7 +64,6 @@ jobs:
       LAVFI_CC_CLANG: ${{ matrix.compiler }}
       LAVFI_CC_FFMPEG: ${{ github.workspace }}/.build/ffmpeg-${{ matrix.platform }}/bin/ffmpeg
       LAVFI_CC_WEEK5_FFMPEG: ${{ github.workspace }}/.build/ffmpeg-week5-${{ matrix.platform }}/bin/ffmpeg
-      LAVFI_CC_CACHE_DIR: ${{ runner.temp }}/lavfi-cc-${{ matrix.id }}/kernels
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -75,6 +74,10 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Configure temporary kernel cache
+        shell: bash
+        run: echo "LAVFI_CC_CACHE_DIR=$RUNNER_TEMP/lavfi-cc-${{ matrix.id }}/kernels" >> "$GITHUB_ENV"
 
       - name: Ensure selected Clang is available
         shell: bash
