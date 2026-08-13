@@ -12,6 +12,7 @@ from typing import BinaryIO, Callable
 
 from . import __version__
 from .frontend import Analysis, analyze_filtergraph
+from .ffmpeg import run_ffmpeg
 from .interpreter import InterpreterError, interpret_rgba8
 from .ir import PixelIR
 from .native import (
@@ -103,6 +104,23 @@ def _parser() -> argparse.ArgumentParser:
         help="write generated C to this path instead of beside the library",
     )
     _add_pass_switches(compile_parser)
+    run = subparsers.add_parser(
+        "run", help="compile an eligible -vf region and run patched FFmpeg"
+    )
+    run.add_argument(
+        "--ffmpeg", metavar="PATH", help="FFmpeg executable (or LAVFI_CC_FFMPEG)"
+    )
+    run.add_argument(
+        "--require-fusion",
+        action="store_true",
+        help="fail instead of running the original chain when fusion is unavailable",
+    )
+    _add_pass_switches(run)
+    run.add_argument(
+        "ffmpeg_arguments",
+        nargs=argparse.REMAINDER,
+        help="FFmpeg arguments, preceded by --",
+    )
     return parser
 
 
@@ -163,6 +181,7 @@ def _print_analysis(analysis: Analysis, passes: PassResult | None = None) -> Non
     print(f"Optimized plan hash: {passes.ir.plan_hash}")
     print("Reference interpreter: available (Week 3)")
     print("Native C backend: available (Week 4; uncached)")
+    print("FFmpeg fused-filter integration: available (Week 5)")
     print("Cache status: unavailable until the Week 6 cache milestone")
     print(f"Planned rewrite: {analysis.rewritten_filtergraph}")
 
@@ -303,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
             value = analysis.as_dict()
             value["optimization"] = passes.as_dict() if passes is not None else None
             value["native_backend"] = "available_uncached" if passes is not None else None
+            value["ffmpeg_integration"] = "available" if passes is not None else None
             json.dump(value, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
         else:
@@ -314,4 +334,19 @@ def main(argv: list[str] | None = None) -> int:
         return _native(arguments)
     if arguments.command == "compile":
         return _compile(arguments)
+    if arguments.command == "run":
+        forwarded = list(arguments.ffmpeg_arguments)
+        if not forwarded or forwarded[0] != "--":
+            print(
+                "lavfi-cc: run arguments must be separated with --",
+                file=sys.stderr,
+            )
+            return 2
+        return run_ffmpeg(
+            forwarded[1:],
+            ffmpeg=arguments.ffmpeg,
+            require_fusion=arguments.require_fusion,
+            identity_elimination=not arguments.no_identity_elimination,
+            lut_composition=not arguments.no_lut_composition,
+        )
     raise AssertionError(f"unhandled command {arguments.command}")

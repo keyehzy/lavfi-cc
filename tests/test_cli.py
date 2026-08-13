@@ -164,6 +164,11 @@ class CLITests(unittest.TestCase):
             self.assertIn("Native library:", result.stdout)
             self.assertIn("lavfi_compiled_kernel", source.read_text())
 
+    def test_run_requires_the_double_dash_separator(self) -> None:
+        result = self.run_cli("run")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be separated with --", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

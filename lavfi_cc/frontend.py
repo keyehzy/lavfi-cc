@@ -540,7 +540,12 @@ def analyze_filtergraph(source: str) -> Analysis:
     effects = ("remove_color_dependent_side_data",) if removes_color_side_data else ()
     ir = PixelIR(tuple(operations), effects)
     original = [invocation.raw for invocation in graph.filters]
-    rewritten = original[:start] + [f"fused=plan_hash={ir.plan_hash}"] + original[end:]
+    remove_color = int("remove_color_dependent_side_data" in effects)
+    planned_filter = (
+        "fused=kernel=KERNEL_PATH:kernel_root=KERNEL_ROOT:"
+        f"plan_hash={ir.plan_hash}:remove_color_side_data={remove_color}"
+    )
+    rewritten = original[:start] + [planned_filter] + original[end:]
     return Analysis(
         source,
         graph,

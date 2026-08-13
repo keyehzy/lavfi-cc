@@ -1,6 +1,30 @@
-# Week 1 hand-fused experiment
+# FFmpeg fused-filter patches
 
-`vf_fused.c` is intentionally not the final dynamic-kernel filter. It hardcodes
+## Week 5 dynamic kernel filter
+
+`vf_fused.c` is the Week 5 integration filter. It loads the generated Week 4
+kernel ABI, validates its version, RGBA8 pixel-format identifier, and plan hash,
+then invokes the kernel in row slices through FFmpeg's worker executor. It also
+copies all frame properties and applies the compiler IR's requested removal of
+color-dependent side data.
+
+The loader requires an absolute kernel path under an absolute, private trusted
+root. Both must belong to the current user; the root cannot be group- or
+world-writable and the library cannot be world-writable. The kernel must be a
+direct child of that root after resolving symlinks.
+
+Build the pinned patched fork from the repository root:
+
+```sh
+./scripts/build-ffmpeg-week5.sh
+```
+
+This creates a separate `.work/ffmpeg-week5` worktree and installs the binary
+under `.build/ffmpeg-week5-<platform>`.
+
+## Week 1 hand-fused experiment
+
+`vf_fused_week1.c` is retained as the original experiment. It hardcodes
 the selected `negate,lutrgb` candidate so Week 1 can test the cheapest decisive
 hypothesis: whether one slice-threaded RGBA pass beats the two exact upstream
 passes.

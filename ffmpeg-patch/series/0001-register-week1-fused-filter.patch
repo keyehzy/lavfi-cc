@@ -22,3 +22,15 @@ index 6d70649..dd539d7 100644
  extern const FFFilter ff_vf_gblur;
  extern const FFFilter ff_vf_gblur_vulkan;
  extern const FFFilter ff_vf_geq;
+diff --git a/configure b/configure
+index 3bf9bf3..4c543ac 100755
+--- a/configure
++++ b/configure
+@@ -4129,6 +4129,7 @@ freezedetect_filter_select="scene_sad"
+ frei0r_deps_any="libdl LoadLibrary"
+ frei0r_filter_deps="frei0r"
+ frei0r_src_filter_deps="frei0r"
++fused_filter_deps="libdl"
+ fspp_filter_deps="gpl"
+ fsync_filter_deps="avformat"
+ gblur_vulkan_filter_deps="vulkan spirv_library"

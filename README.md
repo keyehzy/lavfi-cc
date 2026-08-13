@@ -1,8 +1,8 @@
 # lavfi-cc
 
 `lavfi-cc` is an experimental compiler for fusing compatible FFmpeg video
-filters into one native RGBA8 kernel. The repository has completed the Week 4
-C-code-generation milestone described in
+filters into one native RGBA8 kernel. The repository has completed the Week 5
+FFmpeg-integration milestone described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md).
 
 Explain and lower a bounded region with:
@@ -15,7 +15,25 @@ Explain and lower a bounded region with:
 The command exits with status 0 for an eligible region and 2 for a parse or
 eligibility rejection. Add `--json` to obtain the canonical IR, source map,
 plan hash, diagnostics, and planned filtergraph rewrite as structured output.
-The rewrite remains explanatory until FFmpeg integration arrives in Week 5.
+The rewrite uses placeholders in `explain`; `run` fills them with a private,
+per-invocation compiled kernel and trusted-root path.
+
+Build the pinned FFmpeg fork and run an ordinary command through the fused
+filter with:
+
+```sh
+./scripts/build-ffmpeg-week5.sh
+./lavfi-cc run --require-fusion -- \
+  -f lavfi -i "testsrc2=s=1920x1080:r=30" \
+  -vf "format=rgba,negate,lutrgb=r=val*1.08+2,format=yuv420p" \
+  -frames:v 30 -f null -
+```
+
+`run` accepts exactly one separate `-vf` or `-filter:v` argument. Unsupported
+graphs, compilation failures, and fused-filter preflight failures run the
+original FFmpeg command by default. `--require-fusion` makes those failures
+nonzero instead, which is appropriate for tests and benchmarks. Select a
+different patched binary with `--ffmpeg PATH` or `LAVFI_CC_FFMPEG`.
 
 Run the reference interpreter over one or more tightly packed raw RGBA8 frames:
 
@@ -92,6 +110,15 @@ full correctness and performance exit gate with:
 
 ```sh
 ./scripts/test-week4.sh
+```
+
+Week 5's dynamic AVFilter, wrapper rewrite/fallback contract, and integration
+matrix are in [`docs/week-5-report.md`](docs/week-5-report.md). Build and run
+the complete gate with:
+
+```sh
+./scripts/build-ffmpeg-week5.sh
+./scripts/test-week5.sh
 ```
 
 Set `LAVFI_CC_FFMPEG=/path/to/ffmpeg` to select another pinned build. The

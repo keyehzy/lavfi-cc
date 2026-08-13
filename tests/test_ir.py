@@ -107,9 +107,10 @@ class EligibilityTests(unittest.TestCase):
         self.assertTrue(analysis.eligible, analysis.diagnostics)
         self.assertEqual(
             analysis.rewritten_filtergraph,
-            "scale=10:10,format=rgba,fused=plan_hash="
+            "scale=10:10,format=rgba,fused=kernel=KERNEL_PATH:"
+            "kernel_root=KERNEL_ROOT:plan_hash="
             + analysis.ir.plan_hash
-            + ",format=yuv420p,fps=24",
+            + ":remove_color_side_data=0,format=yuv420p,fps=24",
         )
 
     def test_rejects_ambiguous_multiple_regions(self) -> None:
