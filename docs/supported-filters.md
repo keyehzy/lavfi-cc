@@ -4,11 +4,41 @@ This inventory is derived from FFmpeg `n8.1.2`, commit
 `38b88335f99e76ed89ff3c93f877fdefce736c13`. It is the semantic contract for
 the compiler, not a summary of behavior across arbitrary FFmpeg releases.
 
-The MVP region receives and emits packed `AV_PIX_FMT_RGBA`: four bytes per
-pixel in R, G, B, A order. Every filter boundary produces another RGBA8 value.
-Those intermediate clipping and quantization points must remain even when the
-frame pass is fused. Runtime commands, timeline-dependent options, non-finite
-values, and format changes inside the region are rejected.
+A fused region receives and emits one packed 8-bit RGB format. Every filter
+boundary produces another 8-bit value per component. Those intermediate
+clipping and quantization points must remain even when the frame pass is fused.
+Runtime commands, timeline-dependent options, non-finite values, and format
+changes inside the region are rejected.
+
+## Pixel layouts
+
+The accepted layouts are `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24`.
+They differ only in which byte of a pixel holds which component and whether
+alpha exists, so the IR is layout-independent and always sees logical RGBA.
+`lavfi_cc/layouts.py` records the byte offsets, which were read out of the
+pinned binary by converting one known `0x11223344` RGBA pixel into each format.
+
+An alpha-less layout loads `a = 0` and stores only R, G, and B. That matches
+upstream: the packed `colorchannelmixer` path omits every alpha term when
+`have_alpha` is unset, and the other accepted filters treat components
+independently, so an alpha lane that is never stored cannot change a stored one.
+
+Two rules follow from the format lists rather than from the pixel maths:
+
+- A region may only be fused in a format that **every** filter in it
+  advertises. Otherwise FFmpeg negotiation inserts a conversion inside the
+  region and one kernel is no longer equivalent to the filters it replaced.
+  `colorlevels` and `colorchannelmixer` accept `0rgb`, `0bgr`, `rgb0`, and
+  `bgr0`, which `negate` and `lutrgb` do not, so that family is outside the
+  common subset and is not offered.
+- A region may only be fused in a format it already works in. A pointwise
+  filter is not format-agnostic: pinned `negate` over `testsrc2` does not
+  produce the same bytes as `format=rgba,negate`. Fusing a run whose working
+  format is unknown or unsupported would change output, so it is refused.
+
+Planar (`gbrp`, `gbrap`) and 9–16-bit RGB formats are advertised by all four
+filters but are not implemented; they need per-plane pointers in the kernel
+ABI. See [`roadmap-status.md`](roadmap-status.md).
 
 All four upstream filters advertise `AVFILTER_FLAG_SLICE_THREADS`. A fused
 filter must do the same. These operations are row-local in the accepted subset,
@@ -34,6 +64,12 @@ The preferred explicit alpha spelling is `components=r+g+b+a` (or
 negating RGB: the legacy option changes the plane mask, but packed RGB uses the
 separate component mask. The compiler must reproduce that pinned behavior if it
 accepts the option; it must not infer the behavior suggested by the option name.
+
+An explicit component mask is validated against the format at configuration
+time, and a request for a component the format lacks fails the graph outright
+("Requested components not available"). The default mask skips that check. The
+compiler therefore rejects `components=…a` on `rgb24` and `bgr24` rather than
+treating it as a no-op, so it accepts exactly the graphs upstream accepts.
 
 Accepted MVP constraints:
 

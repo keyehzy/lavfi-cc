@@ -1,9 +1,17 @@
 # lavfi-cc
 
 `lavfi-cc` is an experimental compiler for fusing compatible FFmpeg video
-filters into one native RGBA8 kernel. The repository has completed the Week 5
-FFmpeg-integration and Week 6 cache/operational-safety milestones described in
-[`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md).
+filters into one native kernel over a packed 8-bit RGB frame. The repository
+has completed the Week 5 FFmpeg-integration and Week 6 cache/operational-safety
+milestones described in
+[`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md), plus the reach
+work recorded in [`docs/roadmap-status.md`](docs/roadmap-status.md).
+
+Accepted layouts are `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24`. A
+run is only fused when it already works in one of them: a pointwise filter
+produces different bytes in different pixel formats, so fusing a YUV or
+negotiation-decided run into an RGB kernel would change the output. Runs that
+cannot be fused are reported rather than guessed at.
 
 Explain and lower a bounded region with:
 
@@ -34,6 +42,50 @@ graphs, compilation failures, and fused-filter preflight failures run the
 original FFmpeg command by default. `--require-fusion` makes those failures
 nonzero instead, which is appropriate for tests and benchmarks. Select a
 different patched binary with `--ffmpeg PATH` or `LAVFI_CC_FFMPEG`.
+
+## Discovering islands automatically
+
+`--auto-islands` drops the requirement that the fusible run be bracketed by
+explicit `format` filters. Every maximal run of supported filters is found
+wherever it appears, and each is fused with its own kernel:
+
+```sh
+./lavfi-cc explain --auto-islands --vf \
+  "format=rgba,negate,lutrgb=r=val*2,crop=64:64,colorlevels=rimin=0.1,negate"
+```
+
+The working pixel format is tracked along the chain and survives filters that
+provably cannot change it, such as `crop`, `hflip`, and `fps`. `scale` clears
+it, because `scale` converts.
+
+## Scanning real filtergraphs
+
+`scan` is analysis only: it never compiles, loads, or runs anything. It accepts
+graphs far outside the fusible subset — several chains, link labels, hardware
+filters, unreadable options — and reports which runs are fusible today and what
+is blocking the rest, ranked by the frame passes each blocker withholds:
+
+```sh
+./lavfi-cc scan --file tests/corpus/filtergraphs.txt
+./lavfi-cc scan --vf "[0:v]scale=640:360,format=rgba,negate,lutrgb=r=val*2[a]" --json
+```
+
+## Building kernels ahead of time
+
+`bundle` compiles every kernel a corpus needs once, at build time, so a
+deployment never needs a compiler:
+
+```sh
+./lavfi-cc bundle --file graphs.txt --auto-islands --output kernels/
+./lavfi-cc run --bundle kernels/ --require-bundle --require-fusion -- \
+  -i input.mp4 -vf "format=rgba,negate,lutrgb=r=val*2,format=yuv420p" out.mp4
+```
+
+`run` prefers a bundled kernel over compiling one and validates every hit by
+checksum, ABI, layout, and plan hash. `--require-bundle` refuses to invoke a
+compiler at all. `--emit-only` writes the generated C and the index without
+compiling, so another build system can compile the kernels with its own
+toolchain. Set `LAVFI_CC_BUNDLE` instead of passing `--bundle` if you prefer.
 
 Run the reference interpreter over one or more tightly packed raw RGBA8 frames:
 
@@ -144,6 +196,10 @@ concurrency controls, sanitizer result, and warm-cache measurement are in
 ```sh
 ./scripts/test-week6.sh
 ```
+
+Island discovery, the widened format set, the scanner, ahead-of-time bundles,
+and the reasoning behind what is still missing are in
+[`docs/roadmap-status.md`](docs/roadmap-status.md).
 
 The GitHub Actions workflow runs the native suite with Clang 16, 17, and 18 on
 Linux, and with Apple Clang and LLVM Clang 18 on macOS. The primary compiler on

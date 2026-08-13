@@ -128,6 +128,7 @@ def _with_stages(
         metadata_effects=ir.metadata_effects,
         ir_version=ir.ir_version,
         pixel_format=ir.pixel_format,
+        layout=ir.layout,
     )
 
 

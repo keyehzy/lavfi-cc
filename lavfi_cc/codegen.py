@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .ir import Operation, PixelIR
+from .layouts import get_layout
 from .passes import (
     LEVELS_EVALUATION,
     MIXER_EVALUATIONS,
@@ -20,6 +21,7 @@ class GeneratedC:
     plan_hash: str
     optimized_plan_hash: str
     passes: PassResult
+    layout: str = "rgba"
 
 
 def _format_table(
@@ -207,9 +209,11 @@ def generate_c(
                 "",
             ]
         )
+    layout = get_layout(ir.layout)
     lines.extend(_stage_declarations(stages))
     lines.extend(
         [
+            f"/* byte layout: {layout.name} (step {layout.step}) */",
             "static void process_rgba8(",
             "    uint8_t *dst, ptrdiff_t dst_stride,",
             "    const uint8_t *src, ptrdiff_t src_stride,",
@@ -219,25 +223,26 @@ def generate_c(
             "        const uint8_t *source_row = src + (ptrdiff_t)y * src_stride;",
             "        uint8_t *destination_row = dst + (ptrdiff_t)y * dst_stride;",
             "        for (int x = 0; x < width; ++x) {",
-            "            const uint8_t *source = source_row + (ptrdiff_t)x * 4;",
-            "            uint8_t *destination = destination_row + (ptrdiff_t)x * 4;",
-            "            uint8_t c0 = source[0];",
-            "            uint8_t c1 = source[1];",
-            "            uint8_t c2 = source[2];",
-            "            uint8_t c3 = source[3];",
+            f"            const uint8_t *source = source_row + (ptrdiff_t)x * {layout.step};",
+            f"            uint8_t *destination = destination_row + (ptrdiff_t)x * {layout.step};",
         ]
     )
+    for channel in range(4):
+        offset = layout.offset(channel)
+        if offset is None:
+            # Upstream reads no alpha for these layouts and contributes none.
+            lines.append(f"            uint8_t c{channel} = 0;")
+        else:
+            lines.append(f"            uint8_t c{channel} = source[{offset}];")
     for index, operation in enumerate(stages):
         lines.append("")
         lines.append(f"            /* stage {index} */")
         lines.extend(_stage_body(index, operation))
+    lines.append("")
+    for channel in layout.stored_channels:
+        lines.append(f"            destination[{layout.offset(channel)}] = c{channel};")
     lines.extend(
         [
-            "",
-            "            destination[0] = c0;",
-            "            destination[1] = c1;",
-            "            destination[2] = c2;",
-            "            destination[3] = c3;",
             "        }",
             "    }",
             "}",
@@ -246,7 +251,7 @@ def generate_c(
             "",
             "LAVFI_KERNEL_EXPORT const LavfiCompiledKernel lavfi_compiled_kernel = {",
             "    LAVFI_KERNEL_ABI_VERSION,",
-            "    LAVFI_PIXEL_FORMAT_RGBA8,",
+            f"    {layout.abi_macro},",
             "    kernel_plan_hash,",
             "    process_rgba8,",
             "};",
@@ -258,4 +263,5 @@ def generate_c(
         ir.plan_hash,
         passes.ir.plan_hash,
         passes,
+        layout.name,
     )

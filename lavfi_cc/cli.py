@@ -12,8 +12,9 @@ import sys
 from typing import BinaryIO, Callable
 
 from . import __version__
+from .bundle import BundleError, build_bundle, load_graph_sources
 from .cache import CacheError, KernelCache
-from .frontend import Analysis, analyze_filtergraph
+from .frontend import Analysis, IslandPlan, analyze_filtergraph
 from .ffmpeg import run_ffmpeg
 from .interpreter import InterpreterError, interpret_rgba8
 from .ir import PixelIR
@@ -24,6 +25,7 @@ from .native import (
     library_suffix,
 )
 from .passes import PassResult, optimize_ir
+from .scanner import load_graphs, render_text, scan_graph, summarize
 
 
 def _positive_integer(value: str) -> int:
@@ -89,6 +91,12 @@ def _parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="packed RGBA8 output (default: standard output)",
     )
+    interpret.add_argument(
+        "--auto-islands",
+        action="store_true",
+        help="discover fusible islands anywhere instead of requiring explicit "
+        "format boundaries",
+    )
     native = subparsers.add_parser(
         "native", help="compile and run an eligible chain on raw RGBA8 frames"
     )
@@ -146,12 +154,66 @@ def _parser() -> argparse.ArgumentParser:
         help="fail instead of running the original chain when fusion is unavailable",
     )
     run.add_argument("--cache-dir", metavar="PATH", help="kernel cache directory")
+    run.add_argument(
+        "--bundle",
+        metavar="DIR",
+        help="prebuilt kernel bundle to prefer over compiling (or LAVFI_CC_BUNDLE)",
+    )
+    run.add_argument(
+        "--require-bundle",
+        action="store_true",
+        help="never invoke a compiler; every kernel must come from the bundle",
+    )
     _add_pass_switches(run)
     run.add_argument(
         "ffmpeg_arguments",
         nargs=argparse.REMAINDER,
         help="FFmpeg arguments, preceded by --",
     )
+    bundle = subparsers.add_parser(
+        "bundle",
+        help="build kernels ahead of time so deployment needs no compiler",
+    )
+    bundle_source = bundle.add_mutually_exclusive_group(required=True)
+    bundle_source.add_argument("--vf", metavar="FILTERGRAPH", help="one filtergraph")
+    bundle_source.add_argument(
+        "--file",
+        metavar="PATH",
+        action="append",
+        help="a corpus with one filtergraph per line (repeatable)",
+    )
+    bundle.add_argument(
+        "--output", required=True, metavar="DIR", help="bundle directory to write"
+    )
+    bundle.add_argument(
+        "--emit-only",
+        action="store_true",
+        help="write generated C and the index without compiling anything",
+    )
+    bundle.add_argument("--json", action="store_true", help="emit the report as JSON")
+    _add_pass_switches(bundle)
+
+    scan = subparsers.add_parser(
+        "scan",
+        help="report fusible islands in arbitrary filtergraphs without compiling",
+    )
+    scan_source = scan.add_mutually_exclusive_group(required=True)
+    scan_source.add_argument("--vf", metavar="FILTERGRAPH", help="one filtergraph")
+    scan_source.add_argument(
+        "--file",
+        metavar="PATH",
+        help="a corpus with one filtergraph per line ('-' for standard input)",
+    )
+    scan.add_argument(
+        "--entry-format",
+        metavar="PIXFMT",
+        help="pixel format entering each chain, when the caller can prove it",
+    )
+    scan.add_argument(
+        "--verbose", action="store_true", help="report every island, not only totals"
+    )
+    scan.add_argument("--json", action="store_true", help="emit the report as JSON")
+
     cache = subparsers.add_parser("cache", help="inspect or prune native-kernel cache")
     cache_commands = cache.add_subparsers(dest="cache_command", required=True)
     cache_list = cache_commands.add_parser("list", help="list cached kernels")
@@ -178,6 +240,22 @@ def _add_pass_switches(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="disable levels materialization, LUT composition, and mixer folding",
     )
+    parser.add_argument(
+        "--auto-islands",
+        action="store_true",
+        help="discover fusible islands anywhere instead of requiring explicit "
+        "format boundaries",
+    )
+
+
+def _analyze(arguments: argparse.Namespace, *, entry_format: str | None = None) -> Analysis:
+    """Analyze ``--vf`` honouring the island-discovery switches of any command."""
+
+    return analyze_filtergraph(
+        arguments.vf,
+        auto_islands=getattr(arguments, "auto_islands", False),
+        entry_format=entry_format,
+    )
 
 
 def _format_filter(index: int, invocation: object) -> str:
@@ -194,10 +272,39 @@ def _format_filter(index: int, invocation: object) -> str:
     )
 
 
+def _print_island(
+    analysis: Analysis,
+    plan: IslandPlan,
+    passes: PassResult | None,
+    cache: dict[str, object] | None,
+) -> None:
+    start, end = plan.region
+    detail = f" via {plan.boundary} boundary" if analysis.auto_islands else ""
+    print(f"Eligibility: eligible (filters [{start}:{end}]{detail})")
+    print("Canonical region:")
+    for filter_ in plan.canonical_filters:
+        print(f"  {filter_}")
+    print("IR:")
+    print(plan.ir.pretty())
+    assert passes is not None
+    print("Compiler passes:")
+    for name, changes in passes.changes:
+        print(f"  {name}: {changes} change{'s' if changes != 1 else ''}")
+    print(f"Optimized plan hash: {passes.ir.plan_hash}")
+    if cache is None:
+        print("Cache status: unavailable")
+    else:
+        print(f"Cache key: {cache['key']}")
+        print(f"Cache status: {cache['status']}")
+        if cache.get("path"):
+            print(f"Cached kernel: {cache['path']}")
+        if cache.get("detail"):
+            print(f"Cache detail: {cache['detail']}")
+
+
 def _print_analysis(
     analysis: Analysis,
-    passes: PassResult | None = None,
-    cache: dict[str, object] | None = None,
+    details: list[tuple[IslandPlan, PassResult | None, dict[str, object] | None]],
 ) -> None:
     print("Parsed filters:")
     if analysis.graph is None:
@@ -212,32 +319,14 @@ def _print_analysis(
             print(f"  - {diagnostic.format()}")
         return
 
-    assert analysis.ir is not None
-    assert analysis.region is not None
-    start, end = analysis.region
-    print(f"Eligibility: eligible (filters [{start}:{end}])")
-    print("Canonical region:")
-    for filter_ in analysis.canonical_filters:
-        print(f"  {filter_}")
-    print("IR:")
-    print(analysis.ir.pretty())
-    assert passes is not None
-    print("Compiler passes:")
-    for name, changes in passes.changes:
-        print(f"  {name}: {changes} change{'s' if changes != 1 else ''}")
-    print(f"Optimized plan hash: {passes.ir.plan_hash}")
+    for position, (plan, passes, cache) in enumerate(details):
+        if len(details) > 1:
+            print(f"Island {position + 1} of {len(details)}:")
+        _print_island(analysis, plan, passes, cache)
+    print(f"Frame passes eliminated: {analysis.eliminated_passes}")
     print("Reference interpreter: available (Week 3)")
     print("Native C backend: available (Week 4)")
     print("FFmpeg fused-filter integration: available (Week 5)")
-    if cache is None:
-        print("Cache status: unavailable")
-    else:
-        print(f"Cache key: {cache['key']}")
-        print(f"Cache status: {cache['status']}")
-        if cache.get("path"):
-            print(f"Cached kernel: {cache['path']}")
-        if cache.get("detail"):
-            print(f"Cache detail: {cache['detail']}")
     print(f"Planned rewrite: {analysis.rewritten_filtergraph}")
 
 
@@ -257,7 +346,7 @@ def _stream_frames(
     arguments: argparse.Namespace,
     process_frame: Callable[[PixelIR, bytes, int, int], bytes],
 ) -> int:
-    analysis = analyze_filtergraph(arguments.vf)
+    analysis = _analyze(arguments, entry_format="rgba")
     if not analysis.eligible:
         for diagnostic in analysis.diagnostics:
             print(f"lavfi-cc: {diagnostic.format()}", file=sys.stderr)
@@ -310,7 +399,7 @@ def _interpret(arguments: argparse.Namespace) -> int:
 
 
 def _native(arguments: argparse.Namespace) -> int:
-    analysis = analyze_filtergraph(arguments.vf)
+    analysis = _analyze(arguments, entry_format="rgba")
     if not analysis.eligible:
         for diagnostic in analysis.diagnostics:
             print(f"lavfi-cc: {diagnostic.format()}", file=sys.stderr)
@@ -323,7 +412,7 @@ def _native(arguments: argparse.Namespace) -> int:
             identity_elimination=not arguments.no_identity_elimination,
             lut_composition=not arguments.no_lut_composition,
         ) as cached, NativeKernel(
-            cached.library_path, analysis.ir.plan_hash
+            cached.library_path, analysis.ir.plan_hash, layout=analysis.ir.layout
         ) as kernel:
             return _stream_frames(
                 arguments,
@@ -337,7 +426,7 @@ def _native(arguments: argparse.Namespace) -> int:
 
 
 def _compile(arguments: argparse.Namespace) -> int:
-    analysis = analyze_filtergraph(arguments.vf)
+    analysis = _analyze(arguments, entry_format="rgba")
     if not analysis.eligible:
         for diagnostic in analysis.diagnostics:
             print(f"lavfi-cc: {diagnostic.format()}", file=sys.stderr)
@@ -392,6 +481,105 @@ def _compile(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _bundle(arguments: argparse.Namespace) -> int:
+    if arguments.vf is not None:
+        graphs = [arguments.vf]
+    else:
+        try:
+            graphs = load_graph_sources(arguments.file)
+        except OSError as error:
+            print(f"lavfi-cc: {error}", file=sys.stderr)
+            return 1
+    if not graphs:
+        print("lavfi-cc: no filtergraph to bundle", file=sys.stderr)
+        return 2
+
+    try:
+        report = build_bundle(
+            graphs,
+            arguments.output,
+            auto_islands=arguments.auto_islands,
+            compile_kernels=not arguments.emit_only,
+            identity_elimination=not arguments.no_identity_elimination,
+            lut_composition=not arguments.no_lut_composition,
+        )
+    except (BundleError, NativeError, OSError) as error:
+        print(f"lavfi-cc: {error}", file=sys.stderr)
+        return 1
+
+    if arguments.json:
+        json.dump(
+            {
+                "directory": str(Path(arguments.output).resolve()),
+                "graphs": report.graphs,
+                "kernels": len(report.entries),
+                "compiled": report.compiled,
+                "entries": [entry.as_dict() for entry in report.entries],
+                "ineligible": [
+                    {"graph": graph, "reason": reason}
+                    for graph, reason in report.ineligible
+                ],
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+    else:
+        print(f"Bundle directory: {Path(arguments.output).resolve()}")
+        print(f"Graphs read: {report.graphs}")
+        print(f"Distinct kernels: {len(report.entries)}")
+        print(f"Compiled libraries: {report.compiled}")
+        for entry in report.entries:
+            print(f"  {entry.plan_hash} {entry.layout} {entry.source_name}")
+        if report.ineligible:
+            print(f"Graphs with no fusible island: {len(report.ineligible)}")
+    # A corpus is allowed to contain graphs with nothing to fuse.
+    return 0
+
+
+def _scan(arguments: argparse.Namespace) -> int:
+    if arguments.vf is not None:
+        graphs = [arguments.vf]
+    else:
+        try:
+            if arguments.file == "-":
+                graphs = load_graphs(sys.stdin)
+            else:
+                with open(arguments.file, "r", encoding="utf-8") as stream:
+                    graphs = load_graphs(stream)
+        except OSError as error:
+            print(f"lavfi-cc: {error}", file=sys.stderr)
+            return 1
+    if not graphs:
+        print("lavfi-cc: no filtergraph to scan", file=sys.stderr)
+        return 2
+
+    scans = [
+        scan_graph(graph, entry_format=arguments.entry_format) for graph in graphs
+    ]
+    summary = summarize(scans)
+    if arguments.json:
+        json.dump(
+            {
+                "summary": summary.as_dict(),
+                "graphs": [scan.as_dict() for scan in scans],
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+    else:
+        print(
+            render_text(
+                scans, summary, verbose=arguments.verbose or len(scans) == 1
+            )
+        )
+    # Scanning is analysis only: a graph with no island is a finding, not a failure.
+    return 0 if summary.parsed == summary.graphs else 1
+
+
 def _cache(arguments: argparse.Namespace) -> int:
     cache = KernelCache(arguments.cache_dir)
     try:
@@ -437,21 +625,21 @@ def _cache(arguments: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.command == "explain":
-        analysis = analyze_filtergraph(arguments.vf)
-        passes = (
-            optimize_ir(
-                analysis.ir,
+        analysis = _analyze(arguments)
+        details: list[
+            tuple[IslandPlan, PassResult | None, dict[str, object] | None]
+        ] = []
+        for plan in analysis.plans:
+            passes = optimize_ir(
+                plan.ir,
                 identity_elimination=not arguments.no_identity_elimination,
                 lut_composition=not arguments.no_lut_composition,
             )
-            if analysis.ir is not None
-            else None
-        )
-        cache_info = None
-        if analysis.ir is not None:
             try:
-                cache_info = KernelCache(arguments.cache_dir).probe(
-                    analysis.ir,
+                cache_info: dict[str, object] | None = KernelCache(
+                    arguments.cache_dir
+                ).probe(
+                    plan.ir,
                     identity_elimination=not arguments.no_identity_elimination,
                     lut_composition=not arguments.no_lut_composition,
                 )
@@ -461,16 +649,27 @@ def main(argv: list[str] | None = None) -> int:
                     "status": "unavailable",
                     "detail": str(error),
                 }
+            details.append((plan, passes, cache_info))
         if arguments.json:
             value = analysis.as_dict()
-            value["optimization"] = passes.as_dict() if passes is not None else None
-            value["native_backend"] = "available" if passes is not None else None
-            value["ffmpeg_integration"] = "available" if passes is not None else None
-            value["cache"] = cache_info
+            first = details[0] if details else (None, None, None)
+            value["optimization"] = (
+                first[1].as_dict() if first[1] is not None else None
+            )
+            value["native_backend"] = "available" if details else None
+            value["ffmpeg_integration"] = "available" if details else None
+            value["cache"] = first[2]
+            for island, (_plan, island_passes, island_cache) in zip(
+                value["islands"], details, strict=True
+            ):
+                island["optimization"] = (
+                    island_passes.as_dict() if island_passes is not None else None
+                )
+                island["cache"] = island_cache
             json.dump(value, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
         else:
-            _print_analysis(analysis, passes, cache_info)
+            _print_analysis(analysis, details)
         return 0 if analysis.eligible else 2
     if arguments.command == "interpret":
         return _interpret(arguments)
@@ -478,6 +677,10 @@ def main(argv: list[str] | None = None) -> int:
         return _native(arguments)
     if arguments.command == "compile":
         return _compile(arguments)
+    if arguments.command == "bundle":
+        return _bundle(arguments)
+    if arguments.command == "scan":
+        return _scan(arguments)
     if arguments.command == "cache":
         return _cache(arguments)
     if arguments.command == "run":
@@ -495,5 +698,8 @@ def main(argv: list[str] | None = None) -> int:
             require_fusion=arguments.require_fusion,
             identity_elimination=not arguments.no_identity_elimination,
             lut_composition=not arguments.no_lut_composition,
+            auto_islands=arguments.auto_islands,
+            bundle_dir=arguments.bundle,
+            require_bundle=arguments.require_bundle,
         )
     raise AssertionError(f"unhandled command {arguments.command}")

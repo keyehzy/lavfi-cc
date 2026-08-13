@@ -8,6 +8,7 @@ import struct
 from typing import Any
 
 from .ir import IR_VERSION, Operation, PixelIR
+from .layouts import LAYOUTS, get_layout
 
 
 class InterpreterError(ValueError):
@@ -268,6 +269,8 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
         )
     if ir.pixel_format != "rgba8":
         raise InterpreterError(f"unsupported pixel format {ir.pixel_format!r}")
+    if ir.layout not in LAYOUTS:
+        raise InterpreterError(f"unsupported pixel layout {ir.layout!r}")
     if len(ir.operations) < 2:
         raise InterpreterError("IR must contain a load and a store")
     if ir.operations[0].kind != "load_rgba8" or ir.operations[-1].kind != "store_rgba8":
@@ -405,7 +408,8 @@ def interpret_into(
         raise InterpreterError("width must be a positive integer")
     if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
         raise InterpreterError("height must be a positive integer")
-    row_bytes = width * 4
+    layout = get_layout(ir.layout)
+    row_bytes = width * layout.step
     source_stride = row_bytes if source_stride is None else source_stride
     destination_stride = row_bytes if destination_stride is None else destination_stride
     source_view = _byte_view(source, "source", writable=False)
@@ -425,20 +429,25 @@ def interpret_into(
     )
 
     stages = _prepare(ir)
+    step = layout.step
+    offsets = layout.offsets
+    stored = layout.stored_channels
     for y in range(height):
         source_row = source_offset + y * source_stride
         destination_row = destination_offset + y * destination_stride
         for x in range(width):
-            source_pixel = source_row + x * 4
-            pixel: Pixel = (
-                source_view[source_pixel],
-                source_view[source_pixel + 1],
-                source_view[source_pixel + 2],
-                source_view[source_pixel + 3],
+            source_pixel = source_row + x * step
+            # An absent alpha loads as zero, matching upstream's have_alpha=0 path.
+            pixel: Pixel = tuple(  # type: ignore[assignment]
+                source_view[source_pixel + offsets[channel]]
+                if offsets[channel] is not None
+                else 0
+                for channel in range(4)
             )
             output = _run_pixel(stages, pixel)
-            destination_pixel = destination_row + x * 4
-            destination_view[destination_pixel : destination_pixel + 4] = bytes(output)
+            destination_pixel = destination_row + x * step
+            for channel in stored:
+                destination_view[destination_pixel + offsets[channel]] = output[channel]
 
 
 def interpret_rgba8(ir: PixelIR, source: Any, width: int, height: int) -> bytes:
@@ -448,7 +457,7 @@ def interpret_rgba8(ir: PixelIR, source: Any, width: int, height: int) -> bytes:
         raise InterpreterError("width must be a positive integer")
     if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
         raise InterpreterError("height must be a positive integer")
-    expected = width * height * 4
+    expected = width * height * get_layout(ir.layout).step
     source_view = _byte_view(source, "source", writable=False)
     if len(source_view) != expected:
         raise InterpreterError(

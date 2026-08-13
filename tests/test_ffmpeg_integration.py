@@ -272,7 +272,13 @@ class FFmpegEndToEndTests(unittest.TestCase):
 
     @classmethod
     def run_wrapper(
-        cls, graph: str, source: bytes, width: int, height: int
+        cls,
+        graph: str,
+        source: bytes,
+        width: int,
+        height: int,
+        *,
+        extra_options: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
             [
@@ -283,6 +289,7 @@ class FFmpegEndToEndTests(unittest.TestCase):
                 "--ffmpeg",
                 str(week5_ffmpeg_path()),
                 "--require-fusion",
+                *extra_options,
                 "--",
                 "-hide_banner",
                 "-nostdin",
@@ -316,6 +323,45 @@ class FFmpegEndToEndTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             check=False,
         )
+
+    def test_auto_islands_fuse_several_regions_bit_exactly(self) -> None:
+        generator = random.Random(0x15A4D)
+        width, height = 33, 7
+        source = bytes(
+            generator.randrange(256) for _ in range(width * height * 4)
+        )
+        # Two fusible runs separated by a geometric filter that keeps the
+        # format, with no trailing format boundary to mark the second run.
+        graph = (
+            "format=rgba,negate,lutrgb=r=val*1.08+2:g=negval,"
+            "hflip,"
+            "colorlevels=rimin=.05:gimax=.9:preserve=none,"
+            "colorchannelmixer=rr=.9:rg=.1:gg=.8:gb=.2:bb=1:aa=1:pc=none"
+        )
+        analysis = analyze_filtergraph(graph, auto_islands=True)
+        self.assertEqual(len(analysis.plans), 2)
+
+        baseline = self.run_raw(graph, source, width, height)
+        fused = self.run_wrapper(
+            graph, source, width, height, extra_options=("--auto-islands",)
+        )
+        self.assertEqual(baseline.returncode, 0, baseline.stderr.decode())
+        self.assertEqual(fused.returncode, 0, fused.stderr.decode())
+        self.assertEqual(len(baseline.stdout), width * height * 4)
+        self.assertEqual(fused.stdout, baseline.stdout)
+
+    def test_auto_islands_refuse_a_negotiated_region(self) -> None:
+        # scale clears the pinned format, so the following run would have to be
+        # fused in a format FFmpeg negotiates. That must fail, not guess.
+        result = self.run_wrapper(
+            "scale=8:8,negate,lutrgb=r=val*2",
+            b"\0" * (4 * 4 * 4),
+            4,
+            4,
+            extra_options=("--auto-islands",),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"negotiation", result.stderr)
 
     def test_wrapper_is_bit_exact_for_supported_multistage_chains(self) -> None:
         generator = random.Random(0xF05ED)

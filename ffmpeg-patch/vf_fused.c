@@ -25,10 +25,33 @@
 #include "libavutil/opt.h"
 #include "avfilter.h"
 #include "filters.h"
+#include "formats.h"
 #include "video.h"
 
 #define LAVFI_KERNEL_ABI_VERSION 1u
+
+/* Packed 8-bit RGB layouts, mirroring runtime/kernel_abi.h. Every one of them
+ * is a single plane addressed by one stride, so they all share this filter's
+ * slice loop and no ABI change was needed to add them. */
 #define LAVFI_PIXEL_FORMAT_RGBA8 1u
+#define LAVFI_PIXEL_FORMAT_BGRA8 2u
+#define LAVFI_PIXEL_FORMAT_ARGB8 3u
+#define LAVFI_PIXEL_FORMAT_ABGR8 4u
+#define LAVFI_PIXEL_FORMAT_RGB24 5u
+#define LAVFI_PIXEL_FORMAT_BGR24 6u
+
+static enum AVPixelFormat kernel_pixel_format(uint32_t identifier)
+{
+    switch (identifier) {
+    case LAVFI_PIXEL_FORMAT_RGBA8: return AV_PIX_FMT_RGBA;
+    case LAVFI_PIXEL_FORMAT_BGRA8: return AV_PIX_FMT_BGRA;
+    case LAVFI_PIXEL_FORMAT_ARGB8: return AV_PIX_FMT_ARGB;
+    case LAVFI_PIXEL_FORMAT_ABGR8: return AV_PIX_FMT_ABGR;
+    case LAVFI_PIXEL_FORMAT_RGB24: return AV_PIX_FMT_RGB24;
+    case LAVFI_PIXEL_FORMAT_BGR24: return AV_PIX_FMT_BGR24;
+    default:                       return AV_PIX_FMT_NONE;
+    }
+}
 
 typedef void (*LavfiProcessFunction)(
     uint8_t *dst,
@@ -181,9 +204,9 @@ static av_cold int init(AVFilterContext *ctx)
         ret = AVERROR(EINVAL);
         goto fail;
     }
-    if (s->kernel->pixel_format != LAVFI_PIXEL_FORMAT_RGBA8) {
-        av_log(ctx, AV_LOG_ERROR, "kernel pixel format %u is not RGBA8 (%u)\n",
-               s->kernel->pixel_format, LAVFI_PIXEL_FORMAT_RGBA8);
+    if (kernel_pixel_format(s->kernel->pixel_format) == AV_PIX_FMT_NONE) {
+        av_log(ctx, AV_LOG_ERROR, "kernel pixel format %u is not supported\n",
+               s->kernel->pixel_format);
         ret = AVERROR(EINVAL);
         goto fail;
     }
@@ -267,6 +290,24 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     return ff_filter_frame(outlink, out);
 }
 
+/* The kernel is loaded during init, so by the time formats are negotiated the
+ * filter can advertise exactly the one layout the kernel was compiled for.
+ * FFmpeg then converts into it only if the surrounding graph requires it. */
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
+{
+    const FusedContext *s = ctx->priv;
+    enum AVPixelFormat pix_fmts[2] = { AV_PIX_FMT_NONE, AV_PIX_FMT_NONE };
+
+    if (!s->kernel)
+        return AVERROR(EINVAL);
+    pix_fmts[0] = kernel_pixel_format(s->kernel->pixel_format);
+    if (pix_fmts[0] == AV_PIX_FMT_NONE)
+        return AVERROR(EINVAL);
+    return ff_set_pixel_formats_from_list2(ctx, cfg_in, cfg_out, pix_fmts);
+}
+
 static const AVFilterPad inputs[] = {
     {
         .name         = "default",
@@ -278,7 +319,7 @@ static const AVFilterPad inputs[] = {
 const FFFilter ff_vf_fused = {
     .p.name        = "fused",
     .p.description = NULL_IF_CONFIG_SMALL(
-        "Run one checked lavfi-cc RGBA8 kernel."),
+        "Run one checked lavfi-cc packed 8-bit RGB kernel."),
     .p.priv_class  = &fused_class,
     .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(FusedContext),
@@ -286,5 +327,5 @@ const FFFilter ff_vf_fused = {
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(ff_video_default_filterpad),
-    FILTER_PIXFMTS(AV_PIX_FMT_RGBA),
+    FILTER_QUERY_FUNC2(query_formats),
 };

@@ -14,6 +14,7 @@ from typing import Any
 
 from .codegen import GeneratedC, generate_c
 from .ir import PixelIR
+from .layouts import DEFAULT_LAYOUT, get_layout
 
 
 KERNEL_ABI_VERSION = 1
@@ -243,6 +244,7 @@ class NativeKernel:
         *,
         temporary_directory: tempfile.TemporaryDirectory[str] | None = None,
         artifact: CompiledArtifact | None = None,
+        layout: str = DEFAULT_LAYOUT,
     ) -> None:
         path = Path(library_path).expanduser().resolve()
         if not path.is_file():
@@ -258,10 +260,11 @@ class NativeKernel:
                 f"kernel ABI version {entry.abi_version} does not match "
                 f"{KERNEL_ABI_VERSION}"
             )
-        if entry.pixel_format != PIXEL_FORMAT_RGBA8:
+        expected_layout = get_layout(layout)
+        if entry.pixel_format != expected_layout.abi_id:
             raise KernelLoadError(
-                f"kernel pixel format {entry.pixel_format} is not RGBA8 "
-                f"({PIXEL_FORMAT_RGBA8})"
+                f"kernel pixel format {entry.pixel_format} is not "
+                f"{expected_layout.name} ({expected_layout.abi_id})"
             )
         encoded_hash = entry.plan_hash
         if encoded_hash is None:
@@ -281,6 +284,8 @@ class NativeKernel:
         self.path = path
         self.plan_hash = observed_hash
         self.artifact = artifact
+        self.layout = expected_layout
+        self.step = expected_layout.step
         self._library: ctypes.CDLL | None = library
         self._process: _ProcessFunction | None = entry.process
         self._temporary_directory = temporary_directory
@@ -343,7 +348,7 @@ class NativeKernel:
     ) -> None:
         width = _positive_integer(width, "width")
         height = _positive_integer(height, "height")
-        row_bytes = width * 4
+        row_bytes = width * self.step
         source_stride = row_bytes if source_stride is None else source_stride
         destination_stride = (
             row_bytes if destination_stride is None else destination_stride
@@ -393,7 +398,7 @@ class NativeKernel:
     def process_rgba8(self, source: Any, width: int, height: int) -> bytes:
         width = _positive_integer(width, "width")
         height = _positive_integer(height, "height")
-        expected = width * height * 4
+        expected = width * height * self.step
         source_view = _byte_view(source, "source", writable=False)
         if len(source_view) != expected:
             raise KernelExecutionError(

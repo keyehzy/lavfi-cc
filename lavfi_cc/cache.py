@@ -24,10 +24,10 @@ from typing import Any, Callable, Iterator
 
 from .codegen import GeneratedC, generate_c
 from .ir import PixelIR
+from .layouts import DEFAULT_LAYOUT, LAYOUTS, get_layout
 from .native import (
     BASE_COMPILER_FLAGS,
     KERNEL_ABI_VERSION,
-    PIXEL_FORMAT_RGBA8,
     CompiledArtifact,
     NativeKernel,
     _clang_path,
@@ -291,7 +291,7 @@ class KernelCache:
             "schema": CACHE_SCHEMA_VERSION,
             "compiler_version": VERSION,
             "kernel_abi_version": KERNEL_ABI_VERSION,
-            "pixel_format": PIXEL_FORMAT_RGBA8,
+            "pixel_format": get_layout(generated.layout).abi_id,
             "ffmpeg_abi": FFMPEG_FUSED_ABI_IDENTIFIER,
             "source_plan_hash": generated.plan_hash,
             "optimized_ir": generated.passes.ir.canonical_dict(),
@@ -396,8 +396,11 @@ class KernelCache:
         plan_hash = manifest.get("source_plan_hash")
         if not isinstance(plan_hash, str):
             raise CacheError("cache manifest has no source plan hash")
+        layout = manifest.get("layout", DEFAULT_LAYOUT)
+        if not isinstance(layout, str) or layout not in LAYOUTS:
+            raise CacheError("cache manifest has no usable pixel layout")
         try:
-            with NativeKernel(library, plan_hash):
+            with NativeKernel(library, plan_hash, layout=layout):
                 pass
         except Exception as error:
             raise CacheError(f"cached kernel failed ABI validation: {error}") from error
@@ -482,7 +485,11 @@ class KernelCache:
                     raise CacheError(f"compiler did not create expected artifact: {path}")
                 os.chmod(path, 0o600)
                 _regular_private_file(path)
-            with NativeKernel(temporary_library, plan.generated.plan_hash):
+            with NativeKernel(
+                temporary_library,
+                plan.generated.plan_hash,
+                layout=plan.generated.layout,
+            ):
                 pass
             self._sync_file(temporary_library)
             self._sync_file(temporary_source)
@@ -491,6 +498,7 @@ class KernelCache:
                 "key": plan.key,
                 "key_inputs": plan.key_inputs,
                 "source_plan_hash": plan.generated.plan_hash,
+                "layout": plan.generated.layout,
                 "optimized_plan_hash": plan.generated.optimized_plan_hash,
                 "created_ns": time.time_ns(),
                 "files": {"library": library.name, "source": source.name},

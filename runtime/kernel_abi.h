@@ -5,7 +5,16 @@
 #include <stdint.h>
 
 #define LAVFI_KERNEL_ABI_VERSION 1u
+
+/* Packed 8-bit RGB layouts. The process signature is identical for all of
+ * them -- one plane, one stride -- so adding an identifier does not change the
+ * ABI. A loader that only knows RGBA8 still refuses the others by value. */
 #define LAVFI_PIXEL_FORMAT_RGBA8 1u
+#define LAVFI_PIXEL_FORMAT_BGRA8 2u
+#define LAVFI_PIXEL_FORMAT_ARGB8 3u
+#define LAVFI_PIXEL_FORMAT_ABGR8 4u
+#define LAVFI_PIXEL_FORMAT_RGB24 5u
+#define LAVFI_PIXEL_FORMAT_BGR24 6u
 
 #if defined(__GNUC__) || defined(__clang__)
 #define LAVFI_KERNEL_EXPORT __attribute__((visibility("default")))

@@ -40,6 +40,15 @@ if [ ! -f "$source_tree/libavfilter/vf_fused.c" ]; then
     exit 2
 fi
 
+# vf_fused.c is ours rather than an upstream patch, so refresh it on every
+# build. Without this an existing worktree would silently keep a stale filter.
+if ! cmp -s "$project_root/ffmpeg-patch/vf_fused.c" \
+            "$source_tree/libavfilter/vf_fused.c"; then
+    cp "$project_root/ffmpeg-patch/vf_fused.c" \
+       "$source_tree/libavfilter/vf_fused.c"
+    echo "refreshed vf_fused.c in $source_tree"
+fi
+
 mkdir -p "$prefix"
 (
     cd "$source_tree"

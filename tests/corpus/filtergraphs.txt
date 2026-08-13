@@ -1,0 +1,63 @@
+# Filtergraphs shaped like real production workloads, for `lavfi-cc scan`.
+#
+# These exercise the scanner's reach analysis, not its fusion path: several
+# chains, link labels, hardware pipelines, and filters far outside the accepted
+# subset all belong here. Each line is one graph.
+
+# --- Static RGB grading and effects, the target population -------------------
+format=rgba,negate,lutrgb=r=val*1.08+2:g=val*0.94+4:b=val*0.88+12,colorlevels=rimin=0.05:gimax=0.9,colorchannelmixer=rr=0.9:rg=0.1:gg=0.8:gb=0.2,format=yuv420p
+format=rgba,colorchannelmixer=rr=0.393:rg=0.769:rb=0.189:gr=0.349:gg=0.686:gb=0.168:br=0.272:bg=0.534:bb=0.131,format=yuv420p
+format=rgba,colorchannelmixer=rr=0.3:rg=0.4:rb=0.3:gr=0.3:gg=0.4:gb=0.3:br=0.3:bg=0.4:bb=0.3,negate,format=rgb24
+format=rgba,lutrgb=r=negval:g=negval:b=negval,negate,lutrgb=r='clip(val,16,235)',format=yuv420p
+format=rgba,negate,negate,format=yuv420p
+format=rgba,colorlevels=rimin=0.058:gimin=0.058:bimin=0.058:rimax=0.92:gimax=0.92:bimax=0.92,format=yuv420p
+
+# --- Grading split by a geometric filter that preserves the format -----------
+format=rgba,negate,lutrgb=r=val*1.1,crop=1280:720:0:0,colorlevels=rimin=0.05,negate,format=yuv420p
+format=rgba,lutrgb=r=val*1.2,hflip,colorchannelmixer=rr=0.9:gg=0.9:bb=0.9,negate,format=yuv420p
+
+# --- Grading with no explicit boundaries at all (negotiated) -----------------
+negate,lutrgb=r=val*1.08+2,colorlevels=rimin=0.05
+scale=1920:1080,negate,lutrgb=r=val*2,colorchannelmixer=rr=0.9
+fps=30,negate,negate,negate
+
+# --- Grading pinned to a format the kernel does not implement ----------------
+format=yuv420p,negate,lutrgb=r=val*1.08+2,colorlevels=rimin=0.05
+format=rgb24,negate,lutrgb=r=val*1.2,colorchannelmixer=rr=0.9:gg=0.8
+format=gbrp,negate,negate,lutrgb=r=val*1.1
+format=yuv444p,lutyuv=y=val*1.1,eq=contrast=1.2
+
+# --- Ordinary CPU transcodes with a little colour work -----------------------
+scale=1280:720:flags=bicubic,format=yuv420p
+scale=-2:1080,fps=25,format=yuv420p
+crop=iw:ih-100:0:50,scale=640:360,format=yuv420p
+format=rgba,negate,format=yuv420p
+deinterlace_qsv,scale_qsv=w=1280:h=720
+hwupload_cuda,scale_cuda=1280:720,hwdownload,format=nv12
+
+# --- Filters outside the pointwise subset ------------------------------------
+format=rgba,boxblur=2:1,negate,format=yuv420p
+format=rgba,negate,gblur=sigma=3,lutrgb=r=val*2,format=yuv420p
+format=rgba,unsharp=5:5:1.0,colorlevels=rimin=0.05,format=yuv420p
+drawtext=text='hello':x=10:y=10,format=yuv420p
+format=rgba,curves=preset=vintage,format=yuv420p
+format=rgba,eq=brightness=0.06:saturation=1.2,format=yuv420p
+format=rgba,hue=h=90:s=1.2,format=yuv420p
+format=rgba,colorbalance=rs=0.1:gm=-0.1,format=yuv420p
+
+# --- Options inside the subset that are still rejected -----------------------
+format=rgba,colorlevels=rimin=-0.1,negate,format=yuv420p
+format=rgba,colorchannelmixer=rr=0.9:pc=lum,format=yuv420p
+format=rgba,negate=enable='between(t,10,20)',format=yuv420p
+format=rgba,lutrgb=r='if(gt(val,128),255,0)',format=yuv420p
+format=rgba,colorlevels=preserve=lum:rimin=0.1,format=yuv420p
+
+# --- Multiple chains and link labels -----------------------------------------
+[0:v]format=rgba,negate,lutrgb=r=val*1.2,format=yuv420p[v]
+[0:v]scale=640:360,format=rgba,negate,lutrgb=r=val*2[a];[1:v]format=rgba,negate,negate[b];[a][b]overlay=x=10[out]
+[0:v]split=2[a][b];[a]format=rgba,negate,lutrgb=r=val*1.1,format=yuv420p[x];[b]hflip[y];[x][y]hstack[out]
+[0:v]trim=0:10,format=rgba,colorlevels=rimin=0.05,negate,format=yuv420p[v]
+
+# --- Whitespace and quoting as written by hand -------------------------------
+format=rgba, negate, lutrgb=r=val*1.08+2, format=yuv420p
+format=rgba,lutrgb=r='clip(val,16,235)':g='clip(val,16,235)',negate,format=yuv420p

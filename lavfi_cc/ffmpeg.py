@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -11,8 +12,9 @@ import subprocess
 import sys
 from typing import Sequence
 
+from .bundle import BundleError, resolve_bundle
 from .cache import CacheError, KernelCache
-from .frontend import Analysis, analyze_filtergraph
+from .frontend import Analysis, IslandPlan, analyze_filtergraph, rewrite_with
 from .native import NativeError, compile_kernel
 
 
@@ -63,19 +65,27 @@ def fused_filter(
     analysis: Analysis,
     kernel_path: str | os.PathLike[str],
     kernel_root: str | os.PathLike[str],
+    *,
+    plan: IslandPlan | None = None,
 ) -> str:
-    """Render the checked dynamic-filter invocation for an eligible analysis."""
+    """Render the checked dynamic-filter invocation for one approved island."""
 
-    if not analysis.eligible or analysis.ir is None:
+    if not analysis.eligible:
         raise FFmpegIntegrationError("cannot render a fused filter for an ineligible graph")
+    if plan is None:
+        plan = analysis.plan
+    if plan is None:
+        raise FFmpegIntegrationError(
+            "this analysis approved several islands; name the one to render"
+        )
     remove_color = int(
-        "remove_color_dependent_side_data" in analysis.ir.metadata_effects
+        "remove_color_dependent_side_data" in plan.ir.metadata_effects
     )
     return (
         "fused="
         f"kernel={_quote_filter_value(str(Path(kernel_path).resolve()))}:"
         f"kernel_root={_quote_filter_value(str(Path(kernel_root).resolve()))}:"
-        f"plan_hash={analysis.ir.plan_hash}:"
+        f"plan_hash={plan.ir.plan_hash}:"
         f"remove_color_side_data={remove_color}"
     )
 
@@ -83,11 +93,21 @@ def fused_filter(
 def rewrite_filtergraph(analysis: Analysis, replacement: str) -> str:
     """Replace only the frontend-approved region, retaining both format guards."""
 
-    if not analysis.eligible or analysis.graph is None or analysis.region is None:
+    return rewrite_filtergraph_islands(analysis, [replacement])
+
+
+def rewrite_filtergraph_islands(
+    analysis: Analysis, replacements: Sequence[str]
+) -> str:
+    """Replace every approved island, retaining each surrounding filter."""
+
+    if not analysis.eligible or analysis.graph is None:
         raise FFmpegIntegrationError("cannot rewrite an ineligible filtergraph")
-    start, end = analysis.region
-    filters = [invocation.raw for invocation in analysis.graph.filters]
-    return ",".join(filters[:start] + [replacement] + filters[end:])
+    if len(replacements) != len(analysis.plans):
+        raise FFmpegIntegrationError(
+            f"expected {len(analysis.plans)} replacement(s), got {len(replacements)}"
+        )
+    return rewrite_with(analysis.graph, analysis.plans, list(replacements))
 
 
 def rewrite_ffmpeg_arguments(
@@ -201,6 +221,9 @@ def run_ffmpeg(
     require_fusion: bool = False,
     identity_elimination: bool = True,
     lut_composition: bool = True,
+    auto_islands: bool = False,
+    bundle_dir: str | os.PathLike[str] | None = None,
+    require_bundle: bool = False,
 ) -> int:
     """Compile, preflight, rewrite, and run one ordinary FFmpeg invocation."""
 
@@ -221,7 +244,7 @@ def run_ffmpeg(
             failure_status=2,
         )
 
-    analysis = analyze_filtergraph(location.value)
+    analysis = analyze_filtergraph(location.value, auto_islands=auto_islands)
     if not analysis.eligible:
         reason = "; ".join(item.format() for item in analysis.diagnostics)
         return _fallback(
@@ -231,34 +254,72 @@ def run_ffmpeg(
             require_fusion=require_fusion,
             failure_status=2,
         )
-    assert analysis.ir is not None
+
+    try:
+        bundle = resolve_bundle(bundle_dir)
+    except BundleError as error:
+        return _fallback(
+            executable,
+            arguments,
+            f"kernel bundle is unusable: {error}",
+            require_fusion=require_fusion,
+            failure_status=1,
+        )
+    if bundle is None and require_bundle:
+        return _fallback(
+            executable,
+            arguments,
+            "a prebuilt kernel bundle was required but none was configured",
+            require_fusion=require_fusion,
+            failure_status=1,
+        )
 
     try:
         cache = KernelCache(cache_dir)
-        with cache.acquire(
-            analysis.ir,
-            compiler=compile_kernel,
-            identity_elimination=identity_elimination,
-            lut_composition=lut_composition,
-        ) as cached:
-            replacement = fused_filter(
-                analysis, cached.library_path, cached.library_path.parent
-            )
-            rewritten_graph = rewrite_filtergraph(analysis, replacement)
+        with ExitStack() as stack:
+            replacements: list[str] = []
+            for plan in analysis.plans:
+                # A prebuilt kernel wins, so a deployment needs no compiler.
+                if bundle is not None and plan.ir.plan_hash in bundle:
+                    library_path = bundle.library_path(plan.ir.plan_hash)
+                elif require_bundle:
+                    raise BundleError(
+                        f"bundle has no kernel for plan {plan.ir.plan_hash}"
+                    )
+                else:
+                    cached = stack.enter_context(
+                        cache.acquire(
+                            plan.ir,
+                            compiler=compile_kernel,
+                            identity_elimination=identity_elimination,
+                            lut_composition=lut_composition,
+                        )
+                    )
+                    library_path = cached.library_path
+                replacements.append(
+                    fused_filter(
+                        analysis,
+                        library_path,
+                        library_path.parent,
+                        plan=plan,
+                    )
+                )
+            rewritten_graph = rewrite_filtergraph_islands(analysis, replacements)
             rewritten_arguments = rewrite_ffmpeg_arguments(
                 arguments, location, rewritten_graph
             )
-            available, detail = _preflight(executable, replacement)
-            if not available:
-                return _fallback(
-                    executable,
-                    arguments,
-                    f"fused-filter preflight failed: {detail}",
-                    require_fusion=require_fusion,
-                    failure_status=1,
-                )
+            for replacement in replacements:
+                available, detail = _preflight(executable, replacement)
+                if not available:
+                    return _fallback(
+                        executable,
+                        arguments,
+                        f"fused-filter preflight failed: {detail}",
+                        require_fusion=require_fusion,
+                        failure_status=1,
+                    )
             return _execute(executable, rewritten_arguments)
-    except (CacheError, NativeError, FFmpegIntegrationError, OSError) as error:
+    except (CacheError, NativeError, FFmpegIntegrationError, BundleError, OSError) as error:
         return _fallback(
             executable,
             arguments,

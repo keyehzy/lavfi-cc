@@ -10,7 +10,9 @@ from typing import Any
 from .parser import SourceSpan
 
 
-IR_VERSION = 2
+#: Version 3 added the byte layout, so a kernel built for one packed order is
+#: never reused for another.
+IR_VERSION = 3
 CHANNELS = ("r", "g", "b", "a")
 
 
@@ -54,11 +56,15 @@ class PixelIR:
     metadata_effects: tuple[str, ...] = ()
     ir_version: int = IR_VERSION
     pixel_format: str = "rgba8"
+    #: Byte layout the kernel loads from and stores to. The operations
+    #: themselves are layout-independent: they always see logical RGBA.
+    layout: str = "rgba"
 
     def canonical_dict(self) -> dict[str, Any]:
         return {
             "ir_version": self.ir_version,
             "pixel_format": self.pixel_format,
+            "layout": self.layout,
             "metadata_effects": list(self.metadata_effects),
             "operations": [operation.canonical_dict() for operation in self.operations],
         }
@@ -67,6 +73,7 @@ class PixelIR:
         return {
             "ir_version": self.ir_version,
             "pixel_format": self.pixel_format,
+            "layout": self.layout,
             "metadata_effects": list(self.metadata_effects),
             "operations": [operation.debug_dict() for operation in self.operations],
         }
@@ -83,7 +90,7 @@ class PixelIR:
         return hashlib.sha256(self.serialize()).hexdigest()
 
     def pretty(self) -> str:
-        lines = [f"pixel_ir v{self.ir_version} {self.pixel_format}"]
+        lines = [f"pixel_ir v{self.ir_version} {self.pixel_format} layout={self.layout}"]
         for index, operation in enumerate(self.operations):
             source = ""
             if operation.source is not None:
