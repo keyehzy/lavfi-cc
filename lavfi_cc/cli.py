@@ -6,11 +6,13 @@ import argparse
 from contextlib import ExitStack
 import json
 from pathlib import Path
+import re
 import shlex
 import sys
 from typing import BinaryIO, Callable
 
 from . import __version__
+from .cache import CacheError, KernelCache
 from .frontend import Analysis, analyze_filtergraph
 from .ffmpeg import run_ffmpeg
 from .interpreter import InterpreterError, interpret_rgba8
@@ -34,6 +36,28 @@ def _positive_integer(value: str) -> int:
     return number
 
 
+def _byte_size(value: str) -> int:
+    match = re.fullmatch(r"([0-9]+)([KMGT]i?B|B)?", value, re.IGNORECASE)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "expected bytes or a size such as 512MiB or 1GiB"
+        )
+    number = int(match.group(1))
+    suffix = (match.group(2) or "B").upper()
+    powers = {
+        "B": 1,
+        "KB": 1000,
+        "MB": 1000**2,
+        "GB": 1000**3,
+        "TB": 1000**4,
+        "KIB": 1024,
+        "MIB": 1024**2,
+        "GIB": 1024**3,
+        "TIB": 1024**4,
+    }
+    return number * powers[suffix]
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lavfi-cc")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -45,6 +69,8 @@ def _parser() -> argparse.ArgumentParser:
     explain.add_argument(
         "--json", action="store_true", help="emit diagnostics and IR as JSON"
     )
+    explain.add_argument("--cache-dir", metavar="PATH", help="kernel cache directory")
+    _add_pass_switches(explain)
     interpret = subparsers.add_parser(
         "interpret", help="run an eligible chain on packed raw RGBA8 frames"
     )
@@ -81,10 +107,11 @@ def _parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="packed RGBA8 output (default: standard output)",
     )
+    native.add_argument("--cache-dir", metavar="PATH", help="kernel cache directory")
     _add_pass_switches(native)
 
     compile_parser = subparsers.add_parser(
-        "compile", help="generate and compile a standalone native kernel"
+        "compile", help="ensure an eligible native kernel is cached"
     )
     compile_parser.add_argument("--vf", required=True, metavar="FILTERGRAPH")
     compile_parser.add_argument(
@@ -96,12 +123,15 @@ def _parser() -> argparse.ArgumentParser:
     compile_parser.add_argument(
         "--output",
         metavar="PATH",
-        help="library path (default: .build/week4/<plan-hash>.<platform>)",
+        help="export library path (supplying this bypasses the cache)",
     )
     compile_parser.add_argument(
         "--emit-c",
         metavar="PATH",
-        help="write generated C to this path instead of beside the library",
+        help="export generated C (supplying this bypasses the cache)",
+    )
+    compile_parser.add_argument(
+        "--cache-dir", metavar="PATH", help="kernel cache directory"
     )
     _add_pass_switches(compile_parser)
     run = subparsers.add_parser(
@@ -115,12 +145,25 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="fail instead of running the original chain when fusion is unavailable",
     )
+    run.add_argument("--cache-dir", metavar="PATH", help="kernel cache directory")
     _add_pass_switches(run)
     run.add_argument(
         "ffmpeg_arguments",
         nargs=argparse.REMAINDER,
         help="FFmpeg arguments, preceded by --",
     )
+    cache = subparsers.add_parser("cache", help="inspect or prune native-kernel cache")
+    cache_commands = cache.add_subparsers(dest="cache_command", required=True)
+    cache_list = cache_commands.add_parser("list", help="list cached kernels")
+    cache_list.add_argument(
+        "--cache-dir", metavar="PATH", help="kernel cache directory"
+    )
+    cache_list.add_argument("--json", action="store_true", help="emit entries as JSON")
+    cache_prune = cache_commands.add_parser("prune", help="remove oldest kernels")
+    cache_prune.add_argument(
+        "--cache-dir", metavar="PATH", help="kernel cache directory"
+    )
+    cache_prune.add_argument("--max-size", required=True, type=_byte_size, metavar="SIZE")
     return parser
 
 
@@ -151,7 +194,11 @@ def _format_filter(index: int, invocation: object) -> str:
     )
 
 
-def _print_analysis(analysis: Analysis, passes: PassResult | None = None) -> None:
+def _print_analysis(
+    analysis: Analysis,
+    passes: PassResult | None = None,
+    cache: dict[str, object] | None = None,
+) -> None:
     print("Parsed filters:")
     if analysis.graph is None:
         print("  <filtergraph did not parse>")
@@ -180,9 +227,17 @@ def _print_analysis(analysis: Analysis, passes: PassResult | None = None) -> Non
         print(f"  {name}: {changes} change{'s' if changes != 1 else ''}")
     print(f"Optimized plan hash: {passes.ir.plan_hash}")
     print("Reference interpreter: available (Week 3)")
-    print("Native C backend: available (Week 4; uncached)")
+    print("Native C backend: available (Week 4)")
     print("FFmpeg fused-filter integration: available (Week 5)")
-    print("Cache status: unavailable until the Week 6 cache milestone")
+    if cache is None:
+        print("Cache status: unavailable")
+    else:
+        print(f"Cache key: {cache['key']}")
+        print(f"Cache status: {cache['status']}")
+        if cache.get("path"):
+            print(f"Cached kernel: {cache['path']}")
+        if cache.get("detail"):
+            print(f"Cache detail: {cache['detail']}")
     print(f"Planned rewrite: {analysis.rewritten_filtergraph}")
 
 
@@ -262,10 +317,13 @@ def _native(arguments: argparse.Namespace) -> int:
         return 2
     assert analysis.ir is not None
     try:
-        with NativeKernel.compile(
+        cache = KernelCache(arguments.cache_dir)
+        with cache.acquire(
             analysis.ir,
             identity_elimination=not arguments.no_identity_elimination,
             lut_composition=not arguments.no_lut_composition,
+        ) as cached, NativeKernel(
+            cached.library_path, analysis.ir.plan_hash
         ) as kernel:
             return _stream_frames(
                 arguments,
@@ -273,7 +331,7 @@ def _native(arguments: argparse.Namespace) -> int:
                     source, width, height
                 ),
             )
-    except NativeError as error:
+    except (CacheError, NativeError) as error:
         print(f"lavfi-cc: {error}", file=sys.stderr)
         return 1
 
@@ -286,47 +344,133 @@ def _compile(arguments: argparse.Namespace) -> int:
         return 2
     assert analysis.ir is not None
     try:
-        output = (
-            Path(arguments.output)
-            if arguments.output
-            else Path(".build")
-            / "week4"
-            / (analysis.ir.plan_hash + library_suffix())
-        )
-        artifact = compile_kernel(
+        if arguments.output or arguments.emit_c:
+            output = (
+                Path(arguments.output)
+                if arguments.output
+                else Path(".build")
+                / "week4"
+                / (analysis.ir.plan_hash + library_suffix())
+            )
+            artifact = compile_kernel(
+                analysis.ir,
+                output,
+                source_path=arguments.emit_c,
+                identity_elimination=not arguments.no_identity_elimination,
+                lut_composition=not arguments.no_lut_composition,
+            )
+            generated = artifact.generated
+            print(f"Plan hash: {generated.plan_hash}")
+            print(f"Optimized plan hash: {generated.optimized_plan_hash}")
+            for name, changes in generated.passes.changes:
+                print(f"Pass {name}: {changes} change{'s' if changes != 1 else ''}")
+            print("Cache status: bypassed (explicit output)")
+            print(f"Generated C: {artifact.source_path}")
+            print(f"Native library: {artifact.library_path}")
+            print(f"Compiler command: {shlex.join(artifact.command)}")
+            return 0
+
+        cache = KernelCache(arguments.cache_dir)
+        cached = cache.ensure(
             analysis.ir,
-            output,
-            source_path=arguments.emit_c,
             identity_elimination=not arguments.no_identity_elimination,
             lut_composition=not arguments.no_lut_composition,
         )
-    except (NativeError, OSError) as error:
+    except (CacheError, NativeError, OSError) as error:
         print(f"lavfi-cc: {error}", file=sys.stderr)
         return 1
-    print(f"Plan hash: {artifact.generated.plan_hash}")
-    print(f"Optimized plan hash: {artifact.generated.optimized_plan_hash}")
-    for name, changes in artifact.generated.passes.changes:
+    print(f"Plan hash: {cached.generated.plan_hash}")
+    print(f"Optimized plan hash: {cached.generated.optimized_plan_hash}")
+    for name, changes in cached.generated.passes.changes:
         print(f"Pass {name}: {changes} change{'s' if changes != 1 else ''}")
-    print(f"Generated C: {artifact.source_path}")
-    print(f"Native library: {artifact.library_path}")
-    print(f"Compiler command: {shlex.join(artifact.command)}")
+    print(f"Cache key: {cached.key}")
+    print(f"Cache status: {cached.status}")
+    print(f"Generated C: {cached.source_path}")
+    print(f"Native library: {cached.library_path}")
+    if cached.command is not None:
+        print(f"Compiler command: {shlex.join(cached.command)}")
     return 0
+
+
+def _cache(arguments: argparse.Namespace) -> int:
+    cache = KernelCache(arguments.cache_dir)
+    try:
+        if arguments.cache_command == "list":
+            entries = cache.list_entries()
+            if arguments.json:
+                json.dump(
+                    {
+                        "cache_directory": str(cache.root),
+                        "entries": [entry.as_dict() for entry in entries],
+                        "total_size": sum(entry.size for entry in entries),
+                    },
+                    sys.stdout,
+                    indent=2,
+                    sort_keys=True,
+                )
+                sys.stdout.write("\n")
+            elif not entries:
+                print(f"Cache directory: {cache.root}")
+                print("Cache is empty")
+            else:
+                print(f"Cache directory: {cache.root}")
+                for entry in entries:
+                    print(
+                        f"{entry.key} {entry.status} {entry.size} bytes "
+                        f"plan={entry.plan_hash or '-'}"
+                    )
+            return 0
+        if arguments.cache_command == "prune":
+            result = cache.prune(arguments.max_size)
+            print(f"Cache directory: {cache.root}")
+            print(f"Size: {result.before_size} -> {result.after_size} bytes")
+            print(f"Removed entries: {result.removed_entries}")
+            if result.skipped_locked:
+                print(f"Skipped active entries: {result.skipped_locked}")
+            return 0 if result.after_size <= arguments.max_size else 1
+    except (CacheError, NativeError, OSError) as error:
+        print(f"lavfi-cc: {error}", file=sys.stderr)
+        return 1
+    raise AssertionError(f"unhandled cache command {arguments.cache_command}")
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.command == "explain":
         analysis = analyze_filtergraph(arguments.vf)
-        passes = optimize_ir(analysis.ir) if analysis.ir is not None else None
+        passes = (
+            optimize_ir(
+                analysis.ir,
+                identity_elimination=not arguments.no_identity_elimination,
+                lut_composition=not arguments.no_lut_composition,
+            )
+            if analysis.ir is not None
+            else None
+        )
+        cache_info = None
+        if analysis.ir is not None:
+            try:
+                cache_info = KernelCache(arguments.cache_dir).probe(
+                    analysis.ir,
+                    identity_elimination=not arguments.no_identity_elimination,
+                    lut_composition=not arguments.no_lut_composition,
+                )
+            except (CacheError, NativeError, OSError) as error:
+                cache_info = {
+                    "key": "unavailable",
+                    "status": "unavailable",
+                    "detail": str(error),
+                }
         if arguments.json:
             value = analysis.as_dict()
             value["optimization"] = passes.as_dict() if passes is not None else None
-            value["native_backend"] = "available_uncached" if passes is not None else None
+            value["native_backend"] = "available" if passes is not None else None
             value["ffmpeg_integration"] = "available" if passes is not None else None
+            value["cache"] = cache_info
             json.dump(value, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
         else:
-            _print_analysis(analysis, passes)
+            _print_analysis(analysis, passes, cache_info)
         return 0 if analysis.eligible else 2
     if arguments.command == "interpret":
         return _interpret(arguments)
@@ -334,6 +478,8 @@ def main(argv: list[str] | None = None) -> int:
         return _native(arguments)
     if arguments.command == "compile":
         return _compile(arguments)
+    if arguments.command == "cache":
+        return _cache(arguments)
     if arguments.command == "run":
         forwarded = list(arguments.ffmpeg_arguments)
         if not forwarded or forwarded[0] != "--":
@@ -345,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_ffmpeg(
             forwarded[1:],
             ffmpeg=arguments.ffmpeg,
+            cache_dir=arguments.cache_dir,
             require_fusion=arguments.require_fusion,
             identity_elimination=not arguments.no_identity_elimination,
             lut_composition=not arguments.no_lut_composition,

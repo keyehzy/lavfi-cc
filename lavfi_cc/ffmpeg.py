@@ -1,4 +1,4 @@
-"""Week 5 integration with the patched FFmpeg ``fused`` AVFilter."""
+"""Patched-FFmpeg integration using the persistent checked kernel cache."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 from typing import Sequence
 
+from .cache import CacheError, KernelCache
 from .frontend import Analysis, analyze_filtergraph
-from .native import NativeError, NativeKernel, compile_kernel, library_suffix
+from .native import NativeError, compile_kernel
 
 
 class FFmpegIntegrationError(RuntimeError):
@@ -197,6 +197,7 @@ def run_ffmpeg(
     arguments: Sequence[str],
     *,
     ffmpeg: str | os.PathLike[str] | None = None,
+    cache_dir: str | os.PathLike[str] | None = None,
     require_fusion: bool = False,
     identity_elimination: bool = True,
     lut_composition: bool = True,
@@ -232,29 +233,17 @@ def run_ffmpeg(
         )
     assert analysis.ir is not None
 
-    build_root = Path(__file__).resolve().parents[1] / ".build" / "week5"
     try:
-        build_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(build_root, 0o700)
-        with tempfile.TemporaryDirectory(prefix="run-", dir=build_root) as temporary:
-            directory = Path(temporary).resolve()
-            os.chmod(directory, 0o700)
-            library = directory / (analysis.ir.plan_hash + library_suffix())
-            source = directory / (analysis.ir.plan_hash + ".c")
-            compile_kernel(
-                analysis.ir,
-                library,
-                source_path=source,
-                identity_elimination=identity_elimination,
-                lut_composition=lut_composition,
+        cache = KernelCache(cache_dir)
+        with cache.acquire(
+            analysis.ir,
+            compiler=compile_kernel,
+            identity_elimination=identity_elimination,
+            lut_composition=lut_composition,
+        ) as cached:
+            replacement = fused_filter(
+                analysis, cached.library_path, cached.library_path.parent
             )
-            os.chmod(library, 0o600)
-            os.chmod(source, 0o600)
-            # Apply the same ABI/hash checks as the AVFilter before involving
-            # the user's command. This also catches a corrupt compiler result.
-            with NativeKernel(library, analysis.ir.plan_hash):
-                pass
-            replacement = fused_filter(analysis, library, directory)
             rewritten_graph = rewrite_filtergraph(analysis, replacement)
             rewritten_arguments = rewrite_ffmpeg_arguments(
                 arguments, location, rewritten_graph
@@ -269,7 +258,7 @@ def run_ffmpeg(
                     failure_status=1,
                 )
             return _execute(executable, rewritten_arguments)
-    except (NativeError, FFmpegIntegrationError, OSError) as error:
+    except (CacheError, NativeError, FFmpegIntegrationError, OSError) as error:
         return _fallback(
             executable,
             arguments,

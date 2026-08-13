@@ -1,6 +1,9 @@
 """Frontend, pixel IR, and reference interpreter for lavfi-cc."""
 
+from .version import VERSION as __version__
+
 from .frontend import Analysis, analyze_filtergraph, require_ir
+from .cache import CacheError, KernelCache
 from .ffmpeg import FFmpegIntegrationError, run_ffmpeg
 from .interpreter import (
     InterpreterError,
@@ -21,11 +24,13 @@ from .passes import PassResult, optimize_ir
 
 __all__ = [
     "Analysis",
+    "CacheError",
     "CompilationError",
     "FFmpegIntegrationError",
     "InterpreterError",
     "KernelExecutionError",
     "KernelLoadError",
+    "KernelCache",
     "NativeKernel",
     "PassResult",
     "PixelIR",
@@ -39,4 +44,3 @@ __all__ = [
     "run_ffmpeg",
     "validate_ir",
 ]
-__version__ = "0.5.0"

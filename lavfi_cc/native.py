@@ -18,6 +18,13 @@ from .ir import PixelIR
 
 KERNEL_ABI_VERSION = 1
 PIXEL_FORMAT_RGBA8 = 1
+BASE_COMPILER_FLAGS = (
+    "-std=c11",
+    "-O2",
+    "-fPIC",
+    "-fno-fast-math",
+    "-ffp-contract=off",
+)
 _RUNTIME_DIRECTORY = Path(__file__).resolve().parents[1] / "runtime"
 
 
@@ -80,11 +87,7 @@ def compiler_command(
         )
     return (
         compiler,
-        "-std=c11",
-        "-O2",
-        "-fPIC",
-        "-fno-fast-math",
-        "-ffp-contract=off",
+        *BASE_COMPILER_FLAGS,
         link_mode,
         "-I",
         str(_RUNTIME_DIRECTORY),

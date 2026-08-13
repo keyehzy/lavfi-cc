@@ -164,6 +164,36 @@ class CLITests(unittest.TestCase):
             self.assertIn("Native library:", result.stdout)
             self.assertIn("lavfi_compiled_kernel", source.read_text())
 
+    @unittest.skipUnless(shutil.which("clang"), "Week 6 CLI tests require Clang")
+    def test_compile_uses_cache_and_cache_commands_inspect_and_prune_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "cache"
+            arguments = (
+                "compile",
+                "--vf",
+                "format=rgba,negate,format=rgba",
+                "--cache-dir",
+                str(cache),
+            )
+            cold = self.run_cli(*arguments)
+            warm = self.run_cli(*arguments)
+            self.assertEqual(cold.returncode, 0, cold.stderr)
+            self.assertEqual(warm.returncode, 0, warm.stderr)
+            self.assertIn("Cache status: miss", cold.stdout)
+            self.assertIn("Cache status: hit", warm.stdout)
+
+            listed = self.run_cli("cache", "list", "--cache-dir", str(cache), "--json")
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            value = json.loads(listed.stdout)
+            self.assertEqual(len(value["entries"]), 1)
+            self.assertEqual(value["entries"][0]["status"], "valid")
+
+            pruned = self.run_cli(
+                "cache", "prune", "--cache-dir", str(cache), "--max-size", "0B"
+            )
+            self.assertEqual(pruned.returncode, 0, pruned.stderr)
+            self.assertIn("Removed entries: 1", pruned.stdout)
+
     def test_run_requires_the_double_dash_separator(self) -> None:
         result = self.run_cli("run")
         self.assertEqual(result.returncode, 2)

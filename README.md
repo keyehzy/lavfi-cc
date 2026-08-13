@@ -2,7 +2,7 @@
 
 `lavfi-cc` is an experimental compiler for fusing compatible FFmpeg video
 filters into one native RGBA8 kernel. The repository has completed the Week 5
-FFmpeg-integration milestone described in
+FFmpeg-integration and Week 6 cache/operational-safety milestones described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md).
 
 Explain and lower a bounded region with:
@@ -15,8 +15,8 @@ Explain and lower a bounded region with:
 The command exits with status 0 for an eligible region and 2 for a parse or
 eligibility rejection. Add `--json` to obtain the canonical IR, source map,
 plan hash, diagnostics, and planned filtergraph rewrite as structured output.
-The rewrite uses placeholders in `explain`; `run` fills them with a private,
-per-invocation compiled kernel and trusted-root path.
+The rewrite uses placeholders in `explain`; `run` fills them with a checked
+kernel from the private content-addressed cache and its trusted-root path.
 
 Build the pinned FFmpeg fork and run an ordinary command through the fused
 filter with:
@@ -48,7 +48,7 @@ Omit `--input` or `--output` to use standard input or standard output. Input
 must contain only complete `width * height * 4` byte frames. The Python API also
 supports padded and negative frame strides through `interpret_into`.
 
-Compile and run the same stream through a temporary checked native kernel:
+Compile and run the same stream through a cached, checked native kernel:
 
 ```sh
 ./lavfi-cc native \
@@ -57,10 +57,26 @@ Compile and run the same stream through a temporary checked native kernel:
   --input input.rgba --output output.rgba
 ```
 
-Use `./lavfi-cc compile --vf "..."` to retain readable generated C and a native
-`.dylib` or `.so` under `.build/week4`. The loader validates the ABI version,
-RGBA8 format identifier, and source plan hash before executing a kernel.
-Persistent content-addressed caching remains a Week 6 milestone.
+Use `./lavfi-cc compile --vf "..."` to populate or validate the persistent
+cache. The command reports `miss`, `hit`, or `rebuilt`; `explain` reports the
+same stable cache key and current status. Supplying `--output` and/or `--emit-c`
+exports a standalone library/source pair and deliberately bypasses the cache.
+
+Inspect and cap the cache with:
+
+```sh
+./lavfi-cc cache list
+./lavfi-cc cache prune --max-size 1GiB
+```
+
+The default is `~/Library/Caches/lavfi-cc/kernels-v1` on macOS. Linux uses
+`$XDG_CACHE_HOME/lavfi-cc/kernels-v1`, falling back to
+`~/.cache/lavfi-cc/kernels-v1`. Override it with `--cache-dir PATH` or
+`LAVFI_CC_CACHE_DIR`. The cache directory must be owned by
+the current user and private (mode 0700); artifacts are mode 0600. Entries are
+checksum- and ABI-validated before use. Corrupt or interrupted entries are
+rebuilt, concurrent requests for one key compile once, and pruning skips a
+kernel while `run` is using it.
 
 The checked-in Week 1 tooling deliberately uses one pinned FFmpeg build as both
 the benchmark subject and semantic oracle:
@@ -119,6 +135,14 @@ the complete gate with:
 ```sh
 ./scripts/build-ffmpeg-week5.sh
 ./scripts/test-week5.sh
+```
+
+Week 6's cache-key contract, atomic publication and recovery behavior,
+concurrency controls, sanitizer result, and warm-cache measurement are in
+[`docs/week-6-report.md`](docs/week-6-report.md). Run the complete gate with:
+
+```sh
+./scripts/test-week6.sh
 ```
 
 Set `LAVFI_CC_FFMPEG=/path/to/ffmpeg` to select another pinned build. The

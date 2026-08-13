@@ -115,7 +115,8 @@ class FallbackTests(unittest.TestCase):
         self, execute: mock.Mock, _compile: mock.Mock, _resolve: mock.Mock
     ) -> None:
         arguments = ("-vf", "format=rgba,negate,format=rgba")
-        self.assertEqual(run_ffmpeg(arguments), 19)
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(run_ffmpeg(arguments, cache_dir=directory), 19)
         execute.assert_called_once_with("/fake/ffmpeg", arguments)
 
     @mock.patch("lavfi_cc.ffmpeg.resolve_ffmpeg", return_value="/fake/ffmpeg")
@@ -125,7 +126,10 @@ class FallbackTests(unittest.TestCase):
         self, execute: mock.Mock, _compile: mock.Mock, _resolve: mock.Mock
     ) -> None:
         arguments = ("-vf", "format=rgba,negate,format=rgba")
-        self.assertEqual(run_ffmpeg(arguments, require_fusion=True), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                run_ffmpeg(arguments, require_fusion=True, cache_dir=directory), 1
+            )
         execute.assert_not_called()
 
     @mock.patch("lavfi_cc.ffmpeg.resolve_ffmpeg", return_value="/fake/ffmpeg")
@@ -139,13 +143,14 @@ class FallbackTests(unittest.TestCase):
 
         arguments = ("-vf", "format=rgba,negate,format=rgba")
         with (
+            tempfile.TemporaryDirectory() as directory,
             mock.patch("lavfi_cc.ffmpeg.compile_kernel", side_effect=fake_compile),
-            mock.patch("lavfi_cc.ffmpeg.NativeKernel"),
+            mock.patch("lavfi_cc.cache.NativeKernel"),
             mock.patch(
                 "lavfi_cc.ffmpeg._preflight", return_value=(False, "load error")
             ),
         ):
-            self.assertEqual(run_ffmpeg(arguments), 29)
+            self.assertEqual(run_ffmpeg(arguments, cache_dir=directory), 29)
         execute.assert_called_once_with("/fake/ffmpeg", arguments)
 
 
