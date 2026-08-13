@@ -44,9 +44,13 @@ record_only=${RECORD_ONLY:-0}
 if [ "$record_only" != 1 ]; then
     (
         cd "$source_dir"
+        # --enable-gpl is what puts vf_eq.c in the oracle: eq is GPL-only
+        # upstream, and a filter the oracle does not carry cannot be checked
+        # for bit-exactness, which is the whole point of pinning it.
         ./configure \
             --prefix="$prefix" \
             --cc="$cc" \
+            --enable-gpl \
             --disable-doc \
             --disable-ffplay \
             --disable-stripping

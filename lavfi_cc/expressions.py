@@ -1,4 +1,12 @@
-"""Safe evaluator for the documented Week 2 lutrgb expression subset."""
+"""Safe evaluator for the documented Week 2 lutrgb expression subset.
+
+The same subset serves ``lutyuv``, which is ``vf_lut.c``'s other entry point.
+The only difference is the range a component is defined over: ``lutrgb`` runs
+every channel over ``0..255``, while ``lutyuv`` gives luma ``16..235`` and each
+chroma channel ``16..240``.  That range reaches the expression as ``minval``
+and ``maxval`` and, through them, as ``clipval`` and ``negval``, so
+:func:`build_lut` takes it as a parameter rather than assuming full range.
+"""
 
 from __future__ import annotations
 
@@ -103,18 +111,34 @@ def _evaluate(node: ast.AST, variables: dict[str, float]) -> float:
     raise AssertionError(f"unvalidated expression node: {ast.dump(node)}")
 
 
-def build_lut(source: str) -> tuple[int, ...]:
+#: Range every ``lutrgb`` component is defined over.
+FULL_RANGE = (0, 255)
+
+
+def build_lut(source: str, value_range: tuple[int, int] = FULL_RANGE) -> tuple[int, ...]:
+    """Materialize one component's 256-entry table over ``[minval, maxval]``.
+
+    ``clipval`` and ``negval`` are derived exactly as ``config_props`` derives
+    them: both are clamped into the component's own range, so on a limited-range
+    luma channel ``negval`` is ``av_clip(16 + 235 - val, 16, 235)`` rather than
+    ``255 - val``.  The final clamp stays ``[0, 255]``, which is what upstream
+    uses for every 8-bit format regardless of the component's range.
+    """
+
+    minimum, maximum = value_range
     tree = parse_expression(source)
     values: list[int] = []
     for value in range(256):
+        clipped = max(minimum, min(value, maximum))
+        negated = max(minimum, min(minimum + maximum - value, maximum))
         result = _evaluate(
             tree,
             {
                 "val": float(value),
-                "clipval": float(value),
-                "negval": float(255 - value),
-                "minval": 0.0,
-                "maxval": 255.0,
+                "clipval": float(clipped),
+                "negval": float(negated),
+                "minval": float(minimum),
+                "maxval": float(maximum),
             },
         )
         if not math.isfinite(result):

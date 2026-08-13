@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+import re
 import struct
 from typing import Any, Callable
 
@@ -142,6 +143,50 @@ def _levels_rounding_is_target_independent(
         if quantize(contracted) != quantize(separate):
             return False
     return True
+
+
+#: A plain decimal literal, which is the whole static subset of an option that
+#: upstream evaluates with ``av_expr_eval``.  Anything richer either names a
+#: per-frame variable or reaches an evaluator this compiler does not reproduce.
+_NUMERIC_LITERAL = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z")
+
+
+def _parse_static_expression(value: str, option: str) -> float:
+    """Parse an option whose value upstream treats as an expression.
+
+    Only a literal is accepted.  ``eq`` and ``hue`` evaluate these with the
+    frame counter, timestamp, and frame rate in scope, so anything referring to
+    a variable is a different value on every frame and cannot be baked into a
+    kernel at all.
+    """
+
+    if not _NUMERIC_LITERAL.fullmatch(value.strip()):
+        raise LoweringError(
+            "dynamic_expression",
+            f"{option} must be a plain number in the accepted subset; "
+            f"{value!r} is an expression that upstream may re-evaluate per frame",
+            option,
+        )
+    number = float(value)
+    if not math.isfinite(number):
+        raise LoweringError(
+            "non_finite", "non-finite numeric values are not supported", option
+        )
+    return number
+
+
+def _clipf(value: float, minimum: float, maximum: float) -> float:
+    """Reproduce ``av_clipf``, which clamps in binary32 rather than binary64.
+
+    Its parameters are ``float``, so a ``double`` expression result is rounded
+    to binary32 on the way in and the bounds are the binary32 neighbours of the
+    literals in the source.  Every ``eq`` option passes through this, so the
+    rounding is part of the filter's observable behaviour.
+    """
+
+    return _float32(
+        min(max(_float32(value), _float32(minimum)), _float32(maximum))
+    )
 
 
 def _identity_table() -> tuple[int, ...]:
@@ -270,31 +315,367 @@ def _lower_negate(
     return Lowered((operation, quantize), f"negate=components={ordered}")
 
 
-def _lower_lutrgb(
-    invocation: FilterInvocation, index: int, layout: PixelLayout | None
-) -> Lowered:
-    options = _check_options(invocation, set(CHANNELS))
-    expressions = {channel: "clipval" for channel in CHANNELS}
+#: Component names and per-channel ``[minval, maxval]`` range of each
+#: ``vf_lut.c`` entry point at 8-bit depth.
+#:
+#: The two entry points are the same filter with a different component
+#: vocabulary and a different range.  ``lutrgb`` falls into ``config_props``'s
+#: default branch, which gives every component ``0..255``; ``lutyuv`` falls into
+#: the YUV branch, which gives luma ``16..235`` and each chroma channel
+#: ``16..240``.  Alpha is full range in both, and the final ``av_clip((int)res,
+#: 0, max[A])`` is ``[0, 255]`` either way.
+#:
+#: Upstream also accepts ``c0``..``c3`` as slot-numbered aliases for these
+#: names, and the RGB names alias the YUV slots in ``lutyuv`` and vice versa.
+#: Both spellings are refused here: they name the same option twice with no
+#: added expressiveness, and ``lutyuv=r=…`` silently means luma.
+_LUT_VARIANTS: dict[str, tuple[tuple[str, ...], tuple[tuple[int, int], ...]]] = {
+    "lutrgb": (CHANNELS, ((0, 255), (0, 255), (0, 255), (0, 255))),
+    "lutyuv": (("y", "u", "v", "a"), ((16, 235), (16, 240), (16, 240), (0, 255))),
+}
+
+
+def _lower_lut(invocation: FilterInvocation, index: int) -> Lowered:
+    """Lower one ``vf_lut.c`` entry point into a four-channel byte table."""
+
+    names, ranges = _LUT_VARIANTS[invocation.name]
+    options = _check_options(invocation, set(names))
+    expressions = {name: "clipval" for name in names}
     expressions.update({name: option.value for name, option in options.items()})
     tables: list[tuple[int, ...]] = []
-    for channel in CHANNELS:
+    for name, value_range in zip(names, ranges, strict=True):
         try:
-            tables.append(build_lut(expressions[channel]))
+            tables.append(build_lut(expressions[name], value_range))
         except ExpressionError as error:
-            raise LoweringError(
-                "unsupported_expression", str(error), channel
-            ) from error
+            raise LoweringError("unsupported_expression", str(error), name) from error
     operation = Operation("lut8", {"tables": tuple(tables)}, source_ref(index, invocation))
     quantize = Operation(
         "quantize_rgba8",
         {"mode": "truncate_toward_zero_then_saturate"},
         source_ref(index, invocation),
     )
-    canonical = "lutrgb=" + ":".join(
-        f"{channel}=table:{_table_hash(table)}"
-        for channel, table in zip(CHANNELS, tables, strict=True)
+    canonical = f"{invocation.name}=" + ":".join(
+        f"{name}=table:{_table_hash(table)}"
+        for name, table in zip(names, tables, strict=True)
     )
+    # vf_lut.c drops colour-dependent side data unconditionally, for every one
+    # of its entry points.
     return Lowered((operation, quantize), canonical, removes_color_side_data=True)
+
+
+def _lower_lutrgb(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    return _lower_lut(invocation, index)
+
+
+def _lower_lutyuv(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    return _lower_lut(invocation, index)
+
+
+#: ``eq``'s options, their defaults, and the range ``av_clipf`` clamps them to.
+#:
+#: Out-of-range values are clamped rather than refused, because that is what
+#: upstream does; refusing them would reject graphs FFmpeg accepts.
+_EQ_OPTIONS: dict[str, tuple[str, float, float]] = {
+    "contrast": ("1.0", -1000.0, 1000.0),
+    "brightness": ("0.0", -1.0, 1.0),
+    "saturation": ("1.0", 0.0, 3.0),
+    "gamma": ("1.0", 0.1, 10.0),
+    "gamma_r": ("1.0", 0.1, 10.0),
+    "gamma_g": ("1.0", 0.1, 10.0),
+    "gamma_b": ("1.0", 0.1, 10.0),
+    "gamma_weight": ("1.0", 0.0, 1.0),
+}
+
+#: How many binary32 steps of slack the gamma table must tolerate.
+#:
+#: ``create_lut`` is the only accepted path that calls ``pow``, and a libm's
+#: ``pow`` is not bit-exact across implementations.  A table is only emitted
+#: when perturbing every ``pow`` result by this many ULPs leaves all 256 bytes
+#: unchanged, so a kernel cannot disagree with the oracle over a rounding this
+#: compiler does not control.
+_GAMMA_ULP_SLACK = 4
+
+
+def _next_after(value: float, steps: int) -> float:
+    """Return the binary64 *steps* ULPs away from *value*."""
+
+    for _ in range(abs(steps)):
+        value = math.nextafter(value, math.inf if steps > 0 else -math.inf)
+    return value
+
+
+def _eq_process_table(contrast: float, brightness: float) -> tuple[int, ...]:
+    """Reproduce ``process_c``, which is integer arithmetic end to end."""
+
+    def c_divide(numerator: int, denominator: int) -> int:
+        # C integer division truncates toward zero; Python's floors.
+        quotient = abs(numerator) // abs(denominator)
+        return -quotient if (numerator < 0) != (denominator < 0) else quotient
+
+    scaled = int(contrast * 256 * 16)
+    offset = (
+        c_divide(int(100.0 * brightness + 100.0) * 511, 200)
+        - 128
+        - c_divide(scaled, 32)
+    )
+    table: list[int] = []
+    for value in range(256):
+        # `pel & ~255` then `(-pel) >> 31` is a saturating cast to uint8.
+        pixel = ((value * scaled) >> 12) + offset
+        table.append(max(0, min(255, pixel)))
+    return tuple(table)
+
+
+def _eq_gamma_table(
+    contrast: float, brightness: float, gamma: float, gamma_weight: float, option: str
+) -> tuple[int, ...]:
+    """Reproduce ``create_lut``, and refuse it when ``pow`` decides a byte."""
+
+    exponent = 1.0 / gamma
+    linear_weight = 1.0 - gamma_weight
+
+    def quantize(base: float, powed: float) -> int:
+        value = base * linear_weight + powed * gamma_weight
+        return 255 if value >= 1.0 else int(256.0 * value)
+
+    table: list[int] = []
+    for value in range(256):
+        base = contrast * (value / 255.0 - 0.5) + 0.5 + brightness
+        if base <= 0.0:
+            table.append(0)
+            continue
+        powed = math.pow(base, exponent)
+        byte = quantize(base, powed)
+        for steps in (-_GAMMA_ULP_SLACK, _GAMMA_ULP_SLACK):
+            if quantize(base, _next_after(powed, steps)) != byte:
+                raise LoweringError(
+                    "libm_sensitive_gamma",
+                    f"the gamma table entry for {value} changes when pow() moves "
+                    f"by {_GAMMA_ULP_SLACK} ULPs, so it depends on a libm rounding "
+                    "this compiler cannot guarantee matches the oracle",
+                    option,
+                )
+        table.append(byte)
+    return tuple(table)
+
+
+def _eq_channel_table(
+    contrast: float,
+    brightness: float,
+    gamma: float,
+    gamma_weight: float,
+    option: str,
+) -> tuple[tuple[int, ...], str]:
+    """Pick the same one of ``check_values``' three paths that upstream picks.
+
+    The three are genuinely different mappings, not refinements of each other:
+    the all-default case copies the plane, while ``process_c`` with those same
+    values would subtract one from every sample.
+    """
+
+    if contrast == 1.0 and brightness == 0.0 and gamma == 1.0:
+        return _identity_table(), "copy"
+    if gamma == 1.0 and abs(contrast) < 7.9:
+        return _eq_process_table(contrast, brightness), "process"
+    return (
+        _eq_gamma_table(contrast, brightness, gamma, gamma_weight, option),
+        "lut",
+    )
+
+
+def _lower_eq(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    options = _check_options(invocation, set(_EQ_OPTIONS) | {"eval"})
+
+    evaluation = options.get("eval")
+    if evaluation is not None and evaluation.value.lower() != "init":
+        raise LoweringError(
+            "runtime_option",
+            "eval=frame re-evaluates the options on every frame, so they are "
+            "not static and cannot be baked into a kernel",
+            "eval",
+        )
+
+    values: dict[str, float] = {}
+    for name, (default, minimum, maximum) in _EQ_OPTIONS.items():
+        raw = options[name].value if name in options else default
+        values[name] = _clipf(_parse_static_expression(raw, name), minimum, maximum)
+
+    # param[0] is luma; param[1] and param[2] are Cb and Cr, whose contrast is
+    # the saturation and whose brightness upstream leaves at zero. Alpha is
+    # copied, so its table is the identity.
+    channels = (
+        (values["contrast"], values["brightness"],
+         values["gamma"] * values["gamma_g"], "gamma"),
+        (values["saturation"], 0.0,
+         math.sqrt(values["gamma_b"] / values["gamma_g"]), "gamma_b"),
+        (values["saturation"], 0.0,
+         math.sqrt(values["gamma_r"] / values["gamma_g"]), "gamma_r"),
+    )
+    tables: list[tuple[int, ...]] = []
+    paths: list[str] = []
+    for contrast, brightness, gamma, option in channels:
+        table, path = _eq_channel_table(
+            contrast, brightness, gamma, values["gamma_weight"], option
+        )
+        tables.append(table)
+        paths.append(path)
+    tables.append(_identity_table())
+
+    operation = Operation(
+        "lut8", {"tables": tuple(tables)}, source_ref(index, invocation)
+    )
+    quantize = Operation(
+        "quantize_rgba8", {"mode": "lookup_u8"}, source_ref(index, invocation)
+    )
+    canonical = (
+        "eq="
+        + ":".join(f"{name}={values[name].hex()}" for name in _EQ_OPTIONS)
+        + ":eval=init:paths="
+        + "+".join(paths)
+    )
+    return Lowered((operation, quantize), canonical)
+
+
+#: ``hue`` clamps saturation and brightness to this range before using them.
+_HUE_LIMIT = 10.0
+
+#: Binary32 slack the hue coefficients must tolerate, for the same reason
+#: :data:`_GAMMA_ULP_SLACK` exists: ``sin`` and ``cos`` are libm calls whose
+#: last bits this compiler does not control.  Here the result is rounded to an
+#: integer, so the slack only bites when the scaled coefficient lands within a
+#: few ULPs of a half-integer.
+_HUE_ULP_SLACK = 4
+
+
+def _lrint(value: float) -> int:
+    """``lrint`` under the default rounding mode: nearest, ties to even."""
+
+    return round(value)
+
+
+def _hue_coefficient(
+    trigonometric: float,
+    saturation: float,
+    option: str,
+    name: str,
+    exact: bool,
+) -> int:
+    """Scale one of ``sin``/``cos`` into 16.16, refusing a decisive rounding.
+
+    ``exact`` says the trigonometric value is not an approximation, so no libm
+    can disagree about it and the slack does not apply.  Without that the guard
+    would refuse a large share of ordinary graphs: at a zero angle the product
+    is a multiple of one sixteenth for any saturation, so it lands exactly on a
+    rounding tie about one time in eight, and a tie moves under any
+    perturbation however certain the value is.
+    """
+
+    coefficient = _lrint(trigonometric * (1 << 16) * saturation)
+    if exact:
+        return coefficient
+    for steps in (-_HUE_ULP_SLACK, _HUE_ULP_SLACK):
+        moved = _next_after(trigonometric, steps) * (1 << 16) * saturation
+        if _lrint(moved) != coefficient:
+            raise LoweringError(
+                "libm_sensitive_hue",
+                f"the {name} coefficient changes when {name}() moves by "
+                f"{_HUE_ULP_SLACK} ULPs, so it depends on a libm rounding this "
+                "compiler cannot guarantee matches the oracle",
+                option,
+            )
+    return coefficient
+
+
+def _lower_hue(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    options = _check_options(invocation, {"h", "H", "s", "b"})
+    if "h" in options and "H" in options:
+        raise LoweringError(
+            "conflicting_options",
+            "h and H are incompatible and upstream fails to configure a graph "
+            "naming both",
+            "H",
+        )
+
+    # av_clip and av_clipf both land on the range bound exactly, so a single
+    # clamp describes either.
+    saturation = min(
+        _HUE_LIMIT,
+        max(
+            -_HUE_LIMIT,
+            _float32(
+                _parse_static_expression(
+                    options["s"].value if "s" in options else "1", "s"
+                )
+            ),
+        ),
+    )
+    brightness = min(
+        _HUE_LIMIT,
+        max(
+            -_HUE_LIMIT,
+            _float32(
+                _parse_static_expression(
+                    options["b"].value if "b" in options else "0", "b"
+                )
+            ),
+        ),
+    )
+
+    # h is degrees and H is radians. hue_deg is a float, so the conversion to
+    # radians rounds to binary32 twice: once on the option, once on the result.
+    if "h" in options:
+        degrees = _float32(_parse_static_expression(options["h"].value, "h"))
+        angle = _float32(degrees * math.pi / 180)
+        option = "h"
+    elif "H" in options:
+        angle = _float32(_parse_static_expression(options["H"].value, "H"))
+        option = "H"
+    else:
+        angle = 0.0
+        option = "s"
+
+    # C requires cos(0) to be exactly 1 and sin(0) exactly 0, so at a zero
+    # angle -- which is what hue=s=… and hue=b=… mean -- the coefficients carry
+    # no libm uncertainty at all.
+    exact = angle == 0.0
+    cosine = _hue_coefficient(math.cos(angle), saturation, option, "cos", exact)
+    sine = _hue_coefficient(math.sin(angle), saturation, option, "sin", exact)
+
+    # Luma only carries the brightness offset. Upstream copies the plane when
+    # brightness is zero and applies this table otherwise; the table is the
+    # identity at zero, so one path describes both.
+    luma = tuple(
+        max(0, min(255, int(value + brightness * 25.5))) for value in range(256)
+    )
+    identity = _identity_table()
+    lut = Operation(
+        "lut8",
+        {"tables": (luma, identity, identity, identity)},
+        source_ref(index, invocation),
+    )
+    lut_quantize = Operation(
+        "quantize_rgba8", {"mode": "lookup_u8"}, source_ref(index, invocation)
+    )
+    rotate = Operation(
+        "chroma_rotate_i32",
+        {"cosine": cosine, "sine": sine},
+        source_ref(index, invocation),
+    )
+    rotate_quantize = Operation(
+        "quantize_rgba8",
+        {"mode": "saturate_i32_to_u8"},
+        source_ref(index, invocation),
+    )
+    canonical = f"hue=cos={cosine}:sin={sine}:b={brightness.hex()}"
+    return Lowered((lut, lut_quantize, rotate, rotate_quantize), canonical)
 
 
 def _lower_colorlevels(
@@ -457,6 +838,9 @@ Lowerer = Callable[[FilterInvocation, int, "PixelLayout | None"], Lowered]
 LOWERERS: dict[str, Lowerer] = {
     "negate": _lower_negate,
     "lutrgb": _lower_lutrgb,
+    "lutyuv": _lower_lutyuv,
+    "eq": _lower_eq,
+    "hue": _lower_hue,
     "colorlevels": _lower_colorlevels,
     "colorchannelmixer": _lower_colorchannelmixer,
 }
@@ -478,9 +862,10 @@ SUPPORTED_FILTERS = tuple(LOWERERS)
 #: ``colorchannelmixer`` additionally accept the ``0rgb``/``rgb0`` family that
 #: ``negate`` and ``lutrgb`` do not, so it is outside the common subset.
 #:
-#: Only ``negate`` advertises YUV at all: ``lutrgb``, ``colorlevels``, and
-#: ``colorchannelmixer`` are RGB-only upstream, so a YUV run containing one of
-#: them is not contiguous in one format and is refused rather than fused.
+#: The two families barely overlap: ``negate`` advertises both, while
+#: ``lutrgb``, ``colorlevels``, and ``colorchannelmixer`` are RGB-only and
+#: ``lutyuv`` is YUV-only.  A run mixing the two families is therefore not
+#: contiguous in one format and is refused rather than fused.
 _RGB8 = frozenset(
     {"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24", "gbrp", "gbrap"}
 )
@@ -489,6 +874,9 @@ _YUV8 = frozenset({"yuv444p", "yuv422p", "yuv420p"})
 FILTER_FORMATS: dict[str, frozenset[str]] = {
     "negate": _RGB8 | _YUV8,
     "lutrgb": _RGB8,
+    "lutyuv": _YUV8,
+    "eq": _YUV8,
+    "hue": _YUV8,
     "colorlevels": _RGB8,
     "colorchannelmixer": _RGB8,
 }

@@ -115,6 +115,33 @@ def _is_mixer(operation: Operation) -> bool:
     )
 
 
+def _is_chroma_rotate(operation: Operation) -> bool:
+    return operation.kind == "chroma_rotate_i32"
+
+
+def _stage_channels(operation: Operation) -> frozenset[int]:
+    """The channels a stage writes, and therefore the loops it belongs in."""
+
+    if _is_chroma_rotate(operation):
+        return frozenset({1, 2})
+    return frozenset(range(4))
+
+
+def _stage_coupling(operation: Operation) -> frozenset[int]:
+    """The channels a stage must see together in one loop iteration.
+
+    Empty when each output depends only on its own input, which is the case for
+    every table-driven stage: those write all four channels but couple none of
+    them, so their planes stay in separate loops.
+    """
+
+    if _is_chroma_rotate(operation):
+        return frozenset({1, 2})
+    if _is_mixer(operation):
+        return frozenset(range(4))
+    return frozenset()
+
+
 def _stage_declarations(stages: list[Operation]) -> list[str]:
     lines: list[str] = []
     for index, operation in enumerate(stages):
@@ -122,6 +149,12 @@ def _stage_declarations(stages: list[Operation]) -> list[str]:
             lines.append(f"/* stage {index}: four independent byte lookup tables */")
             rows = tuple(tuple(row) for row in operation.parameters["tables"])
             lines.extend(_format_table(f"lut_{index}", "uint8_t", rows))
+        elif _is_chroma_rotate(operation):
+            lines.append(
+                f"/* stage {index}: chroma rotation, evaluated inline "
+                f"(cos {operation.parameters['cosine']}, "
+                f"sin {operation.parameters['sine']} in 16.16) */"
+            )
         elif operation.parameters["evaluation"] == LEVELS_EVALUATION:
             lines.append(
                 f"/* stage {index}: materialized levels_f32_fma (single-rounding oracle) */"
@@ -165,16 +198,47 @@ def _channel_assignment(index: int, operation: Operation, channel: int) -> str:
     raise ValueError(f"unsupported code-generation stage {operation.kind!r}")
 
 
-def _stage_body(index: int, operation: Operation) -> list[str]:
+def _chroma_rotate_body(index: int, operation: Operation, indent: str) -> list[str]:
+    """Emit ``vf_hue.c``'s chroma rotation inline rather than as its tables.
+
+    Upstream indexes two 64 KiB tables by the ``(u, v)`` pair; the arithmetic
+    behind them is a few int32 operations that cannot overflow at these
+    magnitudes.  The ``>> 16`` is on a signed value, exactly as upstream writes
+    it, so both are the same arithmetic shift under the same compiler.
+    """
+
+    cosine = operation.parameters["cosine"]
+    sine = operation.parameters["sine"]
+    rounding = f"({1 << 15} + {128 << 16})"
+    return [
+        f"{indent}{{",
+        f"{indent}    const int32_t u{index} = (int32_t)c1 - 128;",
+        f"{indent}    const int32_t v{index} = (int32_t)c2 - 128;",
+        f"{indent}    c1 = lavfi_saturate_i32("
+        f"(({cosine} * u{index}) - ({sine} * v{index}) + {rounding}) >> 16);",
+        f"{indent}    c2 = lavfi_saturate_i32("
+        f"(({sine} * u{index}) + ({cosine} * v{index}) + {rounding}) >> 16);",
+        f"{indent}}}",
+    ]
+
+
+def _stage_body(
+    index: int,
+    operation: Operation,
+    channels: tuple[int, ...] = (0, 1, 2, 3),
+    indent: str = "            ",
+) -> list[str]:
+    """Emit one stage for a loop carrying exactly *channels*."""
+
+    if _is_chroma_rotate(operation):
+        return _chroma_rotate_body(index, operation, indent)
     if not _is_mixer(operation):
         return [
-            "            " + _channel_assignment(index, operation, channel)
-            for channel in range(4)
+            indent + _channel_assignment(index, operation, channel)
+            for channel in channels
         ]
 
-    lines = [
-        f"            lavfi_i16x4 n{index} = (lavfi_i16x4){{0, 0, 0, 0}};"
-    ]
+    lines = [f"{indent}lavfi_i16x4 n{index} = (lavfi_i16x4){{0, 0, 0, 0}};"]
     for input_, column in enumerate(_mixer_columns(operation)):
         mode = _mixer_column_mode(column)
         if mode == "table":
@@ -183,10 +247,10 @@ def _stage_body(index: int, operation: Operation) -> list[str]:
             term = _direct_mixer_vector(input_, column)
         else:
             continue
-        lines.append(f"            n{index} += {term};")
+        lines.append(f"{indent}n{index} += {term};")
     lines.extend(
-        f"            c{channel} = lavfi_saturate_i32(n{index}[{channel}]);"
-        for channel in range(4)
+        f"{indent}c{channel} = lavfi_saturate_i32(n{index}[{channel}]);"
+        for channel in channels
     )
     return lines
 
@@ -254,21 +318,68 @@ def _ceil_shift_expression(name: str, shift: int) -> str:
     return f"({name} + {(1 << shift) - 1}) >> {shift}"
 
 
+def _walk_planes(
+    layout: PixelLayout, stages: list[Operation]
+) -> list[tuple[int, ...]]:
+    """Group the planes that one loop has to visit together.
+
+    The default is one loop per plane, which is what every channel-independent
+    pipeline needs.  A stage that reads across channels -- ``hue`` rotating Cb
+    into Cr -- forces the planes holding those channels into a single loop, so
+    both samples are in hand at once.  ``validate_ir`` has already refused any
+    stage that would join planes the layout samples differently.
+    """
+
+    groups = [(plane,) for plane, channels in enumerate(layout.plane_channels) if channels]
+    for operation in stages:
+        wanted = {
+            layout.plane(channel)
+            for channel in _stage_coupling(operation)
+            if layout.plane(channel) is not None
+        }
+        if len(wanted) < 2:
+            continue
+        merged = tuple(
+            sorted(
+                plane
+                for group in groups
+                if wanted & set(group)
+                for plane in group
+            )
+        )
+        groups = [group for group in groups if not (wanted & set(group))]
+        groups.append(merged)
+        groups.sort()
+    return groups
+
+
 def _plane_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
-    """Walk each plane at its own resolution, one channel at a time.
+    """Walk each group of co-sited planes at its own resolution.
 
     ``width`` and ``height`` describe plane 0, so every other plane derives its
-    dimensions the way the rest of libavfilter does.
+    dimensions the way the rest of libavfilter does.  A group holding one plane
+    -- the case for every channel-independent pipeline -- names its row
+    pointers plainly; a group spanning planes qualifies them by plane number.
     """
 
     lines: list[str] = []
-    for plane, channels in enumerate(layout.plane_channels):
+    for group in _walk_planes(layout, stages):
+        channels = tuple(
+            channel for plane in group for channel in layout.plane_channels[plane]
+        )
         if not channels:
             continue
-        horizontal, vertical = layout.plane_shift(plane)
+        # Every plane of a group shares one resolution, by construction.
+        horizontal, vertical = layout.plane_shift(group[0])
         stored = [channel for channel in channels if channel in layout.stored_channels]
+
+        def row(prefix: str, plane: int) -> str:
+            return f"{prefix}_row" if len(group) == 1 else f"{prefix}_row_{plane}"
+
         lines.append(
-            f"    /* plane {plane} carries channel"
+            f"    /* plane{'s' if len(group) != 1 else ''} "
+            f"{', '.join(str(plane) for plane in group)} carr"
+            f"{'y' if len(group) != 1 else 'ies'} channel"
             f"{'s' if len(channels) != 1 else ''} "
             f"{', '.join(str(channel) for channel in channels)} */"
         )
@@ -280,32 +391,39 @@ def _plane_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
             f"        const int plane_height = {_ceil_shift_expression('height', vertical)};"
         )
         lines.append("        for (int y = 0; y < plane_height; ++y) {")
-        lines.append(
-            f"            const uint8_t *source_row = "
-            f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
-        )
-        lines.append(
-            f"            uint8_t *destination_row = "
-            f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
-        )
+        for plane in group:
+            lines.append(
+                f"            const uint8_t *{row('source', plane)} = "
+                f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
+            )
+            lines.append(
+                f"            uint8_t *{row('destination', plane)} = "
+                f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
+            )
         lines.append("            for (int x = 0; x < plane_width; ++x) {")
         for channel in channels:
             sample = _sample_index(layout, channel)
+            source = row("source", layout.plane(channel))  # type: ignore[arg-type]
             lines.append(
-                f"                uint8_t c{channel} = source_row[{sample}];"
+                f"                uint8_t c{channel} = {source}[{sample}];"
             )
         for index, operation in enumerate(stages):
+            active = tuple(
+                channel for channel in channels
+                if channel in _stage_channels(operation)
+            )
+            if not active:
+                continue
             lines.append("")
             lines.append(f"                /* stage {index} */")
-            for channel in channels:
-                lines.append(
-                    "                "
-                    + _channel_assignment(index, operation, channel)
-                )
+            lines.extend(
+                _stage_body(index, operation, active, "                ")
+            )
         lines.append("")
         for channel in stored:
             sample = _sample_index(layout, channel)
-            lines.append(f"                destination_row[{sample}] = c{channel};")
+            destination = row("destination", layout.plane(channel))  # type: ignore[arg-type]
+            lines.append(f"                {destination}[{sample}] = c{channel};")
         lines.extend(["            }", "        }", "    }"])
     return lines
 
@@ -325,7 +443,12 @@ def generate_c(
     )
     body = passes.ir.operations[1:-1]
     stages = [body[index] for index in range(0, len(body), 2)]
+    # The vector type is only for the mixer; both it and the chroma rotation
+    # saturate their int32 results to bytes.
     uses_mixer = any(_is_mixer(operation) for operation in stages)
+    needs_saturation = uses_mixer or any(
+        _is_chroma_rotate(operation) for operation in stages
+    )
 
     lines = [
         "/* Generated by lavfi-cc. This file is deterministic for its input IR. */",
@@ -336,9 +459,11 @@ def generate_c(
     ]
     if uses_mixer:
         lines.extend(
+            ["typedef int16_t lavfi_i16x4 __attribute__((ext_vector_type(4)));", ""]
+        )
+    if needs_saturation:
+        lines.extend(
             [
-                "typedef int16_t lavfi_i16x4 __attribute__((ext_vector_type(4)));",
-                "",
                 "static inline uint8_t lavfi_saturate_i32(int32_t value)",
                 "{",
                 "    if (value < 0)",

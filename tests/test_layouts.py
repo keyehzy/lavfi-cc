@@ -35,17 +35,31 @@ RGB_CHAINS = (
     "colorchannelmixer=rr=.9:rg=.1:ba=.3",
 )
 
-# negate is the only accepted filter that advertises YUV upstream; lutrgb,
-# colorlevels, and colorchannelmixer are RGB-only, so a YUV run containing one
-# of them is refused rather than fused. Its component mask is spelled in the
-# other family's names here, and on a subsampled layout each plane is walked at
-# its own resolution.
+# negate, lutyuv, eq, and hue are the accepted filters that advertise YUV
+# upstream; lutrgb, colorlevels, and colorchannelmixer are RGB-only, so a YUV
+# run containing one of them is refused rather than fused. Component masks and
+# LUT expressions are spelled in the other family's names here, the lutyuv
+# expressions exercise the 16-235/16-240 limited range, the eq invocations
+# cover each of its three upstream code paths, hue rotates Cb into Cr so its
+# two chroma planes have to be walked in one loop, and on a subsampled layout
+# each sampling group is walked at its own resolution.
 YUV_CHAINS = (
     "negate",
     "negate=components=y",
     "negate=components=u+v",
     "negate=components=y+u+v",
-    "negate,negate=components=y",
+    "lutyuv=y=negval:u=negval:v=negval",
+    "lutyuv=y=minval+maxval-val:u='clip(val,100,180)'",
+    "lutyuv=y=val*1.125-7:v=maxval-val",
+    "eq=contrast=1.4:brightness=-0.15",
+    "eq=saturation=0.6",
+    "eq=gamma=2.2:gamma_weight=0.7",
+    "eq=contrast=1.2:brightness=0.05:saturation=1.3:gamma=1.8:gamma_r=1.4",
+    "hue=h=45",
+    "hue=h=110:s=1.6:b=0.4",
+    "hue=H=2.1:s=-1.2",
+    "negate,lutyuv=y=negval:u=val*0.9+12,eq=contrast=1.3:saturation=0.8,"
+    "hue=h=25:s=1.2:b=-0.3,negate=components=v",
 )
 
 
@@ -187,6 +201,46 @@ class LayoutAnalysisTests(unittest.TestCase):
                 self.assertEqual(
                     analysis.diagnostics[0].code, "format_not_advertised"
                 )
+
+    def test_rgb_layouts_refuse_lutyuv(self) -> None:
+        # lutyuv advertises no RGB format, so FFmpeg would convert around it.
+        for name in ("rgba", "rgb24", "gbrp"):
+            with self.subTest(layout=name):
+                analysis = analyze_filtergraph(
+                    f"format={name},lutyuv=y=negval,format={name}"
+                )
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(
+                    analysis.diagnostics[0].code, "format_not_advertised"
+                )
+
+    def test_lutyuv_refuses_the_rgb_component_names(self) -> None:
+        # Upstream shares one options table between lutrgb and lutyuv, so
+        # lutyuv=r=... silently sets the luma expression. Refusing it keeps the
+        # spelling from meaning two different things.
+        for graph, filter_name in (
+            ("format=yuv420p,lutyuv=r=negval,format=yuv420p", "lutyuv"),
+            ("format=rgba,lutrgb=y=negval,format=rgba", "lutrgb"),
+        ):
+            with self.subTest(filter=filter_name):
+                analysis = analyze_filtergraph(graph)
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(
+                    analysis.diagnostics[0].code, "unsupported_option"
+                )
+
+    def test_lutyuv_and_lutrgb_do_not_share_a_plan(self) -> None:
+        # The same expression means different bytes in the two ranges, so the
+        # two filters must never collide on one cached kernel.
+        yuv = analyze_filtergraph(
+            "format=yuv444p,lutyuv=y=negval:u=negval:v=negval,format=yuv444p"
+        )
+        rgb = analyze_filtergraph(
+            "format=rgba,lutrgb=r=negval:g=negval:b=negval,format=rgba"
+        )
+        self.assertTrue(yuv.eligible, yuv.diagnostics)
+        self.assertTrue(rgb.eligible, rgb.diagnostics)
+        self.assertNotEqual(yuv.ir.plan_hash, rgb.ir.plan_hash)
 
     def test_negate_alpha_is_inert_on_yuv(self) -> None:
         # yuv420p has no alpha plane for the plane mask to select, so the

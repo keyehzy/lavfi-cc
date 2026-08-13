@@ -21,8 +21,9 @@ from lavfi_cc.layouts import get_layout
 
 
 #: One case per code-generation shape: the packed whole-pixel walk with every
-#: lowering, and the per-plane walk a subsampled layout needs. The dimensions
-#: are odd so a chroma plane's AV_CEIL_RSHIFT rounding is exercised.
+#: lowering, the one-plane-per-loop walk a subsampled layout needs, and the
+#: two-planes-in-one-loop walk hue's chroma rotation forces. The dimensions are
+#: odd so a chroma plane's AV_CEIL_RSHIFT rounding is exercised.
 CASES = (
     (
         "format=rgba,negate=components=r+g+b+a,"
@@ -36,6 +37,13 @@ CASES = (
     (
         "format=yuv420p,negate,negate=components=y,"
         "negate=components=u+v,format=yuv420p",
+        257,
+        5,
+    ),
+    (
+        "format=yuv420p,lutyuv=y=negval:u=val*0.9+12,"
+        "eq=contrast=1.3:saturation=0.8:gamma=1.7,"
+        "hue=h=37.5:s=1.4:b=-0.35,format=yuv420p",
         257,
         5,
     ),

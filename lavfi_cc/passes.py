@@ -64,9 +64,25 @@ def _identity_mixer(operation: Operation) -> bool:
     )
 
 
+def _identity_chroma_rotate(operation: Operation) -> bool:
+    """A zero-degree rotation at unit saturation leaves both channels alone.
+
+    ``(u - 128) << 16`` plus the half-step rounding term shifts back to exactly
+    ``u`` for every byte, so this is an identity rather than an approximation
+    of one.
+    """
+
+    return (
+        operation.parameters["cosine"] == 1 << 16
+        and operation.parameters["sine"] == 0
+    )
+
+
 def _is_identity(operation: Operation) -> bool:
     if operation.kind == "lut8":
         return _identity_lut(operation)
+    if operation.kind == "chroma_rotate_i32":
+        return _identity_chroma_rotate(operation)
     if operation.kind != "matrix4x4":
         return False
     evaluation = operation.parameters["evaluation"]

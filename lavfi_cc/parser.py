@@ -19,7 +19,10 @@ import re
 
 
 _NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
-_OPTION_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+#: Option names are case-sensitive upstream and both cases are in use: ``hue``
+#: spells its hue angle ``h`` in degrees and ``H`` in radians, and the two mean
+#: different things.
+_OPTION_NAME = re.compile(r"[a-zA-Z][a-zA-Z0-9_]*\Z")
 
 
 class FiltergraphSyntaxError(ValueError):

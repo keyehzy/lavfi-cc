@@ -132,6 +132,25 @@ class PixelLayout:
         )
 
     @property
+    def sampling_groups(self) -> tuple[tuple[int, ...], ...]:
+        """Channels this layout stores, grouped by their sampling resolution.
+
+        Channels in one group have a sample at exactly the same set of
+        positions, so one loop can visit all of them and an operation may read
+        across them.  Channels in different groups have no common iteration
+        space: a ``yuv420p`` chroma sample covers four luma samples, so there is
+        no single pixel whose luma and chroma an operation could mix.
+
+        A layout with no subsampling has exactly one group holding every stored
+        channel, which is why a whole-pixel walk is valid there.
+        """
+
+        groups: dict[tuple[int, int], list[int]] = {}
+        for channel in self.stored_channels:
+            groups.setdefault(self.subsampling[channel], []).append(channel)
+        return tuple(tuple(group) for group in groups.values())
+
+    @property
     def plane_channels(self) -> tuple[tuple[int, ...], ...]:
         """The logical channels each plane stores, in channel order."""
 

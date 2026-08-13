@@ -46,15 +46,20 @@ def _integer(value: Any, description: str) -> int:
     return value
 
 
+#: Each channel depends only on itself.
+INDEPENDENT_GROUPS = ((0,), (1,), (2,), (3,))
+#: Every output channel reads every input channel.
+WHOLE_PIXEL_GROUPS = ((0, 1, 2, 3),)
+#: The two chroma channels depend on each other but on nothing else.
+CHROMA_PAIR_GROUPS = ((0,), (1, 2), (3,))
+
+
 @dataclass(frozen=True)
 class _LutStage:
     tables: tuple[tuple[int, ...], ...]
 
     #: A lookup reads only its own channel, so one plane can run it alone.
-    channel_independent = True
-
-    def evaluate_channel(self, channel: int, value: int) -> int:
-        return self.tables[channel][value]
+    channel_groups = INDEPENDENT_GROUPS
 
     def evaluate(self, pixel: Pixel) -> Pixel:
         return tuple(  # type: ignore[return-value]
@@ -69,26 +74,24 @@ class _LevelsStage:
     output_offsets: tuple[int, ...]
 
     #: The matrix is diagonal, so each channel depends only on itself.
-    channel_independent = True
+    channel_groups = INDEPENDENT_GROUPS
 
-    def evaluate_channel(self, channel: int, value: int) -> int:
+    def evaluate(self, pixel: Pixel) -> Pixel:
         # The pinned Apple-Clang FFmpeg oracle contracts this expression to one
         # binary32 FMLA. Both inputs have few enough significant bits for
         # binary64 to hold the exact intermediate before the single explicit
         # binary32 rounding below.
-        return _u8(
-            int(
-                _f32(
-                    (value - self.input_offsets[channel])
-                    * self.coefficients[channel]
-                    + self.output_offsets[channel]
+        return tuple(  # type: ignore[return-value]
+            _u8(
+                int(
+                    _f32(
+                        (pixel[channel] - self.input_offsets[channel])
+                        * self.coefficients[channel]
+                        + self.output_offsets[channel]
+                    )
                 )
             )
-        )
-
-    def evaluate(self, pixel: Pixel) -> Pixel:
-        return tuple(  # type: ignore[return-value]
-            self.evaluate_channel(channel, pixel[channel]) for channel in range(4)
+            for channel in range(4)
         )
 
 
@@ -97,7 +100,7 @@ class _MixerStage:
     tables: tuple[tuple[tuple[int, ...], ...], ...]
 
     #: Every output channel sums terms from all four inputs.
-    channel_independent = False
+    channel_groups = WHOLE_PIXEL_GROUPS
 
     def evaluate(self, pixel: Pixel) -> Pixel:
         output = []
@@ -111,7 +114,32 @@ class _MixerStage:
         return tuple(output)  # type: ignore[return-value]
 
 
-Stage = _LutStage | _LevelsStage | _MixerStage
+@dataclass(frozen=True)
+class _ChromaRotateStage:
+    """``vf_hue.c``'s chroma rotation, as exact integer arithmetic.
+
+    Upstream materializes this as two 64 KiB tables indexed by the ``(u, v)``
+    pair.  The arithmetic behind them is a handful of 32-bit operations that
+    cannot overflow at these magnitudes, so it is evaluated directly instead:
+    same bytes, no table.
+    """
+
+    cosine: int
+    sine: int
+
+    #: Chroma is a 2D vector here, so the two channels rotate into each other.
+    channel_groups = CHROMA_PAIR_GROUPS
+
+    def evaluate(self, pixel: Pixel) -> Pixel:
+        u = pixel[1] - 128
+        v = pixel[2] - 128
+        # + (1 << 15) rounds the >> 16 to nearest; + (128 << 16) re-centres.
+        rotated_u = ((self.cosine * u) - (self.sine * v) + (1 << 15) + (128 << 16)) >> 16
+        rotated_v = ((self.sine * u) + (self.cosine * v) + (1 << 15) + (128 << 16)) >> 16
+        return (pixel[0], _u8(rotated_u), _u8(rotated_v), pixel[3])
+
+
+Stage = _LutStage | _LevelsStage | _MixerStage | _ChromaRotateStage
 
 
 def _prepare_lut(operation: Operation) -> _LutStage:
@@ -280,6 +308,28 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
     return _MixerStage(tuple(prepared_rows))
 
 
+#: Widest ``hue`` coefficient: ``lrint(1.0 * (1 << 16) * 10)``, the saturation
+#: bound.  Anything wider could overflow the int32 the arithmetic assumes.
+_CHROMA_COEFFICIENT_LIMIT = 10 * (1 << 16)
+
+
+def _prepare_chroma_rotate(operation: Operation) -> _ChromaRotateStage:
+    parameters = operation.parameters
+    if set(parameters) != {"cosine", "sine"}:
+        raise InterpreterError(
+            "chroma_rotate_i32 parameters must be cosine and sine"
+        )
+    cosine = _integer(parameters["cosine"], "chroma rotation cosine")
+    sine = _integer(parameters["sine"], "chroma rotation sine")
+    for value in (cosine, sine):
+        if not -_CHROMA_COEFFICIENT_LIMIT <= value <= _CHROMA_COEFFICIENT_LIMIT:
+            raise InterpreterError(
+                "chroma rotation coefficients must be within "
+                f"+/-{_CHROMA_COEFFICIENT_LIMIT}"
+            )
+    return _ChromaRotateStage(cosine, sine)
+
+
 def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
     if ir.ir_version != IR_VERSION:
         raise InterpreterError(
@@ -315,6 +365,12 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
             if mode not in {"lookup_u8", "truncate_toward_zero_then_saturate"}:
                 raise InterpreterError(f"lut8 cannot use quantization mode {mode!r}")
             stages.append(_prepare_lut(transform))
+        elif transform.kind == "chroma_rotate_i32":
+            if mode != "saturate_i32_to_u8":
+                raise InterpreterError(
+                    f"chroma_rotate_i32 cannot use quantization mode {mode!r}"
+                )
+            stages.append(_prepare_chroma_rotate(transform))
         elif transform.kind == "matrix4x4":
             evaluation = transform.parameters.get("evaluation")
             if evaluation == "levels_f32_fma":
@@ -337,18 +393,37 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
         else:
             raise InterpreterError(f"unsupported transform {transform.kind!r}")
 
-    # A subsampled layout stores one chroma sample per several luma samples, so
-    # there is no single pixel whose four channels an operation could mix. Every
-    # consumer of the IR reaches this check, so the restriction cannot be
-    # bypassed by constructing the IR directly.
-    if LAYOUTS[ir.layout].subsampled:
-        for index, stage in enumerate(stages):
-            if not stage.channel_independent:
-                raise InterpreterError(
-                    f"stage {index} mixes channels, which the subsampled layout "
-                    f"{ir.layout!r} cannot express"
-                )
+    _check_sampling_groups(ir.layout, stages)
     return tuple(stages)
+
+
+def _check_sampling_groups(name: str, stages: list[Stage]) -> None:
+    """Refuse a stage that reads across channels with no common sample grid.
+
+    A subsampled layout stores one chroma sample per several luma samples, so
+    an operation mixing luma with chroma has no single pixel to mix.  The
+    admissible mixes are exactly those confined to one of the layout's sampling
+    groups: ``yuv420p`` can rotate Cb into Cr, because those two are sampled at
+    the same positions, but cannot fold luma into either.
+
+    Every consumer of the IR reaches this check, so the restriction cannot be
+    bypassed by constructing the IR directly.
+    """
+
+    layout = LAYOUTS[name]
+    stored = set(layout.stored_channels)
+    groups = [set(group) for group in layout.sampling_groups]
+    for index, stage in enumerate(stages):
+        for channels in stage.channel_groups:
+            required = set(channels) & stored
+            if len(required) > 1 and not any(
+                required <= group for group in groups
+            ):
+                raise InterpreterError(
+                    f"stage {index} reads across channels "
+                    f"{sorted(required)} together, which the layout {name!r} "
+                    "samples at different resolutions"
+                )
 
 
 def _validate_pixel(pixel: tuple[int, ...] | list[int]) -> Pixel:
@@ -497,7 +572,7 @@ def interpret_into(
 
     stages = _prepare(ir)
     if layout.subsampled:
-        _interpret_planes(
+        _interpret_groups(
             stages,
             layout,
             source_view,
@@ -553,7 +628,7 @@ def interpret_into(
                 ] = output[channel]
 
 
-def _interpret_planes(
+def _interpret_groups(
     stages: tuple[Stage, ...],
     layout: PixelLayout,
     source_view: memoryview,
@@ -565,30 +640,50 @@ def _interpret_planes(
     source_offset: int,
     destination_offset: int,
 ) -> None:
-    """Run a channel-independent pipeline one plane at a time.
+    """Run the pipeline one sampling group at a time.
 
-    A subsampled layout has no common iteration space, so each plane is walked
-    at its own resolution and only the channels it stores are evaluated.
-    :func:`_prepare` has already refused any stage that would need the others.
+    A subsampled layout has no single iteration space, so each group of
+    co-sited channels is walked at its own resolution.  Channels outside the
+    group are loaded as zero and their results discarded: :func:`_prepare` has
+    already refused any stage whose output inside this group would have needed
+    them.
     """
 
-    for plane, channels in enumerate(layout.plane_channels):
-        origin = layout.plane_origin(plane, width, height)
-        plane_width = layout.plane_width(plane, width)
-        plane_height = layout.plane_height(plane, height)
+    for channels in layout.sampling_groups:
+        planes = tuple(layout.plane(channel) for channel in channels)
         offsets = tuple(layout.offset(channel) for channel in channels)
-        for y in range(plane_height):
-            source_row = source_offset + origin + y * source_strides[plane]
-            destination_row = (
-                destination_offset + origin + y * destination_strides[plane]
+        # Every channel of a group shares one resolution, by construction.
+        group_width = layout.plane_width(planes[0], width)  # type: ignore[arg-type]
+        group_height = layout.plane_height(planes[0], height)  # type: ignore[arg-type]
+        origins = tuple(
+            layout.plane_origin(plane, width, height)  # type: ignore[arg-type]
+            for plane in planes
+        )
+        for y in range(group_height):
+            source_rows = tuple(
+                source_offset + origin + y * source_strides[plane]  # type: ignore[index]
+                for plane, origin in zip(planes, origins, strict=True)
             )
-            for x in range(plane_width):
-                for channel, offset in zip(channels, offsets, strict=True):
-                    index = x * layout.step + offset  # type: ignore[operator]
-                    value = source_view[source_row + index]
-                    for stage in stages:
-                        value = stage.evaluate_channel(channel, value)
-                    destination_view[destination_row + index] = value
+            destination_rows = tuple(
+                destination_offset + origin + y * destination_strides[plane]  # type: ignore[index]
+                for plane, origin in zip(planes, origins, strict=True)
+            )
+            for x in range(group_width):
+                indices = tuple(
+                    x * layout.step + offset  # type: ignore[operator]
+                    for offset in offsets
+                )
+                loaded = [0, 0, 0, 0]
+                for position, channel in enumerate(channels):
+                    loaded[channel] = source_view[
+                        source_rows[position] + indices[position]
+                    ]
+                pixel: Pixel = tuple(loaded)  # type: ignore[assignment]
+                output = _run_pixel(stages, pixel)
+                for position, channel in enumerate(channels):
+                    destination_view[
+                        destination_rows[position] + indices[position]
+                    ] = output[channel]
 
 
 def interpret_rgba8(ir: PixelIR, source: Any, width: int, height: int) -> bytes:

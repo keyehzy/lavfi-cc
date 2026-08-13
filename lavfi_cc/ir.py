@@ -94,6 +94,19 @@ class PixelIR:
         return hashlib.sha256(self.serialize()).hexdigest()
 
     def pretty(self) -> str:
+        # Only the display names change with the layout; the operations
+        # themselves are layout-independent and so is the plan hash.
+        from .layouts import LAYOUTS
+
+        layout = LAYOUTS.get(self.layout)
+        names = (
+            tuple(
+                name or channel
+                for name, channel in zip(layout.component_names, CHANNELS)
+            )
+            if layout is not None
+            else CHANNELS
+        )
         lines = [f"pixel_ir v{self.ir_version} {self.pixel_format} layout={self.layout}"]
         for index, operation in enumerate(self.operations):
             source = ""
@@ -106,7 +119,7 @@ class PixelIR:
             if operation.kind == "lut8":
                 tables = operation.parameters["tables"]
                 summaries = []
-                for channel, table in zip(CHANNELS, tables, strict=True):
+                for channel, table in zip(names, tables, strict=True):
                     digest = hashlib.sha256(bytes(table)).hexdigest()[:12]
                     summaries.append(
                         f"{channel}=sha256:{digest}[{table[0]},{table[64]},{table[128]},{table[255]}]"
@@ -122,6 +135,11 @@ class PixelIR:
                         f"coefficients={operation.parameters['coefficients']} "
                         f"offsets={operation.parameters['offsets']}"
                     )
+            elif operation.kind == "chroma_rotate_i32":
+                detail = (
+                    f"cos={operation.parameters['cosine']} "
+                    f"sin={operation.parameters['sine']} (16.16)"
+                )
             elif operation.kind == "quantize_rgba8":
                 detail = f"mode={operation.parameters['mode']}"
             else:

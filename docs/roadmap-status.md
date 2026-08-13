@@ -4,6 +4,10 @@ The six items below were the planned follow-up to the Week 6 MVP. This
 document records what landed, what did not, and — where something did not — the
 specific finding that determines how much work is left.
 
+All six have now landed at least in part. Item 3 is the most recent and is the
+only one still half-open: its YUV filters are done and its RGB filters are not,
+for a reason recorded under that item.
+
 The framing changed once during this work, and it is worth stating first
 because it reorders the whole roadmap.
 
@@ -37,7 +41,11 @@ of the correctness argument: `lutrgb` is RGB-only, so a run written as
 `format=yuv420p,negate,lutrgb,colorlevels` is not one run at all — FFmpeg
 converts around `lutrgb` — and no kernel may replace it. Format coverage
 decides which runs are fusible; the *filter* subset decides which runs exist.
-With YUV supported, the second is now the binding constraint.
+
+Item 3 has now widened the second, and the gate is symmetric: `lutyuv`, `eq`,
+and `hue` are YUV-only, so they are refused in an RGB run exactly as `lutrgb`
+is refused in a YUV one. `negate` remains the only accepted filter in both
+families.
 
 ## 1. Automatically discover fusible islands — done
 
@@ -103,21 +111,127 @@ Three format-dependent constraints were found and are enforced:
 **Deferred:** the 9–16-bit formats, which need 65536-entry tables and a
 re-derivation of every quantization rule at that depth.
 
-## 3. More pointwise filters — not started, with one finding that reshapes it
+## 3. More pointwise filters — the YUV half landed, the RGB half is unchanged
 
-No new filters landed. The lowering layer was extracted into
-`lavfi_cc/filters.py` so adding one is now local, but the filters named in the
-roadmap split into two groups that need different prerequisites:
+`lutyuv`, `eq`, and `hue` are implemented and bit-exact against the pinned
+oracle in all three accepted YUV layouts. The RGB half of the item —
+`curves`, `colorbalance`, and `colorcontrast` — is untouched, because it still
+needs an IR extension rather than a new table.
 
-- `lutyuv`, `eq`, and `hue` are YUV-native and were blocked on item 4. That
-  block is gone: `yuv444p`, `yuv422p`, and `yuv420p` islands now fuse in place,
-  and `lutyuv` in particular is channel-independent, so it fits the subsampled
-  plane walk without further IR work. They are the first thing to do next.
-- `curves`, `colorbalance`, and `colorcontrast` are RGB-native but are **not
-  channel-independent**, so they do not fit the current IR at all.
+### `lutyuv` is `lutrgb` with a different range, and the range is the whole point
 
-`colorbalance` is the clearest example. Its per-pixel lightness term couples the
-three channels:
+`vf_lut.c` is one filter with two entry points. The difference at 8-bit depth
+is which branch of `config_props` sets the per-component range: `lutrgb` gets
+`0..255` for everything, `lutyuv` gets `16..235` for luma and `16..240` for
+each chroma channel. That range reaches the expression as `minval` and
+`maxval`, and through them as `clipval` and `negval`, so on luma `negval` is
+`av_clip(16 + 235 - val, 16, 235)` rather than `255 - val`. `build_lut` takes
+the range as a parameter and the two filters share one lowering.
+
+Two consequences worth naming. `lutyuv` with no options is *not* an identity —
+the default expression is `clipval`, which clamps into the limited range. And
+the same expression under the two filters is two different tables, so they must
+never collide on one cached kernel; a test pins that.
+
+The one refusal that is stricter than upstream: `vf_lut.c` shares a single
+options table across its entry points, so `lutyuv=r=…` is accepted upstream and
+silently sets the *luma* expression. Both cross-family spellings are refused
+here rather than honoured, because a spelling that means something other than
+what it says is worth failing on.
+
+### `eq` picks one of three code paths, and they disagree
+
+`check_values` chooses per plane between copying the plane, a fixed-point
+integer `process_c`, and a float `create_lut`. These are not refinements of one
+another. With every option at its default the plane is copied; running
+`process_c` with those same values would compute `brightness = -1` and subtract
+one from every sample. Getting the choice wrong is an off-by-one on every pixel
+of an otherwise no-op filter, so the lowering reproduces the branch exactly.
+
+`av_clipf` takes `float` parameters, so every one of `eq`'s options is rounded
+to binary32 on the way in and the clamp bounds are the binary32 neighbours of
+the literals in the source. Two literals that differ as doubles but agree as
+floats have to produce the same kernel, and a test pins that too.
+
+Out-of-range values are clamped rather than refused, because upstream clamps
+them; refusing would reject graphs FFmpeg accepts. What *is* refused is
+anything that is not static: `eval=frame` re-evaluates per frame, and an option
+naming `n`, `t`, or `r` is a different value on every frame. Only a plain
+numeric literal is accepted.
+
+### `hue` needed a new IR operation, because it mixes Cb into Cr
+
+`hue` is the first accepted filter that is not channel-independent. Its chroma
+step treats `(U, V)` as a 2D vector and rotates it, which item 4's rule — a
+subsampled layout accepts only channel-independent operations — would have
+refused outright.
+
+That rule was too strong, and the correction is the structural result here.
+What a subsampled layout cannot express is a mix of channels that have *no
+sample in common*. Cb and Cr are sampled at exactly the same positions in every
+accepted YUV format, so one loop can hold both. `PixelLayout.sampling_groups`
+partitions the stored channels by sampling shift, each stage declares the
+channel groups it reads across, and `validate_ir` requires each stage group to
+fit inside one sampling group. A colour matrix is still refused on `yuv420p`,
+for the original reason; a chroma rotation is not.
+
+Upstream materializes the rotation as two 64 KiB tables indexed by the `(u, v)`
+pair. The arithmetic behind them is a handful of int32 operations that cannot
+overflow at these magnitudes — saturation is bounded at 10, so the coefficients
+fit in 16.16 with room to spare — so the kernel evaluates it inline instead:
+same bytes, 128 KiB less generated C.
+
+Luma is a separate matter: upstream copies the plane when brightness is zero
+and applies `lut_l` otherwise, and `lut_l` is the identity at zero brightness,
+so one table describes both paths and the optimizer folds it away.
+
+### Two libm dependencies, and the guard they share
+
+`eq`'s gamma path calls `pow` and `hue`'s coefficients call `sin` and `cos`.
+Neither is bit-exact across libm implementations, and neither is under this
+compiler's control. Both are handled the way `colorlevels` already handles
+float32 contraction: perturb the libm result by a few ULPs and refuse the
+lowering if any output byte changes. A table that survives that cannot disagree
+with the oracle over a rounding this compiler does not decide.
+
+The guard needs one exemption, and finding it is the reason to state the rule
+carefully. A perturbation test refuses anything sitting on a rounding tie, but
+a tie is only a problem when the value reaching it is uncertain. At a zero
+angle — which is what `hue=s=…` and `hue=b=…` mean, the most ordinary way to
+use the filter — C fixes `cos(0)` at exactly 1 and `sin(0)` at exactly 0, and
+the coefficient is then a multiple of one sixteenth for any saturation, so it
+lands exactly on a tie about one time in eight. Guarding those would have
+refused an eighth of all saturation-only graphs for a rounding no libm can
+disagree about. The zero angle is therefore exempt, and one such tie is pinned
+against the oracle as a test.
+
+With that, the guard is cheap in practice: over 120 randomized `eq` graphs
+spanning all three code paths and 45 randomized `hue` graphs it refused none,
+and every one was byte-identical to the oracle.
+
+### What is checked
+
+`tests/test_layouts.py` runs sixteen YUV chains across all three layouts
+through the interpreter, the compiled kernel, and patched FFmpeg at
+`-filter_threads 4`. `tests/test_yuv_filters.py` pins the reasoning: which
+upstream path each option set selects, which spellings are refused, and the
+sampling-group rule including IR built by hand to prove it cannot be dodged.
+The ASan/UBSan gate gained a third case for the two-planes-in-one-loop shape.
+
+Checked once by hand, not automated: `eq` against the oracle over 120 random
+option sets, and `hue` over its complete `256x256` chroma domain — every
+`(u, v)` pair — for 45 random option sets plus nine chosen ones covering
+degrees, radians, negative saturation, and brightness. The suite's fixed chains
+are the standing guard; those sweeps are what the libm exemption above was
+found by.
+
+### The RGB half is unchanged, and `colorbalance` is still the clearest example
+
+`curves`, `colorbalance`, and `colorcontrast` are RGB-native and **not**
+channel-independent. `hue`'s chroma rotation does not help them: it mixes two
+channels that a table could not, but it is one fixed integer operation, not the
+general float expression these need. `colorbalance`'s per-pixel lightness term
+couples all three channels:
 
 ```c
 const float l = (FFMAX3(r, g, b) + FFMIN3(r, g, b));
@@ -130,9 +244,24 @@ evaluating a fixed float32 expression across all four channels, with upstream's
 exact operation order, `av_clipf` clamping, and `lrintf` ties-to-even rounding
 reproduced. That is a genuine IR extension, not a new table.
 
+The sampling-group rule `hue` introduced does tell that extension where it may
+run: such an operation reads across all four channels, so it fits `yuv444p` and
+every RGB layout and is refused on `yuv422p` and `yuv420p` — which is the
+guard that already applies to `colorchannelmixer`.
+
 Adding a filter whose semantics are only approximately right would be worse
 than not adding it, because bit-exactness against the pinned oracle is the
 property this compiler exists to preserve.
+
+### The oracle had to be rebuilt with `--enable-gpl`
+
+`vf_eq.c` is GPL, and the pinned oracle was configured without `--enable-gpl`,
+so it had no `eq` filter at all — the filter could be implemented but not
+checked, which for this compiler is the same as not implementing it. Both build
+scripts now pass `--enable-gpl` at the same pinned revision `n8.1.2`. The
+binaries in `.build/` are GPL rather than LGPL as a result; they are local
+artifacts and are not distributed. `lutyuv` and `hue` are LGPL and were present
+all along.
 
 ## 4. Avoid boundary conversion — done for `yuv444p`, `yuv422p`, `yuv420p`
 
@@ -159,27 +288,35 @@ is how the rest of libavfilter sizes a chroma plane, and which rounds up: a
 
 That has a consequence beyond addressing. With subsampling there is no longer
 one loop iteration per pixel, so there is no single pixel whose four channels
-an operation could mix, and a subsampled layout accepts only channel-independent
-operations. `lut8` and the diagonal `levels_f32_fma` qualify; a
-`colorchannelmixer` matrix does not. `validate_ir` rejects the combination, so
-the rule reaches the interpreter, the optimizer, and code generation alike and
-cannot be dodged by constructing the IR directly.
+an operation could mix. Item 4 stated that rule as *a subsampled layout accepts
+only channel-independent operations*, which was too strong; item 3's `hue`
+corrected it to what it should have been. The real constraint is that an
+operation may only read across channels that share a sample grid, and `hue`'s
+chroma rotation does. See item 3 for the sampling-group formulation that
+replaced it. `colorchannelmixer` is refused on `yuv422p` and `yuv420p` either
+way, and `validate_ir` still enforces it for the interpreter, the optimizer,
+and code generation alike.
 
 Both the interpreter and the code generator therefore have two shapes: a
 whole-pixel walk for a layout whose planes share the frame's resolution — which
-is every RGB layout, plus `yuv444p` — and a per-plane walk at each plane's own
-resolution for `yuv422p` and `yuv420p`. Generated C for the existing layouts is
-unchanged, so no cached or bundled kernel was invalidated.
+is every RGB layout, plus `yuv444p` — and a walk over sampling groups at each
+group's own resolution for `yuv422p` and `yuv420p`. A group is one plane
+whenever every stage is channel-independent, which is every pipeline that does
+not contain `hue`; generated C for all 55 layout-and-chain combinations that
+existed before item 3 is byte-identical, so no cached or bundled kernel was
+invalidated by either item.
 
 ### The layout reached the lowering, and the option names moved with it
 
-`negate` is the only accepted filter that advertises YUV at all; `lutrgb`,
-`colorlevels`, and `colorchannelmixer` are RGB-only upstream, so a YUV run
-containing one of them is refused rather than fused. That refusal is not a
-detail: the corpus graph `format=yuv420p,negate,lutrgb=…,colorlevels=…` used to
-be reported as a two-pass island waiting on YUV support, and it never was one —
-FFmpeg converts around `lutrgb`, so those two passes were never removable.
-Supporting YUV is what made that visible.
+`negate` was the only accepted filter that advertised YUV at all when item 4
+landed; `lutrgb`, `colorlevels`, and `colorchannelmixer` are RGB-only upstream,
+so a YUV run containing one of them is refused rather than fused. That refusal
+is not a detail: the corpus graph `format=yuv420p,negate,lutrgb=…,colorlevels=…`
+used to be reported as a two-pass island waiting on YUV support, and it never
+was one — FFmpeg converts around `lutrgb`, so those two passes were never
+removable. Supporting YUV is what made that visible. Item 3 has since added
+`lutyuv`, `eq`, and `hue` on the YUV side, so a YUV island is no longer built
+out of `negate`s alone.
 
 `negate`'s component mask is named per family, and upstream fails to configure
 a graph that names a component the format lacks. `components=r+g+b` is a hard
@@ -213,9 +350,10 @@ was byte-identical to the oracle in all three YUV formats. The suite's fixed
 sizes are the standing guard; that sweep was how the slice alignment was
 convinced to be right at job counts the suite does not reach.
 
-Generated C for the pre-existing layouts is byte-identical to before this work
-across all 40 layout-and-chain combinations, so no cached or bundled kernel was
-invalidated.
+Generated C for the pre-existing layouts was byte-identical to before item 4
+across all 40 layout-and-chain combinations, and item 3 preserved that property
+across all 55 that existed by then, so no cached or bundled kernel was
+invalidated by either.
 
 **Deferred:** `yuva*` (alpha at full resolution alongside subsampled chroma),
 the `yuvj` full-range family, and the remaining ratios `yuv411p`, `yuv410p`,
@@ -229,25 +367,28 @@ whitespace, hardware filters, options this compiler cannot parse — and never
 compiles or runs anything. A lenient parser records per-filter option problems
 instead of failing the graph, so a scan still explains what blocked an island.
 
-Against the corpus in `tests/corpus/filtergraphs.txt`, which item 4 grew from
-40 graphs to 45: four YUV-native grading chains, since decoded video arrives in
-`yuv420p` and the corpus had almost no such graph, plus one pinned to
-`yuv410p`, a ratio that is still unimplemented and now carries the "format the
-kernel cannot run" case that `yuv420p` used to.
+The corpus in `tests/corpus/filtergraphs.txt` grew from 40 graphs to 45 in item
+4 and to 58 in item 3. Item 3's additions are seven YUV grading chains of the
+shape people actually write — `eq` and `hue` together, sometimes with `lutyuv`
+or a `crop` between them — four graphs where an accepted filter is pinned to a
+format it does not advertise, and three where a YUV option is inside the subset
+but still rejected. The two `eq`/`hue`-on-`rgba` graphs moved out of the
+"outside the pointwise subset" section, which is no longer why they are
+refused, and `colorcontrast` took their place there.
 
 ```console
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt
-  graphs scanned:            45
-  islands found:             36
-  islands fusible today:     28
-  frame passes eliminated:   27
-  frame passes blocked:      8
+  graphs scanned:            58
+  islands found:             50
+  islands fusible today:     40
+  frame passes eliminated:   36
+  frame passes blocked:      9
   blocked passes by working format:
-    negotiated   6 passes across 7 islands
+    negotiated   7 passes across 9 islands
     yuv410p      2 passes across 1 island
 
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt --entry-format yuv420p
-  frame passes eliminated:   29
+  frame passes eliminated:   39
   frame passes blocked:      4
 ```
 
@@ -257,7 +398,7 @@ they appear, which is what makes the output actionable.
 Item 2's format work moved this corpus from 17 eliminated passes to 19 with
 `rgb24`, then to 21 with planar `gbrp`, dropping blocked passes from 12 to 8.
 
-Item 4's effect is best read on the corpus as it stood *before* those five new
+Item 4's effect is best read on the corpus as it stood *before* its five new
 graphs, which separates the change from the sample it is measured on:
 
 | the same 40 graphs | eliminated | blocked |
@@ -273,14 +414,35 @@ around it and the run is not contiguous in one format. Supporting YUV is what
 let the scanner see that, and the 2 passes it was crediting were never
 removable.
 
-The gain appears under `--entry-format yuv420p`, which is what a caller can
+The gain appeared under `--entry-format yuv420p`, which is what a caller can
 prove for decoded video: `fps=30,negate,negate,negate` is a genuine YUV island
 that a kernel now replaces.
 
-That is the honest shape of the result, and it names the next blocker. `negate`
-is the only accepted filter that runs in YUV, so until item 3's `lutyuv`, `eq`,
-and `hue` land, a YUV island can only be built out of `negate`s. Item 4 removed
-the format barrier; the filter subset is now the binding one.
+Item 3's effect is measured the same way, on the 58-graph corpus with and
+without the three new filters, so the sample is held fixed:
+
+| the same 58 graphs | eliminated | blocked |
+|---|---:|---:|
+| before `lutyuv`, `eq`, `hue` | 27 | 8 |
+| after | 36 | 9 |
+| after, `--entry-format yuv420p` | 39 | 4 |
+
+Nine more frame passes, and this time it is a gain rather than a correction:
+these are runs that exist in one format and that a kernel can now replace.
+Measured on the *unchanged* 45-graph corpus the movement is only 27 to 28,
+which is the honest reading of how little YUV grading that corpus contained —
+one graph, `format=yuv444p,lutyuv=…,eq=…`, which item 4 could only report.
+
+The one blocked pass that appeared is real rather than a regression:
+`fps=30,eq=…,hue=…` is a newly visible island that negotiation still decides
+the format of, so it needs an entry format a caller can prove. It was not
+counted before because `eq` and `hue` were not in the subset and there was no
+island there to block.
+
+Item 4 removed the format barrier and named the filter subset as the next
+binding constraint. Item 3 has widened the subset on the YUV side; what binds
+now is the RGB half, where `curves`, `colorbalance`, and `colorcontrast` need
+an IR extension rather than a new table.
 
 ## 6. Build-time integration — done for the compiler, unchanged for the patch
 
@@ -315,22 +477,24 @@ silently ignored on rebuild.
 
 ## Recommended order from here
 
-1. **`lutyuv`, `eq`, and `hue`** (item 3's YUV half), now unblocked. This is
-   what turns item 4's format support into reach: `negate` alone can only build
-   a YUV island out of more `negate`s, so every YUV grading chain in the wild
-   still falls outside the subset. `lutyuv` is the cheapest of the three — it
-   is `lutrgb`'s own source file with a different component vocabulary and a
-   16–235/16–240 clamp on `clipval` and `negval` — and it is channel-independent,
-   so it drops into the subsampled plane walk unchanged.
-2. **A cross-channel float IR operation** (item 3's RGB half), which unlocks
+1. **A cross-channel float IR operation** (item 3's RGB half), which unlocks
    `colorbalance`, `colorcontrast`, and `curves` together rather than one at a
-   time. Note that such an operation is *not* expressible on a subsampled
-   layout, so it will need the guard `validate_ir` already applies.
+   time. This is now the binding constraint on reach. The sampling-group rule
+   `hue` introduced is the guard it needs: such an operation reads all four
+   channels, so it is admissible on every RGB layout and on `yuv444p`, and
+   refused on `yuv422p` and `yuv420p`.
+2. **`yuva*` support**, which is a bigger step than the other deferred table
+   entries and worth separating from them. Alpha at full resolution alongside
+   subsampled chroma gives a layout with three sampling groups rather than two,
+   which is the first real exercise of the partition that `hue` made general.
 3. **High-depth formats**: the widest change for the least corpus reach.
-4. **The remaining YUV table entries** — `yuva*`, `yuvj*`, `yuv411p`,
-   `yuv410p`, `yuv440p` — if a real corpus ever asks for them. Each is a row in
-   `layouts.py` plus an ABI identifier now that subsampling is general, but none
-   appears in this corpus.
+4. **The remaining YUV table entries** — `yuvj*`, `yuv411p`, `yuv410p`,
+   `yuv440p` — if a real corpus ever asks for them. Each is a row in
+   `layouts.py` plus an ABI identifier now that subsampling is general; only
+   `yuv410p` appears in this corpus, and only as the "format the kernel cannot
+   run" case.
 
-Layout-aware lowering, previously third on this list, landed as part of item 4
-because `negate`'s component mask could not be expressed in YUV without it.
+Two entries left this list by being done. Layout-aware lowering landed as part
+of item 4, because `negate`'s component mask could not be expressed in YUV
+without it. `lutyuv`, `eq`, and `hue` landed as item 3's YUV half; the
+cross-channel operation that was second is now first.

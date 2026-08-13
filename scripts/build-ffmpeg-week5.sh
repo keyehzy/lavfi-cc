@@ -52,9 +52,12 @@ fi
 mkdir -p "$prefix"
 (
     cd "$source_tree"
+    # Matches scripts/build-ffmpeg.sh: eq is GPL-only upstream, so the fused
+    # build needs --enable-gpl to carry the filters the oracle is compared to.
     ./configure \
         --prefix="$prefix" \
         --cc="$cc" \
+        --enable-gpl \
         --disable-doc \
         --disable-ffplay \
         --disable-stripping

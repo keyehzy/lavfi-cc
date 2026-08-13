@@ -16,10 +16,24 @@ and no conversion is ever introduced at an island boundary. Runs that cannot be
 fused are reported rather than guessed at.
 
 YUV support is native rather than converted: a `yuv420p` island is fused in
-`yuv420p`, with the chroma planes walked at their own resolution. Only
-`negate` advertises YUV among the accepted filters today, so a YUV run
-containing `lutrgb`, `colorlevels`, or `colorchannelmixer` is refused — FFmpeg
-would convert around those, and the run is not one run.
+`yuv420p`, with the chroma planes walked at their own resolution.
+
+The accepted filters split by the formats they advertise upstream, and a run
+may only be fused in a format *every* filter in it accepts:
+
+| filter | formats | notes |
+|---|---|---|
+| `negate` | RGB and YUV | the only one in both families |
+| `lutrgb`, `colorlevels`, `colorchannelmixer` | RGB only | refused in a YUV run |
+| `lutyuv`, `eq`, `hue` | YUV only | refused in an RGB run |
+
+A run mixing the two families is not one run: FFmpeg converts around the odd
+filter out, so no single kernel is equivalent to it.
+
+`hue` rotates Cb into Cr, so it is the one accepted filter that reads across
+channels on a subsampled layout. That is admissible because the two chroma
+channels are sampled at the same positions; a colour matrix mixing luma with
+chroma is still refused there, since those have no sample in common.
 
 Explain and lower a bounded region with:
 

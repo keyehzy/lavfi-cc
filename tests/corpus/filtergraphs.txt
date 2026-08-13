@@ -34,6 +34,28 @@ format=yuv422p,negate=components=y,negate=components=u+v
 format=yuv444p,negate,negate=components=y+u+v
 format=yuv420p,negate,negate,crop=1280:720:0:0,negate,negate
 
+# --- YUV grading as it is actually written, now that lutyuv, eq, and hue lower
+format=yuv420p,eq=contrast=1.1:brightness=0.03:saturation=1.2,hue=h=5:s=1.05
+format=yuv420p,lutyuv=y='clip(val,16,235)',eq=contrast=1.15,hue=s=1.1
+format=yuv422p,hue=h=15:s=1.3,eq=gamma=1.2:gamma_weight=0.8
+format=yuv420p,eq=saturation=0,negate,lutyuv=y=negval
+format=yuv444p,lutyuv=y=val*1.05:u=val*0.95+6:v=val*0.95+6,hue=h=-8
+fps=30,eq=brightness=0.05:contrast=1.1,hue=s=1.2
+format=yuv420p,eq=brightness=0.06,crop=1280:720:0:0,hue=h=12:s=1.15,negate
+
+# --- Accepted filters pinned to a format they do not advertise ---------------
+# eq, hue, and lutyuv are YUV-only upstream and lutrgb is RGB-only, so FFmpeg
+# converts around them and the run is not contiguous in one format.
+format=rgba,eq=brightness=0.06:saturation=1.2,format=yuv420p
+format=rgba,hue=h=90:s=1.2,format=yuv420p
+format=yuv420p,lutrgb=r=val*1.2,eq=contrast=1.1
+format=rgba,negate,lutyuv=y=negval,format=yuv420p
+
+# --- YUV options inside the subset that are still rejected -------------------
+format=yuv420p,eq=eval=frame:contrast=1.4,negate
+format=yuv420p,hue=h='2*PI*t',negate
+format=yuv420p,eq=contrast='1+0.1*n',hue=s=1.2
+
 # --- Ordinary CPU transcodes with a little colour work -----------------------
 scale=1280:720:flags=bicubic,format=yuv420p
 scale=-2:1080,fps=25,format=yuv420p
@@ -48,9 +70,8 @@ format=rgba,negate,gblur=sigma=3,lutrgb=r=val*2,format=yuv420p
 format=rgba,unsharp=5:5:1.0,colorlevels=rimin=0.05,format=yuv420p
 drawtext=text='hello':x=10:y=10,format=yuv420p
 format=rgba,curves=preset=vintage,format=yuv420p
-format=rgba,eq=brightness=0.06:saturation=1.2,format=yuv420p
-format=rgba,hue=h=90:s=1.2,format=yuv420p
 format=rgba,colorbalance=rs=0.1:gm=-0.1,format=yuv420p
+format=rgba,colorcontrast=rc=0.3:gm=-0.2,format=yuv420p
 
 # --- Options inside the subset that are still rejected -----------------------
 format=rgba,colorlevels=rimin=-0.1,negate,format=yuv420p

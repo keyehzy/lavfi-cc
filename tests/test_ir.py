@@ -23,6 +23,24 @@ class ExpressionTests(unittest.TestCase):
         table = build_lut("clip(max(negval, 20), 0, 200)")
         self.assertEqual((table[0], table[55], table[255]), (200, 200, 20))
 
+    def test_limited_range_reaches_clipval_and_negval(self) -> None:
+        # lutyuv's luma range is 16..235, so clipval saturates at both ends and
+        # negval is av_clip(16 + 235 - val, 16, 235) rather than 255 - val.
+        luma = build_lut("clipval", (16, 235))
+        self.assertEqual((luma[0], luma[16], luma[124], luma[235], luma[255]),
+                         (16, 16, 124, 235, 235))
+        negated = build_lut("negval", (16, 235))
+        self.assertEqual((negated[0], negated[124], negated[255]), (235, 127, 16))
+        # Chroma runs 16..240, so the same expression is a different table.
+        chroma = build_lut("negval", (16, 240))
+        self.assertEqual((chroma[0], chroma[124], chroma[255]), (240, 132, 16))
+        self.assertNotEqual(negated, chroma)
+
+    def test_minval_and_maxval_follow_the_range(self) -> None:
+        self.assertEqual(build_lut("minval", (16, 235))[7], 16)
+        self.assertEqual(build_lut("maxval", (16, 240))[7], 240)
+        self.assertEqual(build_lut("maxval")[7], 255)
+
 
 class IRTests(unittest.TestCase):
     def test_every_stage_has_an_explicit_quantization_boundary(self) -> None:
