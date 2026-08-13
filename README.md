@@ -156,7 +156,7 @@ The real-video benchmark input is intentionally not committed. Download it and
 reproduce the baseline-versus-fused measurement with:
 
 ```sh
-yt-dlp -t mp4 -o "video.mp4" \
+yt-dlp --no-playlist -t mp4 -o "video.mp4" \
   "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ"
 ./scripts/build-ffmpeg.sh
 ./scripts/build-ffmpeg-week5.sh

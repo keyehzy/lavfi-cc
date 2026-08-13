@@ -77,8 +77,12 @@ class KernelCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache = KernelCache(Path(directory) / "cache")
             first = cache.ensure(ir, compiler=counting_compiler)
-            first.library_path.write_bytes(b"corrupt")
-            os.chmod(first.library_path, 0o600)
+            # Replace the directory entry instead of truncating an inode that
+            # the platform loader may still have mapped after ABI validation.
+            corrupt = first.library_path.with_name(first.library_path.name + ".corrupt")
+            corrupt.write_bytes(b"corrupt")
+            os.chmod(corrupt, 0o600)
+            os.replace(corrupt, first.library_path)
             recovered = cache.ensure(ir, compiler=counting_compiler)
             self.assertEqual(recovered.status, "rebuilt")
             self.assertEqual(calls, 2)

@@ -93,6 +93,12 @@ jobs:
           "$CC" --version
           python3 --version
 
+      - name: Install Linux FFmpeg build dependencies
+        if: matrix.integration && matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nasm
+
       - name: Restore pinned FFmpeg builds
         if: matrix.integration
         id: ffmpeg-cache
@@ -158,13 +164,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: video.mp4
-          key: video-${{ runner.os }}-dQw4w9WgXcQ-mp4-v1
+          key: video-${{ runner.os }}-dQw4w9WgXcQ-mp4-v2
 
       - name: Download benchmark video
         if: matrix.integration && steps.video-cache.outputs.cache-hit != 'true'
         run: |
           python3 -m pip install --disable-pip-version-check yt-dlp
-          yt-dlp -t mp4 -o "video.mp4" "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ"
+          export PATH="$(dirname "$LAVFI_CC_FFMPEG"):$PATH"
+          yt-dlp --no-playlist -t mp4 -o "video.mp4" "https://youtu.be/dQw4w9WgXcQ?list=RDdQw4w9WgXcQ"
 
       - name: Inspect benchmark video
         if: matrix.integration
