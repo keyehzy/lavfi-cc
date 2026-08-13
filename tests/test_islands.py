@@ -47,12 +47,17 @@ class IslandDiscoveryTests(unittest.TestCase):
 
     def test_format_filter_pins_and_repins_the_working_format(self) -> None:
         scan = scan_chain(
-            chain("format=yuv420p,negate,negate,format=rgba,negate,negate")
+            chain("format=yuv410p,negate,negate,format=rgba,negate,negate")
         )
         self.assertEqual(
             [island.boundary for island in scan.islands],
             [UNSUPPORTED_FORMAT, NATIVE],
         )
+        self.assertEqual(scan.islands[0].working_format, "yuv410p")
+
+    def test_a_supported_yuv_format_pins_a_native_island(self) -> None:
+        scan = scan_chain(chain("format=yuv420p,negate,negate"))
+        self.assertEqual([island.boundary for island in scan.islands], [NATIVE])
         self.assertEqual(scan.islands[0].working_format, "yuv420p")
 
     def test_a_rejected_option_splits_the_run_but_keeps_the_format(self) -> None:
@@ -73,11 +78,22 @@ class FusionSafetyTests(unittest.TestCase):
 
     def test_refuses_a_run_pinned_to_an_unsupported_format(self) -> None:
         analysis = analyze_filtergraph(
-            "format=yuv420p,negate,lutrgb=r=val*2", auto_islands=True
+            "format=yuv410p,negate,lutrgb=r=val*2", auto_islands=True
         )
         self.assertFalse(analysis.eligible)
         self.assertEqual(analysis.diagnostics[0].code, "no_profitable_island")
-        self.assertIn("yuv420p", analysis.diagnostics[0].message)
+        self.assertIn("yuv410p", analysis.diagnostics[0].message)
+
+    def test_refuses_a_yuv_run_containing_an_rgb_only_filter(self) -> None:
+        # lutrgb is RGB-only upstream, so FFmpeg converts around it and the run
+        # is not contiguous in yuv420p at all. Only negate survives, which
+        # removes no frame pass.
+        analysis = analyze_filtergraph(
+            "format=yuv420p,negate,lutrgb=r=val*2", auto_islands=True
+        )
+        self.assertFalse(analysis.eligible)
+        codes = [diagnostic.code for diagnostic in analysis.diagnostics]
+        self.assertIn("format_not_advertised", codes)
 
     def test_refuses_a_run_whose_format_negotiation_decides(self) -> None:
         analysis = analyze_filtergraph(

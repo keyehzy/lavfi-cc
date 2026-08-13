@@ -24,9 +24,9 @@ WEEK5_CANDIDATES = (
     ROOT / ".build" / "ffmpeg-week5-linux" / "bin" / "ffmpeg",
 )
 
-# One chain per accepted filter plus a combined one, so every layout is
+# One chain per accepted filter plus a combined one, so every RGB layout is
 # exercised against every lowering.
-CHAINS = (
+RGB_CHAINS = (
     "negate",
     "lutrgb=r=val*1.125-7:g=negval:b='clip(val,13,241)'",
     "colorlevels=rimin=.05:gimax=.9:preserve=none",
@@ -34,6 +34,23 @@ CHAINS = (
     "negate,lutrgb=r=val*1.08+2,colorlevels=rimin=.05,"
     "colorchannelmixer=rr=.9:rg=.1:ba=.3",
 )
+
+# negate is the only accepted filter that advertises YUV upstream; lutrgb,
+# colorlevels, and colorchannelmixer are RGB-only, so a YUV run containing one
+# of them is refused rather than fused. Its component mask is spelled in the
+# other family's names here, and on a subsampled layout each plane is walked at
+# its own resolution.
+YUV_CHAINS = (
+    "negate",
+    "negate=components=y",
+    "negate=components=u+v",
+    "negate=components=y+u+v",
+    "negate,negate=components=y",
+)
+
+
+def chains_for(name: str) -> tuple[str, ...]:
+    return YUV_CHAINS if get_layout(name).family == "yuv" else RGB_CHAINS
 
 
 def _executable(candidates: tuple[Path, ...], override: str | None) -> Path | None:
@@ -92,29 +109,95 @@ class LayoutTableTests(unittest.TestCase):
         # Planes of a tightly packed frame sit back to back.
         self.assertEqual(get_layout("gbrp").plane_origin(2, 4, 2), 16)
 
+    def test_yuv_layouts_use_luma_cb_cr_planes(self) -> None:
+        for name in ("yuv444p", "yuv422p", "yuv420p"):
+            with self.subTest(layout=name):
+                layout = get_layout(name)
+                self.assertEqual(layout.family, "yuv")
+                self.assertEqual(layout.planes, (0, 1, 2, None))
+                self.assertEqual(layout.plane_count, 3)
+                self.assertEqual(layout.step, 1)
+                self.assertFalse(layout.has_alpha)
+                self.assertEqual(set(layout.components), {"y", "u", "v"})
+
+    def test_chroma_planes_round_up_like_ffmpeg(self) -> None:
+        # AV_CEIL_RSHIFT: an odd dimension keeps a whole trailing chroma
+        # sample, so 5x3 in 4:2:0 has 3x2 chroma planes rather than 2x1.
+        yuv420p = get_layout("yuv420p")
+        self.assertFalse(get_layout("yuv444p").subsampled)
+        self.assertTrue(get_layout("yuv422p").subsampled)
+        self.assertTrue(yuv420p.subsampled)
+        self.assertEqual(
+            [yuv420p.plane_width(plane, 5) for plane in range(3)], [5, 3, 3]
+        )
+        self.assertEqual(
+            [yuv420p.plane_height(plane, 3) for plane in range(3)], [3, 2, 2]
+        )
+        self.assertEqual(yuv420p.frame_size(5, 3), 15 + 6 + 6)
+        self.assertEqual(yuv420p.plane_origin(2, 5, 3), 15 + 6)
+        # 4:2:2 halves width only.
+        self.assertEqual(get_layout("yuv422p").frame_size(5, 3), 15 + 9 + 9)
+        self.assertEqual(get_layout("yuv444p").frame_size(5, 3), 45)
+
     def test_unknown_layout_is_rejected(self) -> None:
         with self.assertRaises(KeyError):
-            get_layout("yuv420p")
+            get_layout("nv12")
 
 
 class LayoutAnalysisTests(unittest.TestCase):
+    def graph(self, name: str) -> str:
+        return f"format={name},{chains_for(name)[-1]},format={name}"
+
     def test_explicit_boundaries_select_the_named_layout(self) -> None:
         for name in LAYOUTS:
             with self.subTest(layout=name):
-                analysis = analyze_filtergraph(
-                    f"format={name},negate,lutrgb=r=val*2,format={name}"
-                )
+                analysis = analyze_filtergraph(self.graph(name))
                 self.assertTrue(analysis.eligible, analysis.diagnostics)
                 self.assertEqual(analysis.ir.layout, name)
 
     def test_each_layout_gets_its_own_plan_hash(self) -> None:
         hashes = {
-            name: analyze_filtergraph(
-                f"format={name},negate,lutrgb=r=val*2,format={name}"
-            ).ir.plan_hash
+            name: analyze_filtergraph(f"format={name},negate,format={name}").ir.plan_hash
             for name in LAYOUTS
         }
         self.assertEqual(len(set(hashes.values())), len(LAYOUTS))
+
+    def test_component_names_are_refused_across_families(self) -> None:
+        # Upstream validates the mask against the format and fails to
+        # configure the graph, so the compiler must refuse it too.
+        for layout, mask in (("rgba", "y+u+v"), ("yuv420p", "r+g+b")):
+            with self.subTest(layout=layout):
+                analysis = analyze_filtergraph(
+                    f"format={layout},negate=components={mask},negate,"
+                    f"format={layout}"
+                )
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(
+                    analysis.diagnostics[0].code, "component_not_available"
+                )
+
+    def test_yuv_layouts_refuse_the_rgb_only_filters(self) -> None:
+        for name in ("lutrgb=r=val*2", "colorlevels=rimin=.05",
+                     "colorchannelmixer=rr=.9"):
+            with self.subTest(filter=name):
+                analysis = analyze_filtergraph(
+                    f"format=yuv420p,{name},format=yuv420p"
+                )
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(
+                    analysis.diagnostics[0].code, "format_not_advertised"
+                )
+
+    def test_negate_alpha_is_inert_on_yuv(self) -> None:
+        # yuv420p has no alpha plane for the plane mask to select, so the
+        # option cannot change what negate does there.
+        for name in ("yuv444p", "yuv422p", "yuv420p"):
+            with self.subTest(layout=name):
+                self.assertTrue(
+                    analyze_filtergraph(
+                        f"format={name},negate=negate_alpha=1,negate,format={name}"
+                    ).eligible
+                )
 
     def test_negate_alpha_is_refused_where_it_would_negate_alpha(self) -> None:
         # A plane mask means the legacy option really does negate alpha on
@@ -179,7 +262,7 @@ class LayoutDifferentialTests(unittest.TestCase):
     def test_interpreter_matches_ffmpeg_for_every_layout(self) -> None:
         for seed, name in enumerate(LAYOUTS):
             source = self.frame(name, seed)
-            for chain in CHAINS:
+            for chain in chains_for(name):
                 graph = f"format={name},{chain},format={name}"
                 with self.subTest(layout=name, chain=chain):
                     analysis = analyze_filtergraph(graph)
@@ -195,7 +278,7 @@ class LayoutDifferentialTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for seed, name in enumerate(LAYOUTS):
                 source = self.frame(name, 100 + seed)
-                chain = CHAINS[-1]
+                chain = chains_for(name)[-1]
                 graph = f"format={name},{chain},format={name}"
                 with self.subTest(layout=name):
                     analysis = analyze_filtergraph(graph)
@@ -218,11 +301,9 @@ class LayoutDifferentialTests(unittest.TestCase):
     "build scripts/build-ffmpeg-week5.sh to run layout integration tests",
 )
 class LayoutEndToEndTests(unittest.TestCase):
-    WIDTH, HEIGHT = 21, 6
-    CHAIN = (
-        "negate,lutrgb=r=val*1.08+2,colorlevels=rimin=.05,"
-        "colorchannelmixer=rr=.9:rg=.1:ba=.3"
-    )
+    # An odd width and height so a subsampled plane's AV_CEIL_RSHIFT rounding
+    # and the chroma-aligned slice boundaries both have to be right.
+    WIDTH, HEIGHT = 21, 7
 
     def arguments(self, layout: str, graph: str) -> list[str]:
         return [
@@ -241,7 +322,7 @@ class LayoutEndToEndTests(unittest.TestCase):
                 generator.randrange(256)
                 for _ in range(layout.frame_size(self.WIDTH, self.HEIGHT))
             )
-            graph = f"format={name},{self.CHAIN},format={name}"
+            graph = f"format={name},{chains_for(name)[-1]},format={name}"
             arguments = self.arguments(name, graph)
             with self.subTest(layout=name):
                 baseline = subprocess.run(

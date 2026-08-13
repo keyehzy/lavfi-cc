@@ -26,15 +26,23 @@ class ScanGraphTests(unittest.TestCase):
         self.assertEqual(scan.blocked_passes, 0)
 
     def test_attributes_a_blocked_island_to_its_working_format(self) -> None:
-        scan = scan_graph("format=yuv420p,negate,lutrgb=r=val*2,negate")
+        scan = scan_graph("format=yuv410p,negate,lutrgb=r=val*2,negate")
         self.assertEqual(scan.eliminated_passes, 0)
         self.assertEqual(scan.blocked_passes, 2)
-        self.assertEqual(scan.islands[0].island.working_format, "yuv420p")
+        self.assertEqual(scan.islands[0].island.working_format, "yuv410p")
+
+    def test_a_supported_yuv_island_is_fusible(self) -> None:
+        scan = scan_graph("format=yuv420p,negate,negate,negate")
+        self.assertEqual(scan.eliminated_passes, 2)
+        self.assertEqual(scan.blocked_passes, 0)
+        self.assertTrue(scan.islands[0].fusible)
+        # Three negations compose into one, which is itself not the identity.
+        self.assertEqual(scan.islands[0].optimized_stages, 1)
 
     def test_scans_several_chains_with_link_labels(self) -> None:
         scan = scan_graph(
             "[0:v]format=rgba,negate,negate[a];"
-            "[1:v]format=yuv420p,negate,negate[b];"
+            "[1:v]format=yuv410p,negate,negate[b];"
             "[a][b]overlay[out]"
         )
         self.assertEqual(len(scan.chains), 3)
@@ -75,17 +83,17 @@ class SummaryTests(unittest.TestCase):
     def test_ranks_blockers_by_the_passes_they_withhold(self) -> None:
         summary = summarize(
             [
-                scan_graph("format=yuv420p,negate,negate,negate,negate"),
-                scan_graph("format=yuv444p,negate,negate"),
+                scan_graph("format=yuv410p,negate,negate,negate,negate"),
+                scan_graph("format=yuv411p,negate,negate"),
                 scan_graph("format=rgba,negate,negate"),
             ]
         )
         self.assertEqual(summary.graphs, 3)
         self.assertEqual(summary.eliminated_passes, 1)
         self.assertEqual(summary.blocked_passes, 4)
-        # yuv420p withholds three passes against yuv444p's one, so it ranks first.
+        # yuv410p withholds three passes against yuv411p's one, so it ranks first.
         self.assertEqual(
-            summary.blocked_passes_by_format.most_common(1), [("yuv420p", 3)]
+            summary.blocked_passes_by_format.most_common(1), [("yuv410p", 3)]
         )
 
     def test_counts_unsupported_filters_and_rejected_options_apart(self) -> None:

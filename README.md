@@ -1,18 +1,25 @@
 # lavfi-cc
 
 `lavfi-cc` is an experimental compiler for fusing compatible FFmpeg video
-filters into one native kernel over an 8-bit RGB frame. The repository
+filters into one native kernel over an 8-bit frame. The repository
 has completed the Week 5 FFmpeg-integration and Week 6 cache/operational-safety
 milestones described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md), plus the reach
 work recorded in [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
 Accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and
-`bgr24`, and the planar `gbrp` and `gbrap`. A run is only fused when it already
-works in one of them: a pointwise filter produces different bytes in different
-pixel formats, so fusing a YUV or negotiation-decided run into an RGB kernel
-would change the output. Runs that cannot be fused are reported rather than
-guessed at.
+`bgr24`, the planar RGB `gbrp` and `gbrap`, and the planar YUV `yuv444p`,
+`yuv422p`, and `yuv420p`. A run is only fused when it already works in one of
+them: a pointwise filter produces different bytes in different pixel formats,
+so fusing a run into a kernel built for another format would change the output,
+and no conversion is ever introduced at an island boundary. Runs that cannot be
+fused are reported rather than guessed at.
+
+YUV support is native rather than converted: a `yuv420p` island is fused in
+`yuv420p`, with the chroma planes walked at their own resolution. Only
+`negate` advertises YUV among the accepted filters today, so a YUV run
+containing `lutrgb`, `colorlevels`, or `colorchannelmixer` is refused — FFmpeg
+would convert around those, and the run is not one run.
 
 Explain and lower a bounded region with:
 
@@ -88,7 +95,8 @@ compiler at all. `--emit-only` writes the generated C and the index without
 compiling, so another build system can compile the kernels with its own
 toolchain. Set `LAVFI_CC_BUNDLE` instead of passing `--bundle` if you prefer.
 
-Run the reference interpreter over one or more tightly packed raw RGBA8 frames:
+Run the reference interpreter over one or more tightly packed raw frames in the
+layout the chain pins:
 
 ```sh
 ./lavfi-cc interpret \
@@ -98,8 +106,10 @@ Run the reference interpreter over one or more tightly packed raw RGBA8 frames:
 ```
 
 Omit `--input` or `--output` to use standard input or standard output. Input
-must contain only complete `width * height * 4` byte frames. The Python API also
-supports padded and negative frame strides through `interpret_into`.
+must contain only complete frames, sized for that layout — `width * height * 4`
+for `rgba`, and `width * height * 3 / 2` for `yuv420p`, whose planes sit back to
+back with chroma dimensions rounded up. The Python API also supports padded and
+negative frame strides, per plane, through `interpret_into`.
 
 Compile and run the same stream through a cached, checked native kernel:
 
@@ -153,7 +163,7 @@ commands, hashes, and summary, so a result can be archived without relying on
 ambient machine state.
 
 Week 1 findings and the gate decision are in
-[`docs/week-1-report.md`](docs/week-1-report.md). Exact RGBA8 semantics and
+[`docs/week-1-report.md`](docs/week-1-report.md). Exact per-format semantics and
 accepted-subset constraints are in
 [`docs/supported-filters.md`](docs/supported-filters.md).
 

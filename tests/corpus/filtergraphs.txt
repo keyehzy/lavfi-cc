@@ -21,11 +21,18 @@ negate,lutrgb=r=val*1.08+2,colorlevels=rimin=0.05
 scale=1920:1080,negate,lutrgb=r=val*2,colorchannelmixer=rr=0.9
 fps=30,negate,negate,negate
 
-# --- Grading pinned to a format the kernel does not implement ----------------
+# --- Grading pinned to a format other than the default -----------------------
 format=yuv420p,negate,lutrgb=r=val*1.08+2,colorlevels=rimin=0.05
 format=rgb24,negate,lutrgb=r=val*1.2,colorchannelmixer=rr=0.9:gg=0.8
 format=gbrp,negate,negate,lutrgb=r=val*1.1
 format=yuv444p,lutyuv=y=val*1.1,eq=contrast=1.2
+format=yuv410p,negate,negate,negate
+
+# --- Grading that stays in planar YUV, the format decoded video arrives in ---
+format=yuv420p,negate,negate,negate
+format=yuv422p,negate=components=y,negate=components=u+v
+format=yuv444p,negate,negate=components=y+u+v
+format=yuv420p,negate,negate,crop=1280:720:0:0,negate,negate
 
 # --- Ordinary CPU transcodes with a little colour work -----------------------
 scale=1280:720:flags=bicubic,format=yuv420p

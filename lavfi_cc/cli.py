@@ -18,6 +18,7 @@ from .frontend import Analysis, IslandPlan, analyze_filtergraph
 from .ffmpeg import run_ffmpeg
 from .interpreter import InterpreterError, interpret_rgba8
 from .ir import PixelIR
+from .layouts import get_layout
 from .native import (
     NativeError,
     NativeKernel,
@@ -74,7 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     explain.add_argument("--cache-dir", metavar="PATH", help="kernel cache directory")
     _add_pass_switches(explain)
     interpret = subparsers.add_parser(
-        "interpret", help="run an eligible chain on packed raw RGBA8 frames"
+        "interpret", help="run an eligible chain on raw frames in the chain's own format"
     )
     interpret.add_argument("--vf", required=True, metavar="FILTERGRAPH")
     interpret.add_argument("--width", required=True, type=_positive_integer)
@@ -83,13 +84,13 @@ def _parser() -> argparse.ArgumentParser:
         "--input",
         default="-",
         metavar="PATH",
-        help="packed RGBA8 input (default: standard input)",
+        help="raw input in the layout the chain pins (default: standard input)",
     )
     interpret.add_argument(
         "--output",
         default="-",
         metavar="PATH",
-        help="packed RGBA8 output (default: standard output)",
+        help="raw output in the layout the chain pins (default: standard output)",
     )
     interpret.add_argument(
         "--auto-islands",
@@ -98,7 +99,7 @@ def _parser() -> argparse.ArgumentParser:
         "format boundaries",
     )
     native = subparsers.add_parser(
-        "native", help="compile and run an eligible chain on raw RGBA8 frames"
+        "native", help="compile and run an eligible chain on raw frames in the chain's own format"
     )
     native.add_argument("--vf", required=True, metavar="FILTERGRAPH")
     native.add_argument("--width", required=True, type=_positive_integer)
@@ -107,13 +108,13 @@ def _parser() -> argparse.ArgumentParser:
         "--input",
         default="-",
         metavar="PATH",
-        help="packed RGBA8 input (default: standard input)",
+        help="raw input in the layout the chain pins (default: standard input)",
     )
     native.add_argument(
         "--output",
         default="-",
         metavar="PATH",
-        help="packed RGBA8 output (default: standard output)",
+        help="raw output in the layout the chain pins (default: standard output)",
     )
     native.add_argument("--cache-dir", metavar="PATH", help="kernel cache directory")
     _add_pass_switches(native)
@@ -358,7 +359,11 @@ def _stream_frames(
             print("lavfi-cc: input and output paths must be different", file=sys.stderr)
             return 2
 
-    frame_size = arguments.width * arguments.height * 4
+    # The chain names the layout, and a planar or subsampled one is not
+    # width * height * 4 bytes.
+    frame_size = get_layout(analysis.ir.layout).frame_size(
+        arguments.width, arguments.height
+    )
     try:
         with ExitStack() as stack:
             input_stream = (

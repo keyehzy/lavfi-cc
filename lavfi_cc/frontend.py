@@ -17,9 +17,8 @@ from .filters import (
     SUPPORTED_FILTERS,
     Lowered,
     LoweringError,
-    filter_supports_rgb8,
+    filter_supports_format,
     format_value,
-    validate_for_layout,
 )
 from .ir import Operation, PixelIR
 from .layouts import DEFAULT_LAYOUT, LAYOUTS
@@ -313,7 +312,7 @@ def _analyze_explicit_region(source: str, graph: Filtergraph) -> Analysis:
                 )
             )
             continue
-        if not filter_supports_rgb8(invocation.name, layout):
+        if not filter_supports_format(invocation.name, layout):
             diagnostics.append(
                 Diagnostic(
                     "format_not_advertised",
@@ -325,8 +324,7 @@ def _analyze_explicit_region(source: str, graph: Filtergraph) -> Analysis:
             )
             continue
         try:
-            validate_for_layout(invocation, LAYOUTS[layout])
-            item = lowerer(invocation, index)
+            item = lowerer(invocation, index, LAYOUTS[layout])
         except LoweringError as error:
             diagnostics.append(_diagnostic_from_lowering(error, invocation, index))
             continue

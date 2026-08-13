@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import ctypes
 from dataclasses import dataclass
 import os
@@ -347,17 +348,23 @@ class NativeKernel:
         width: int,
         height: int,
         *,
-        source_stride: int | None = None,
-        destination_stride: int | None = None,
+        source_stride: int | Sequence[int] | None = None,
+        destination_stride: int | Sequence[int] | None = None,
         source_offset: int = 0,
         destination_offset: int = 0,
     ) -> None:
+        """Run the kernel over one frame.
+
+        ``width`` and ``height`` describe plane 0, which is what the kernel ABI
+        passes through; a subsampled plane's own dimensions come from the
+        layout.
+        """
+
         width = _positive_integer(width, "width")
         height = _positive_integer(height, "height")
-        row_bytes = self.layout.row_bytes(width)
-        source_stride = row_bytes if source_stride is None else source_stride
-        destination_stride = (
-            row_bytes if destination_stride is None else destination_stride
+        source_strides = self._plane_strides(width, source_stride, "source")
+        destination_strides = self._plane_strides(
+            width, destination_stride, "destination"
         )
         source_view = _byte_view(source, "source", writable=False)
         destination_view = _byte_view(destination, "destination", writable=True)
@@ -370,20 +377,22 @@ class NativeKernel:
             for plane in range(self.layout.plane_count)
         ]
         for plane, origin in enumerate(origins):
+            row_bytes = self.layout.plane_row_bytes(plane, width)
+            plane_height = self.layout.plane_height(plane, height)
             _validate_layout(
                 len(source_view),
                 source_offset + origin,
-                source_stride,
+                source_strides[plane],
                 row_bytes,
-                height,
+                plane_height,
                 f"source plane {plane}",
             )
             _validate_layout(
                 len(destination_view),
                 destination_offset + origin,
-                destination_stride,
+                destination_strides[plane],
                 row_bytes,
-                height,
+                plane_height,
                 f"destination plane {plane}",
             )
 
@@ -397,8 +406,8 @@ class NativeKernel:
 
         source_planes = _PlanePointers()
         destination_planes = _PlanePointers()
-        source_strides = _PlaneStrides()
-        destination_strides = _PlaneStrides()
+        plane_source_strides = _PlaneStrides()
+        plane_destination_strides = _PlaneStrides()
         for plane, origin in enumerate(origins):
             source_planes[plane] = ctypes.cast(
                 ctypes.byref(source_array, source_offset + origin),
@@ -408,19 +417,51 @@ class NativeKernel:
                 ctypes.byref(destination_array, destination_offset + origin),
                 ctypes.POINTER(ctypes.c_uint8),
             )
-            source_strides[plane] = source_stride
-            destination_strides[plane] = destination_stride
+            plane_source_strides[plane] = source_strides[plane]
+            plane_destination_strides[plane] = destination_strides[plane]
 
         process = self._process
         if process is None:
             raise KernelExecutionError("kernel is closed")
         process(
             destination_planes,
-            destination_strides,
+            plane_destination_strides,
             source_planes,
-            source_strides,
+            plane_source_strides,
             width,
             height,
+        )
+
+    def _plane_strides(
+        self, width: int, value: int | Sequence[int] | None, description: str
+    ) -> tuple[int, ...]:
+        """Resolve a stride argument into one stride per plane.
+
+        ``None`` means a tightly packed frame, where each plane's stride is its
+        own row length; a single integer applies to every plane, which is what a
+        packed layout has always meant.
+        """
+
+        layout = self.layout
+        if value is None:
+            return tuple(
+                layout.plane_row_bytes(plane, width)
+                for plane in range(layout.plane_count)
+            )
+        if isinstance(value, int) and not isinstance(value, bool):
+            return (value,) * layout.plane_count
+        if isinstance(value, Sequence) and len(value) == layout.plane_count:
+            strides: list[int] = []
+            for stride in value:
+                if isinstance(stride, bool) or not isinstance(stride, int):
+                    raise KernelExecutionError(
+                        f"{description} stride must be an integer"
+                    )
+                strides.append(stride)
+            return tuple(strides)
+        raise KernelExecutionError(
+            f"{description} stride must be an integer or one stride per plane "
+            f"({layout.plane_count})"
         )
 
     def process_rgba8(self, source: Any, width: int, height: int) -> bytes:

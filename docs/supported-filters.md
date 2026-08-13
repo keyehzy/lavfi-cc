@@ -1,10 +1,10 @@
-# Supported-filter semantics for RGBA8
+# Supported-filter semantics for 8-bit pixel formats
 
 This inventory is derived from FFmpeg `n8.1.2`, commit
 `38b88335f99e76ed89ff3c93f877fdefce736c13`. It is the semantic contract for
 the compiler, not a summary of behavior across arbitrary FFmpeg releases.
 
-A fused region receives and emits one packed 8-bit RGB format. Every filter
+A fused region receives and emits one 8-bit pixel format. Every filter
 boundary produces another 8-bit value per component. Those intermediate
 clipping and quantization points must remain even when the frame pass is fused.
 Runtime commands, timeline-dependent options, non-finite values, and format
@@ -13,9 +13,14 @@ changes inside the region are rejected.
 ## Pixel layouts
 
 The accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`,
-and `bgr24`, and the planar `gbrp` and `gbrap`. They differ only in which byte
-holds which component and whether alpha exists, so the IR is
-layout-independent and always sees logical RGBA.
+and `bgr24`, the planar RGB `gbrp` and `gbrap`, and the planar YUV `yuv444p`,
+`yuv422p`, and `yuv420p`. They differ only in which byte holds which component,
+whether alpha exists, and — for YUV — at what resolution each component is
+stored, so the IR stays layout-independent and always sees four logical
+channels. What those channels are *called* does depend on the layout: red,
+green, blue, and alpha in an RGB layout, and luma, Cb, and Cr in a YUV one.
+Filters name their options per family and upstream refuses a name the format
+does not carry, so the lowering is given the layout.
 
 One addressing scheme covers both families. A logical channel lives in a plane
 at a byte offset within each sample group, and consecutive samples are `step`
@@ -29,15 +34,37 @@ A packed layout has one plane, a step of three or four, and a distinct offset
 per channel. A planar layout has one plane per channel, a step of one, and
 every offset zero. `lavfi_cc/layouts.py` records both, read out of the pinned
 binary by converting one known `0x11223344` RGBA pixel into each format; that
-is where `gbrp`'s green, blue, red plane order comes from.
+is where `gbrp`'s green, blue, red plane order comes from. YUV's luma, Cb, Cr
+plane order was read out the same way, with a component-selective `negate`:
+`negate=components=u` changes the second plane and nothing else.
 
-No accepted layout is chroma-subsampled, so a kernel's `width` and `height`
-describe every plane it touches.
+### Chroma subsampling
 
-An alpha-less layout loads `a = 0` and stores only R, G, and B. That matches
-upstream: the packed `colorchannelmixer` path omits every alpha term when
-`have_alpha` is unset, and the other accepted filters treat components
-independently, so an alpha lane that is never stored cannot change a stored one.
+`yuv422p` stores its chroma planes at half width and `yuv420p` at half width
+and half height, rounded up exactly as `AV_CEIL_RSHIFT` does upstream — a
+`5x3` `yuv420p` frame has `3x2` chroma planes, not `2x1`. A kernel's `width`
+and `height` therefore describe plane 0 only, and the kernel derives each other
+plane's dimensions itself from the layout it was generated for.
+
+That changes what an operation may be. One chroma sample covers several luma
+samples, so there is no single pixel whose four channels an operation could
+mix, and a subsampled layout accepts only channel-independent operations.
+`lut8` and the diagonal `levels_f32_fma` qualify; `colorchannelmixer`'s
+matrix does not. `validate_ir` enforces this for every consumer of the IR, so
+it cannot be bypassed by building the IR directly. In practice no accepted
+cross-channel filter advertises YUV anyway, so the check is a backstop rather
+than a limitation that bites.
+
+Code generation and the interpreter follow the same split: a layout whose
+planes share the frame's resolution is walked one pixel at a time with all four
+channels loaded, and a subsampled layout is walked one plane at a time at that
+plane's own resolution.
+
+An alpha-less layout loads `a = 0` and stores only the three colour channels.
+That matches upstream: the packed `colorchannelmixer` path omits every alpha
+term when `have_alpha` is unset, and the other accepted filters treat
+components independently, so an alpha lane that is never stored cannot change a
+stored one.
 
 Two rules follow from the format lists rather than from the pixel maths:
 
@@ -46,18 +73,28 @@ Two rules follow from the format lists rather than from the pixel maths:
   region and one kernel is no longer equivalent to the filters it replaced.
   `colorlevels` and `colorchannelmixer` accept `0rgb`, `0bgr`, `rgb0`, and
   `bgr0`, which `negate` and `lutrgb` do not, so that family is outside the
-  common subset and is not offered.
+  common subset and is not offered. In the other direction, `negate` is the
+  only accepted filter that advertises YUV at all: `lutrgb`, `colorlevels`, and
+  `colorchannelmixer` are RGB-only, so a YUV run containing one of them is
+  refused rather than fused.
 - A region may only be fused in a format it already works in. A pointwise
   filter is not format-agnostic: pinned `negate` over `testsrc2` does not
   produce the same bytes as `format=rgba,negate`. Fusing a run whose working
   format is unknown or unsupported would change output, so it is refused.
 
-The 9–16-bit RGB formats are advertised by all four filters but are not
-implemented. See [`roadmap-status.md`](roadmap-status.md).
+The 9–16-bit formats, the YUVA and YUVJ families, and the remaining
+subsampling ratios (`yuv411p`, `yuv410p`, `yuv440p`) are advertised by
+`negate` but are not implemented. See [`roadmap-status.md`](roadmap-status.md).
 
 All four upstream filters advertise `AVFILTER_FLAG_SLICE_THREADS`. A fused
 filter must do the same. These operations are row-local in the accepted subset,
 so changing the row partition must not change pixel values.
+
+On a subsampled layout the partition is not free, though: a slice boundary must
+fall on the chroma sampling grid, or two jobs both own the luma rows covering
+one chroma row and race to write it. `vf_fused.c` therefore cuts slices in
+units of `1 << log2_chroma_h` plane-0 rows, so each subsampled row belongs to
+exactly one job and the per-plane `AV_CEIL_RSHIFT` row counts tile exactly.
 
 ## `negate`
 
@@ -71,7 +108,13 @@ out[c] = 255 - in[c]
 
 Unselected channels are copied. There is no rounding or clipping step because
 the subtraction is exact over an 8-bit input. The default component mask
-selects R, G, and B and passes A through.
+selects every colour component of whichever family the format belongs to — R,
+G, B or Y, U, V — and passes A through.
+
+Note that the subtrahend is 255 on YUV too. The planar path is
+`dst[x] = 255 - src[x]` over each selected plane, so `negate` does not clip
+luma to the 16–235 studio range or chroma to 16–240 the way `lutyuv`'s
+`clipval` and `negval` variables do.
 
 The preferred explicit alpha spelling is `components=r+g+b+a` (or
 `components=a` for alpha alone). In this pinned revision,
@@ -80,12 +123,25 @@ negating RGB: the legacy option changes the plane mask, but packed RGB uses the
 separate component mask. The compiler must reproduce that pinned behavior if it
 accepts the option; it must not infer the behavior suggested by the option name.
 
+### The component mask is named per family
+
 An explicit component mask is validated against the format at configuration
 time, and a request for a component the format lacks fails the graph outright
-("Requested components not available"). The default mask skips that check. The
-compiler therefore rejects `components=…a` on `rgb24`, `bgr24`, and `gbrp`
-rather than treating it as a no-op, so it accepts exactly the graphs upstream
-accepts.
+("Requested components not available"). The default mask skips that check. Two
+consequences, both reproduced by the compiler so it accepts exactly the graphs
+upstream accepts:
+
+- `components=…a` is rejected on `rgb24`, `bgr24`, `gbrp`, and every accepted
+  YUV layout, rather than treated as a no-op.
+- The families are mutually exclusive. `components=r+g+b` fails on `yuv420p`
+  and `components=y+u+v` fails on `rgba`, both with the same upstream error.
+
+Within a format the mapping is positional and the same for both families: `r`
+and `y` select channel 0, `g` and `u` channel 1, `b` and `v` channel 2, and `a`
+channel 3. On YUV the mask becomes a plane mask directly, so
+`negate=components=u` negates the Cb plane and copies the other two.
+
+### `negate_alpha` is a plane mask
 
 `negate_alpha` sets a **plane** mask, and that mask is only ignored for packed
 RGB, which uses its separate component mask instead. Planar RGB obeys it, so
@@ -100,14 +156,15 @@ gbrap  negate=negate_alpha=1 -> dd cc ee bb     alpha negated
 ```
 
 The compiler accepts the option on packed layouts, where it provably has no
-alpha effect, and on `gbrp`, which has no alpha plane. It rejects it on
-`gbrap`, where honouring it would require the lowering to be layout-aware;
+alpha effect, and on layouts with no alpha plane for it to select — `gbrp` and
+the accepted YUV formats, whose three planes are all selected either way. It
+rejects it on `gbrap`, where honouring it would negate alpha;
 `components=r+g+b+a` states that intent unambiguously and is accepted.
 
 Accepted MVP constraints:
 
-- Only the `r`, `g`, `b`, and `a` component flags are meaningful at the RGBA
-  boundary.
+- Only the component flags the working format carries are meaningful, and the
+  compiler is told the layout so it can say which those are.
 - Parameters are fixed before the first frame. Runtime commands are rejected.
 
 ## `lutrgb`

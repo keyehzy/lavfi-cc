@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import math
 import struct
 from typing import Any
 
 from .ir import IR_VERSION, Operation, PixelIR
-from .layouts import LAYOUTS, get_layout
+from .layouts import LAYOUTS, PixelLayout, get_layout
 
 
 class InterpreterError(ValueError):
@@ -49,6 +50,12 @@ def _integer(value: Any, description: str) -> int:
 class _LutStage:
     tables: tuple[tuple[int, ...], ...]
 
+    #: A lookup reads only its own channel, so one plane can run it alone.
+    channel_independent = True
+
+    def evaluate_channel(self, channel: int, value: int) -> int:
+        return self.tables[channel][value]
+
     def evaluate(self, pixel: Pixel) -> Pixel:
         return tuple(  # type: ignore[return-value]
             self.tables[channel][pixel[channel]] for channel in range(4)
@@ -61,25 +68,36 @@ class _LevelsStage:
     input_offsets: tuple[int, ...]
     output_offsets: tuple[int, ...]
 
-    def evaluate(self, pixel: Pixel) -> Pixel:
-        output: list[int] = []
-        for channel in range(4):
-            # The pinned Apple-Clang FFmpeg oracle contracts this expression
-            # to one binary32 FMLA. Both inputs have few enough significant
-            # bits for binary64 to hold the exact intermediate before the
-            # single explicit binary32 rounding below.
-            value = _f32(
-                (pixel[channel] - self.input_offsets[channel])
-                * self.coefficients[channel]
-                + self.output_offsets[channel]
+    #: The matrix is diagonal, so each channel depends only on itself.
+    channel_independent = True
+
+    def evaluate_channel(self, channel: int, value: int) -> int:
+        # The pinned Apple-Clang FFmpeg oracle contracts this expression to one
+        # binary32 FMLA. Both inputs have few enough significant bits for
+        # binary64 to hold the exact intermediate before the single explicit
+        # binary32 rounding below.
+        return _u8(
+            int(
+                _f32(
+                    (value - self.input_offsets[channel])
+                    * self.coefficients[channel]
+                    + self.output_offsets[channel]
+                )
             )
-            output.append(_u8(int(value)))
-        return tuple(output)  # type: ignore[return-value]
+        )
+
+    def evaluate(self, pixel: Pixel) -> Pixel:
+        return tuple(  # type: ignore[return-value]
+            self.evaluate_channel(channel, pixel[channel]) for channel in range(4)
+        )
 
 
 @dataclass(frozen=True)
 class _MixerStage:
     tables: tuple[tuple[tuple[int, ...], ...], ...]
+
+    #: Every output channel sums terms from all four inputs.
+    channel_independent = False
 
     def evaluate(self, pixel: Pixel) -> Pixel:
         output = []
@@ -318,6 +336,18 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
                 raise InterpreterError(f"unsupported matrix evaluation {evaluation!r}")
         else:
             raise InterpreterError(f"unsupported transform {transform.kind!r}")
+
+    # A subsampled layout stores one chroma sample per several luma samples, so
+    # there is no single pixel whose four channels an operation could mix. Every
+    # consumer of the IR reaches this check, so the restriction cannot be
+    # bypassed by constructing the IR directly.
+    if LAYOUTS[ir.layout].subsampled:
+        for index, stage in enumerate(stages):
+            if not stage.channel_independent:
+                raise InterpreterError(
+                    f"stage {index} mixes channels, which the subsampled layout "
+                    f"{ir.layout!r} cannot express"
+                )
     return tuple(stages)
 
 
@@ -385,6 +415,36 @@ def _validate_layout(
         )
 
 
+def _plane_strides(
+    layout: PixelLayout,
+    width: int,
+    value: int | Sequence[int] | None,
+    description: str,
+) -> tuple[int, ...]:
+    """Resolve a stride argument into one stride per plane.
+
+    ``None`` means a tightly packed frame, where each plane's stride is its own
+    row length; a single integer applies to every plane, which is what a packed
+    layout has always meant.
+    """
+
+    if value is None:
+        return tuple(
+            layout.plane_row_bytes(plane, width)
+            for plane in range(layout.plane_count)
+        )
+    if isinstance(value, int) and not isinstance(value, bool):
+        return (value,) * layout.plane_count
+    if isinstance(value, Sequence) and len(value) == layout.plane_count:
+        return tuple(
+            _integer(entry, f"{description} stride") for entry in value
+        )
+    raise InterpreterError(
+        f"{description} stride must be an integer or one stride per plane "
+        f"({layout.plane_count})"
+    )
+
+
 def interpret_into(
     ir: PixelIR,
     source: Any,
@@ -392,16 +452,17 @@ def interpret_into(
     width: int,
     height: int,
     *,
-    source_stride: int | None = None,
-    destination_stride: int | None = None,
+    source_stride: int | Sequence[int] | None = None,
+    destination_stride: int | Sequence[int] | None = None,
     source_offset: int = 0,
     destination_offset: int = 0,
 ) -> None:
     """Interpret a frame into a distinct destination buffer.
 
-    Strides are measured in bytes and may be negative when the corresponding
-    offset points at the first logical row. Row padding is never read or
-    modified.
+    ``width`` and ``height`` describe plane 0; a subsampled plane derives its
+    own dimensions from the layout. Strides are measured in bytes and may be
+    negative when the corresponding offset points at the first logical row of
+    every plane. Row padding is never read or modified.
     """
 
     if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
@@ -409,9 +470,10 @@ def interpret_into(
     if isinstance(height, bool) or not isinstance(height, int) or height <= 0:
         raise InterpreterError("height must be a positive integer")
     layout = get_layout(ir.layout)
-    row_bytes = layout.row_bytes(width)
-    source_stride = row_bytes if source_stride is None else source_stride
-    destination_stride = row_bytes if destination_stride is None else destination_stride
+    source_strides = _plane_strides(layout, width, source_stride, "source")
+    destination_strides = _plane_strides(
+        layout, width, destination_stride, "destination"
+    )
     source_view = _byte_view(source, "source", writable=False)
     destination_view = _byte_view(destination, "destination", writable=True)
     if source_view.obj is destination_view.obj:
@@ -419,55 +481,114 @@ def interpret_into(
     # Planes of a tightly packed frame sit back to back, which is the layout
     # FFmpeg's rawvideo muxer writes and the one callers pass in.
     for plane in range(layout.plane_count):
-        _validate_layout(
-            len(source_view),
-            source_offset + layout.plane_origin(plane, width, height),
-            source_stride,
-            row_bytes,
-            height,
-            f"source plane {plane}",
-        )
-        _validate_layout(
-            len(destination_view),
-            destination_offset + layout.plane_origin(plane, width, height),
-            destination_stride,
-            row_bytes,
-            height,
-            f"destination plane {plane}",
-        )
+        origin = layout.plane_origin(plane, width, height)
+        for label, view, offset, strides in (
+            ("source", source_view, source_offset, source_strides),
+            ("destination", destination_view, destination_offset, destination_strides),
+        ):
+            _validate_layout(
+                len(view),
+                offset + origin,
+                strides[plane],
+                layout.plane_row_bytes(plane, width),
+                layout.plane_height(plane, height),
+                f"{label} plane {plane}",
+            )
 
     stages = _prepare(ir)
+    if layout.subsampled:
+        _interpret_planes(
+            stages,
+            layout,
+            source_view,
+            destination_view,
+            width,
+            height,
+            source_strides,
+            destination_strides,
+            source_offset,
+            destination_offset,
+        )
+        return
+
+    # Every plane shares the frame's resolution here, so one pixel is one
+    # iteration and a stage may read all four channels of it.
     step = layout.step
     stored = layout.stored_channels
-    # Per channel: the byte its plane starts at, and its offset in a sample.
+    origins = [
+        layout.plane_origin(plane, width, height)
+        for plane in range(layout.plane_count)
+    ]
+    # Per channel: the plane it lives in and its offset in a sample group.
     reads = tuple(
         None
         if layout.plane(channel) is None
-        else (
-            layout.plane_origin(layout.plane(channel), width, height),
-            layout.offset(channel),
-        )
+        else (layout.plane(channel), layout.offset(channel))
         for channel in range(4)
     )
     for y in range(height):
-        source_row = source_offset + y * source_stride
-        destination_row = destination_offset + y * destination_stride
+        source_rows = [
+            source_offset + origins[plane] + y * source_strides[plane]
+            for plane in range(layout.plane_count)
+        ]
+        destination_rows = [
+            destination_offset + origins[plane] + y * destination_strides[plane]
+            for plane in range(layout.plane_count)
+        ]
         for x in range(width):
             # An absent alpha loads as zero, matching upstream's have_alpha=0 path.
             pixel: Pixel = tuple(  # type: ignore[assignment]
                 0
                 if reads[channel] is None
                 else source_view[
-                    source_row + reads[channel][0] + x * step + reads[channel][1]
+                    source_rows[reads[channel][0]] + x * step + reads[channel][1]
                 ]
                 for channel in range(4)
             )
             output = _run_pixel(stages, pixel)
             for channel in stored:
-                origin, offset = reads[channel]  # type: ignore[misc]
+                plane, offset = reads[channel]  # type: ignore[misc]
                 destination_view[
-                    destination_row + origin + x * step + offset
+                    destination_rows[plane] + x * step + offset
                 ] = output[channel]
+
+
+def _interpret_planes(
+    stages: tuple[Stage, ...],
+    layout: PixelLayout,
+    source_view: memoryview,
+    destination_view: memoryview,
+    width: int,
+    height: int,
+    source_strides: tuple[int, ...],
+    destination_strides: tuple[int, ...],
+    source_offset: int,
+    destination_offset: int,
+) -> None:
+    """Run a channel-independent pipeline one plane at a time.
+
+    A subsampled layout has no common iteration space, so each plane is walked
+    at its own resolution and only the channels it stores are evaluated.
+    :func:`_prepare` has already refused any stage that would need the others.
+    """
+
+    for plane, channels in enumerate(layout.plane_channels):
+        origin = layout.plane_origin(plane, width, height)
+        plane_width = layout.plane_width(plane, width)
+        plane_height = layout.plane_height(plane, height)
+        offsets = tuple(layout.offset(channel) for channel in channels)
+        for y in range(plane_height):
+            source_row = source_offset + origin + y * source_strides[plane]
+            destination_row = (
+                destination_offset + origin + y * destination_strides[plane]
+            )
+            for x in range(plane_width):
+                for channel, offset in zip(channels, offsets, strict=True):
+                    index = x * layout.step + offset  # type: ignore[operator]
+                    value = source_view[source_row + index]
+                    for stage in stages:
+                        value = stage.evaluate_channel(channel, value)
+                    destination_view[destination_row + index] = value
 
 
 def interpret_rgba8(ir: PixelIR, source: Any, width: int, height: int) -> bytes:

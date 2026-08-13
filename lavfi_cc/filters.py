@@ -5,6 +5,14 @@ operations it contributes, or raises :class:`LoweringError` explaining exactly
 why that invocation is outside the accepted subset.  Keeping this layer free of
 graph-level concerns lets both the fusion frontend and the analysis-only
 scanner ask the same question about a filter.
+
+A lowerer also receives the layout the filter will run in, because an option's
+meaning can depend on it: ``negate=components=y`` is valid in ``yuv420p`` and a
+configuration failure in ``rgba``, and the reverse holds for
+``components=r``.  The layout is ``None`` when the working format is still
+undecided, which happens only on the scanner's reporting path; a lowerer then
+checks what it can decide without a format and leaves the rest to the caller,
+which has already refused to fuse a run whose format it cannot name.
 """
 
 from __future__ import annotations
@@ -144,41 +152,127 @@ def _table_hash(table: tuple[int, ...]) -> str:
     return hashlib.sha256(bytes(table)).hexdigest()
 
 
-def _lower_negate(invocation: FilterInvocation, index: int) -> Lowered:
-    options = _check_options(invocation, {"components", "negate_alpha"})
-    components = {"r", "g", "b"}
-    if "components" in options:
-        raw_components = options["components"].value
-        tokens = raw_components.split("+")
-        if not tokens or any(token not in CHANNELS for token in tokens):
+#: Every component name the accepted filters use, and the logical channel it
+#: selects.  The two families never overlap and both order their channels the
+#: same way, so one table serves ``r+g+b+a`` and ``y+u+v+a`` alike.
+COMPONENT_CHANNELS = {"r": 0, "y": 0, "g": 1, "u": 1, "b": 2, "v": 2, "a": 3}
+
+#: What a caller may spell when the working format is still undecided.
+_COMPONENT_FAMILIES = (frozenset("rgba"), frozenset("yuva"))
+
+
+def _negate_channels(
+    invocation: FilterInvocation, layout: PixelLayout | None
+) -> set[int]:
+    """Return the logical channels ``negate`` inverts in this layout.
+
+    Upstream validates an explicit mask against the format and fails the graph
+    outright when a component is missing; the default mask names every colour
+    component of whichever family the format belongs to and skips that check.
+    """
+
+    options = invocation.named_options()
+    raw = options.get("components")
+    if raw is None:
+        return {0, 1, 2}
+
+    tokens = raw.value.split("+")
+    if not tokens or any(token not in COMPONENT_CHANNELS for token in tokens):
+        raise LoweringError(
+            "invalid_components",
+            "components must be a + separated combination of r, g, b, and a "
+            "for an RGB format, or y, u, v, and a for a YUV one",
+            "components",
+        )
+    if len(set(tokens)) != len(tokens):
+        raise LoweringError(
+            "invalid_components", "components must not contain duplicates", "components"
+        )
+
+    if layout is None:
+        # Without a format only the vocabulary is decidable: no format offers
+        # both families, but which one it offers is not yet known.
+        if not any(set(tokens) <= family for family in _COMPONENT_FAMILIES):
             raise LoweringError(
                 "invalid_components",
-                "components must be a + separated combination of r, g, b, and a",
+                "components must not mix the RGB and YUV component names",
                 "components",
             )
-        if len(set(tokens)) != len(tokens):
-            raise LoweringError(
-                "invalid_components", "components must not contain duplicates", "components"
-            )
-        components = set(tokens)
-    if "negate_alpha" in options:
-        # In pinned FFmpeg this legacy plane option has no alpha effect on packed RGBA.
-        _parse_bool(options["negate_alpha"].value, "negate_alpha")
+        return {COMPONENT_CHANNELS[token] for token in tokens}
+
+    available = layout.components
+    unavailable = [token for token in tokens if token not in available]
+    if unavailable:
+        raise LoweringError(
+            "component_not_available",
+            f"negate cannot select {unavailable[0]!r} in {layout.name!r}, which "
+            f"carries {'+'.join(available)}; upstream fails to configure this graph",
+            "components",
+        )
+    return {available[token] for token in tokens}
+
+
+def _check_negate_alpha(
+    invocation: FilterInvocation, layout: PixelLayout | None
+) -> None:
+    """Reject the legacy plane option only where it really negates alpha.
+
+    ``negate_alpha`` sets a *plane* mask.  Packed RGB ignores it in favour of
+    its component mask, and a layout without an alpha plane has nothing for it
+    to select, so in both cases it is inert.  On ``gbrap`` it does negate alpha,
+    which is a different meaning for the same option.  An explicit ``components``
+    replaces the plane mask outright, so the option cannot matter there either.
+    """
+
+    options = invocation.named_options()
+    negate_alpha = options.get("negate_alpha")
+    if negate_alpha is None:
+        return
+    enabled = _parse_bool(negate_alpha.value, "negate_alpha")
+    if (
+        enabled
+        and "components" not in options
+        and layout is not None
+        and layout.planar
+        and layout.has_alpha
+    ):
+        raise LoweringError(
+            "planar_negate_alpha",
+            f"negate_alpha sets a plane mask, so it negates alpha in "
+            f"{layout.name!r} unlike in packed RGB; spell the intent as "
+            "components=r+g+b+a instead",
+            "negate_alpha",
+        )
+
+
+def _lower_negate(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    _check_options(invocation, {"components", "negate_alpha"})
+    channels = _negate_channels(invocation, layout)
+    _check_negate_alpha(invocation, layout)
 
     identity = _identity_table()
     inverse = tuple(255 - value for value in range(256))
-    tables = tuple(inverse if channel in components else identity for channel in CHANNELS)
+    tables = tuple(
+        inverse if channel in channels else identity for channel in range(4)
+    )
     operation = Operation("lut8", {"tables": tables}, source_ref(index, invocation))
     quantize = Operation(
         "quantize_rgba8",
         {"mode": "lookup_u8"},
         source_ref(index, invocation),
     )
-    ordered = "+".join(channel for channel in CHANNELS if channel in components)
+    names = layout.component_names if layout is not None else CHANNELS
+    ordered = "+".join(
+        names[channel] or CHANNELS[channel] for channel in sorted(channels)
+    )
     return Lowered((operation, quantize), f"negate=components={ordered}")
 
 
-def _lower_lutrgb(invocation: FilterInvocation, index: int) -> Lowered:
+def _lower_lutrgb(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
     options = _check_options(invocation, set(CHANNELS))
     expressions = {channel: "clipval" for channel in CHANNELS}
     expressions.update({name: option.value for name, option in options.items()})
@@ -203,7 +297,9 @@ def _lower_lutrgb(invocation: FilterInvocation, index: int) -> Lowered:
     return Lowered((operation, quantize), canonical, removes_color_side_data=True)
 
 
-def _lower_colorlevels(invocation: FilterInvocation, index: int) -> Lowered:
+def _lower_colorlevels(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
     point_options = {
         f"{channel}{suffix}"
         for channel in CHANNELS
@@ -298,7 +394,9 @@ def _lower_colorlevels(invocation: FilterInvocation, index: int) -> Lowered:
     return Lowered((operation, quantize), canonical)
 
 
-def _lower_colorchannelmixer(invocation: FilterInvocation, index: int) -> Lowered:
+def _lower_colorchannelmixer(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
     coefficient_names = {output + input_ for output in CHANNELS for input_ in CHANNELS}
     options = _check_options(invocation, coefficient_names | {"pc", "pa"})
     pc = options.get("pc")
@@ -354,7 +452,7 @@ def _lower_colorchannelmixer(invocation: FilterInvocation, index: int) -> Lowere
     return Lowered((operation, quantize), canonical)
 
 
-Lowerer = Callable[[FilterInvocation, int], Lowered]
+Lowerer = Callable[[FilterInvocation, int, "PixelLayout | None"], Lowered]
 
 LOWERERS: dict[str, Lowerer] = {
     "negate": _lower_negate,
@@ -366,91 +464,40 @@ LOWERERS: dict[str, Lowerer] = {
 SUPPORTED_FILTERS = tuple(LOWERERS)
 
 
-#: The packed 8-bit RGB formats each filter advertises in pinned FFmpeg.
+#: The 8-bit formats each filter advertises in pinned FFmpeg.
 #:
 #: A run may only be fused in a format that *every* filter in it accepts.
 #: Otherwise FFmpeg negotiation inserts a conversion in the middle of the run
 #: and one kernel would no longer be equivalent to the filters it replaced.
 #:
-#: These sets cover only the packed 8-bit RGB formats, which are the ones a
-#: kernel can currently run in.  Every accepted filter also advertises planar
-#: and higher-depth formats, and three of them advertise YUV; those are
-#: deliberately out of scope here, so callers must only consult this table for
-#: a format the backend actually implements.  ``colorlevels`` and
+#: These sets cover only the 8-bit formats the backend implements.  Every
+#: accepted filter also advertises higher-depth formats, and ``negate``
+#: advertises far more YUV formats than the three planar ones here; those are
+#: deliberately out of scope, so callers must only consult this table for a
+#: format in :data:`lavfi_cc.layouts.LAYOUTS`.  ``colorlevels`` and
 #: ``colorchannelmixer`` additionally accept the ``0rgb``/``rgb0`` family that
 #: ``negate`` and ``lutrgb`` do not, so it is outside the common subset.
+#:
+#: Only ``negate`` advertises YUV at all: ``lutrgb``, ``colorlevels``, and
+#: ``colorchannelmixer`` are RGB-only upstream, so a YUV run containing one of
+#: them is not contiguous in one format and is refused rather than fused.
 _RGB8 = frozenset(
     {"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24", "gbrp", "gbrap"}
 )
+_YUV8 = frozenset({"yuv444p", "yuv422p", "yuv420p"})
 
-RGB8_FILTER_FORMATS: dict[str, frozenset[str]] = {
-    "negate": _RGB8,
+FILTER_FORMATS: dict[str, frozenset[str]] = {
+    "negate": _RGB8 | _YUV8,
     "lutrgb": _RGB8,
     "colorlevels": _RGB8,
     "colorchannelmixer": _RGB8,
 }
 
 
-def filter_supports_rgb8(name: str, pixel_format: str) -> bool:
-    """Whether *name* advertises this packed 8-bit RGB format upstream.
+def filter_supports_format(name: str, pixel_format: str) -> bool:
+    """Whether *name* advertises this 8-bit format upstream.
 
     Only meaningful for a format in :data:`lavfi_cc.layouts.LAYOUTS`.
     """
 
-    return pixel_format in RGB8_FILTER_FORMATS.get(name, frozenset())
-
-
-def _validate_negate_for_layout(
-    invocation: FilterInvocation, layout: PixelLayout
-) -> None:
-    """Check the two ways ``negate`` depends on the pixel format.
-
-    Upstream validates an explicit component mask against the format at
-    configuration time and fails the graph outright; the default mask skips
-    that check.  Separately, ``negate_alpha`` sets a *plane* mask, which packed
-    RGB ignores in favour of its component mask but planar RGB obeys, so the
-    legacy option really does negate alpha on ``gbrap``.
-    """
-
-    options = invocation.named_options()
-    components = options.get("components")
-    if components is not None and not layout.has_alpha:
-        if "a" in components.value.split("+"):
-            raise LoweringError(
-                "component_not_available",
-                f"negate cannot select alpha in {layout.name!r}, which has no "
-                "alpha channel; upstream fails to configure this graph",
-                "components",
-            )
-
-    negate_alpha = options.get("negate_alpha")
-    if (
-        negate_alpha is not None
-        and components is None
-        and layout.planar
-        and layout.has_alpha
-        and _parse_bool(negate_alpha.value, "negate_alpha")
-    ):
-        raise LoweringError(
-            "planar_negate_alpha",
-            f"negate_alpha sets a plane mask, so it negates alpha in "
-            f"{layout.name!r} unlike in packed RGB; spell the intent as "
-            "components=r+g+b+a instead",
-            "negate_alpha",
-        )
-
-
-LayoutValidator = Callable[[FilterInvocation, PixelLayout], None]
-
-#: Extra checks that only become decidable once the working format is known.
-LAYOUT_VALIDATORS: dict[str, LayoutValidator] = {
-    "negate": _validate_negate_for_layout,
-}
-
-
-def validate_for_layout(invocation: FilterInvocation, layout: PixelLayout) -> None:
-    """Raise :class:`LoweringError` if this filter cannot run in this layout."""
-
-    validator = LAYOUT_VALIDATORS.get(invocation.name)
-    if validator is not None:
-        validator(invocation, layout)
+    return pixel_format in FILTER_FORMATS.get(name, frozenset())

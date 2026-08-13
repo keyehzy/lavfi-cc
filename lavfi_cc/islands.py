@@ -24,9 +24,8 @@ from .filters import (
     LOWERERS,
     Lowered,
     LoweringError,
-    filter_supports_rgb8,
+    filter_supports_format,
     format_value,
-    validate_for_layout,
 )
 from .layouts import LAYOUTS
 from .parser import FilterInvocation
@@ -267,7 +266,7 @@ def scan_chain(
         # Only checkable for a format the backend implements; for anything else
         # the island is already not fusible and the run stays intact for
         # reporting.
-        if current_format in NATIVE_FORMATS and not filter_supports_rgb8(
+        if current_format in NATIVE_FORMATS and not filter_supports_format(
             invocation.name, current_format
         ):
             # FFmpeg would convert into a format this filter accepts, so the
@@ -288,9 +287,11 @@ def scan_chain(
             continue
 
         try:
-            if current_format in NATIVE_FORMATS:
-                validate_for_layout(invocation, LAYOUTS[current_format])
-            lowered = lowerer(invocation, index)
+            # An undecided format leaves the layout-dependent checks to the
+            # caller, which already refuses to fuse a run it cannot name a
+            # format for.
+            layout = LAYOUTS.get(current_format or "")
+            lowered = lowerer(invocation, index, layout)
         except LoweringError as error:
             close_run(index)
             rejections.append(_rejection(index, invocation, error))

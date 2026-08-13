@@ -22,6 +22,12 @@
 #define LAVFI_PIXEL_FORMAT_GBRP8  7u
 #define LAVFI_PIXEL_FORMAT_GBRAP8 8u
 
+/* Planar 8-bit YUV layouts: plane 0 luma, 1 Cb, 2 Cr. The chroma planes of
+ * YUV422P8 and YUV420P8 are subsampled; see the note on width and height. */
+#define LAVFI_PIXEL_FORMAT_YUV444P8 9u
+#define LAVFI_PIXEL_FORMAT_YUV422P8 10u
+#define LAVFI_PIXEL_FORMAT_YUV420P8 11u
+
 #if defined(__GNUC__) || defined(__clang__)
 #define LAVFI_KERNEL_EXPORT __attribute__((visibility("default")))
 #else
@@ -29,8 +35,11 @@
 #endif
 
 /* Planes the kernel does not use may be null, and their strides are ignored.
- * width and height are in samples of the largest plane; no accepted layout is
- * subsampled, so every used plane has the same sample dimensions. */
+ *
+ * width and height are always plane 0's sample dimensions. A kernel compiled
+ * for a subsampled layout derives each chroma plane's dimensions itself with
+ * AV_CEIL_RSHIFT, because it knows the layout it was generated for; the caller
+ * only has to point each plane at the row corresponding to that same slice. */
 typedef void (*LavfiProcessFunction)(
     uint8_t *const *dst,
     const ptrdiff_t *dst_stride,

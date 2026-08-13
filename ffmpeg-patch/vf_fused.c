@@ -1,5 +1,5 @@
 /*
- * Dynamic lavfi-cc RGBA8 kernel filter.
+ * Dynamic lavfi-cc 8-bit kernel filter.
  *
  * This file is part of FFmpeg.
  *
@@ -31,7 +31,9 @@
 
 /* Mirrors runtime/kernel_abi.h. ABI 2 passes per-plane arrays shaped like
  * AVFrame's data[] and linesize[], so packed and planar kernels share one
- * entry point and one slice loop here. */
+ * entry point and one slice loop here. width and height describe plane 0; a
+ * kernel built for a subsampled layout sizes its own chroma planes, so this
+ * filter only has to point each plane at the row the slice starts on. */
 #define LAVFI_KERNEL_ABI_VERSION 2u
 #define LAVFI_KERNEL_MAX_PLANES 4
 
@@ -43,19 +45,25 @@
 #define LAVFI_PIXEL_FORMAT_BGR24  6u
 #define LAVFI_PIXEL_FORMAT_GBRP8  7u
 #define LAVFI_PIXEL_FORMAT_GBRAP8 8u
+#define LAVFI_PIXEL_FORMAT_YUV444P8  9u
+#define LAVFI_PIXEL_FORMAT_YUV422P8 10u
+#define LAVFI_PIXEL_FORMAT_YUV420P8 11u
 
 static enum AVPixelFormat kernel_pixel_format(uint32_t identifier)
 {
     switch (identifier) {
-    case LAVFI_PIXEL_FORMAT_RGBA8:  return AV_PIX_FMT_RGBA;
-    case LAVFI_PIXEL_FORMAT_BGRA8:  return AV_PIX_FMT_BGRA;
-    case LAVFI_PIXEL_FORMAT_ARGB8:  return AV_PIX_FMT_ARGB;
-    case LAVFI_PIXEL_FORMAT_ABGR8:  return AV_PIX_FMT_ABGR;
-    case LAVFI_PIXEL_FORMAT_RGB24:  return AV_PIX_FMT_RGB24;
-    case LAVFI_PIXEL_FORMAT_BGR24:  return AV_PIX_FMT_BGR24;
-    case LAVFI_PIXEL_FORMAT_GBRP8:  return AV_PIX_FMT_GBRP;
-    case LAVFI_PIXEL_FORMAT_GBRAP8: return AV_PIX_FMT_GBRAP;
-    default:                        return AV_PIX_FMT_NONE;
+    case LAVFI_PIXEL_FORMAT_RGBA8:     return AV_PIX_FMT_RGBA;
+    case LAVFI_PIXEL_FORMAT_BGRA8:     return AV_PIX_FMT_BGRA;
+    case LAVFI_PIXEL_FORMAT_ARGB8:     return AV_PIX_FMT_ARGB;
+    case LAVFI_PIXEL_FORMAT_ABGR8:     return AV_PIX_FMT_ABGR;
+    case LAVFI_PIXEL_FORMAT_RGB24:     return AV_PIX_FMT_RGB24;
+    case LAVFI_PIXEL_FORMAT_BGR24:     return AV_PIX_FMT_BGR24;
+    case LAVFI_PIXEL_FORMAT_GBRP8:     return AV_PIX_FMT_GBRP;
+    case LAVFI_PIXEL_FORMAT_GBRAP8:    return AV_PIX_FMT_GBRAP;
+    case LAVFI_PIXEL_FORMAT_YUV444P8:  return AV_PIX_FMT_YUV444P;
+    case LAVFI_PIXEL_FORMAT_YUV422P8:  return AV_PIX_FMT_YUV422P;
+    case LAVFI_PIXEL_FORMAT_YUV420P8:  return AV_PIX_FMT_YUV420P;
+    default:                           return AV_PIX_FMT_NONE;
     }
 }
 
@@ -84,6 +92,7 @@ typedef struct FusedContext {
     void *library;
     const LavfiCompiledKernel *kernel;
     int nb_planes;
+    int hsub, vsub;
 } FusedContext;
 
 typedef struct ThreadData {
@@ -246,25 +255,47 @@ static av_cold void uninit(AVFilterContext *ctx)
     s->library = NULL;
 }
 
+/* Rows of plane 0 that job jobnr owns.
+ *
+ * Slices are cut on the chroma sampling grid rather than on every luma row, so
+ * a subsampled row belongs to exactly one job: two jobs must never write the
+ * same chroma sample. The kernel is told how many plane-0 rows it received and
+ * derives each subsampled plane's row count from that with the same
+ * AV_CEIL_RSHIFT the rest of libavfilter uses, which tiles exactly because
+ * every boundary but the last is a multiple of 1 << vsub. */
+static void slice_rows(const FusedContext *s, int height, int jobnr, int nb_jobs,
+                       int *start, int *end)
+{
+    const int chroma_rows = AV_CEIL_RSHIFT(height, s->vsub);
+
+    *start = FFMIN(ff_slice_pos(chroma_rows, jobnr, nb_jobs) << s->vsub, height);
+    *end   = FFMIN(ff_slice_pos(chroma_rows, jobnr + 1, nb_jobs) << s->vsub, height);
+}
+
 static int filter_slice(AVFilterContext *ctx, void *arg,
                         int jobnr, int nb_jobs)
 {
     FusedContext *s = ctx->priv;
     const ThreadData *td = arg;
-    const int start = ff_slice_pos(td->out->height, jobnr, nb_jobs);
-    const int end = ff_slice_pos(td->out->height, jobnr + 1, nb_jobs);
     const uint8_t *src[LAVFI_KERNEL_MAX_PLANES] = { NULL };
     uint8_t *dst[LAVFI_KERNEL_MAX_PLANES] = { NULL };
     ptrdiff_t src_stride[LAVFI_KERNEL_MAX_PLANES] = { 0 };
     ptrdiff_t dst_stride[LAVFI_KERNEL_MAX_PLANES] = { 0 };
+    int start, end;
 
-    /* No advertised format is chroma-subsampled, so every plane is sliced at
-     * the same row and the kernel sees one height for all of them. */
+    slice_rows(s, td->out->height, jobnr, nb_jobs, &start, &end);
+    if (start >= end)
+        return 0;
+
     for (int plane = 0; plane < s->nb_planes; plane++) {
+        /* Planes 1 and 2 carry chroma; 0 and 3 are always full resolution. */
+        const int vsub = (plane == 1 || plane == 2) ? s->vsub : 0;
+        const int row = start >> vsub;
+
         src[plane] = td->in->data[plane] +
-                     (ptrdiff_t)start * td->in->linesize[plane];
+                     (ptrdiff_t)row * td->in->linesize[plane];
         dst[plane] = td->out->data[plane] +
-                     (ptrdiff_t)start * td->out->linesize[plane];
+                     (ptrdiff_t)row * td->out->linesize[plane];
         src_stride[plane] = td->in->linesize[plane];
         dst_stride[plane] = td->out->linesize[plane];
     }
@@ -303,8 +334,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     td.in = in;
     td.out = out;
+    /* One job per chroma row at most, since that is the finest cut a slice
+     * boundary can land on. */
     ff_filter_execute(ctx, filter_slice, &td, NULL,
-                      FFMIN(outlink->h, ff_filter_get_nb_threads(ctx)));
+                      FFMIN(AV_CEIL_RSHIFT(outlink->h, s->vsub),
+                            ff_filter_get_nb_threads(ctx)));
 
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
@@ -332,12 +366,17 @@ static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
     FusedContext *s = ctx->priv;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
 
+    if (!desc)
+        return AVERROR(EINVAL);
     s->nb_planes = av_pix_fmt_count_planes(inlink->format);
     if (s->nb_planes < 1 || s->nb_planes > LAVFI_KERNEL_MAX_PLANES) {
         av_log(ctx, AV_LOG_ERROR, "unsupported plane count %d\n", s->nb_planes);
         return AVERROR(EINVAL);
     }
+    s->hsub = desc->log2_chroma_w;
+    s->vsub = desc->log2_chroma_h;
     return 0;
 }
 
@@ -353,7 +392,7 @@ static const AVFilterPad inputs[] = {
 const FFFilter ff_vf_fused = {
     .p.name        = "fused",
     .p.description = NULL_IF_CONFIG_SMALL(
-        "Run one checked lavfi-cc packed 8-bit RGB kernel."),
+        "Run one checked lavfi-cc 8-bit RGB or YUV kernel."),
     .p.priv_class  = &fused_class,
     .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(FusedContext),

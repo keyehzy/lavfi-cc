@@ -57,7 +57,11 @@ class PixelIR:
     ir_version: int = IR_VERSION
     pixel_format: str = "rgba8"
     #: Byte layout the kernel loads from and stores to. The operations
-    #: themselves are layout-independent: they always see logical RGBA.
+    #: themselves are layout-independent: they always see four logical
+    #: channels, whether the layout names them red, green, blue, and alpha or
+    #: luma, Cb, and Cr. A subsampled layout additionally restricts the
+    #: operations to channel-independent ones, since its planes have no common
+    #: iteration space.
     layout: str = "rgba"
 
     def canonical_dict(self) -> dict[str, Any]:

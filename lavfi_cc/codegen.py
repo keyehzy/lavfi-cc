@@ -1,4 +1,13 @@
-"""Deterministic, readable scalar C generation for the RGBA8 pixel IR."""
+"""Deterministic, readable scalar C generation for the RGBA8 pixel IR.
+
+A layout whose planes all share the frame's resolution is walked one pixel at a
+time, loading every channel of that pixel so a stage may mix them.  A
+chroma-subsampled layout has no such common iteration space -- one ``yuv420p``
+chroma sample covers four luma samples -- so it is walked one plane at a time
+at that plane's own resolution.  Only channel-independent stages can be emitted
+that way, which :func:`lavfi_cc.interpreter.validate_ir` has already enforced by
+the time code generation runs.
+"""
 
 from __future__ import annotations
 
@@ -146,20 +155,22 @@ def _stage_declarations(stages: list[Operation]) -> list[str]:
     return lines
 
 
-def _stage_body(index: int, operation: Operation) -> list[str]:
-    if operation.kind == "lut8":
-        return [
-            f"            c{channel} = lut_{index}[{channel}][c{channel}];"
-            for channel in range(4)
-        ]
-    if operation.parameters["evaluation"] == LEVELS_EVALUATION:
-        return [
-            f"            c{channel} = levels_{index}[{channel}][c{channel}];"
-            for channel in range(4)
-        ]
+def _channel_assignment(index: int, operation: Operation, channel: int) -> str:
+    """Render one channel's update for a stage that reads only that channel."""
 
+    if operation.kind == "lut8":
+        return f"c{channel} = lut_{index}[{channel}][c{channel}];"
+    if operation.parameters.get("evaluation") == LEVELS_EVALUATION:
+        return f"c{channel} = levels_{index}[{channel}][c{channel}];"
+    raise ValueError(f"unsupported code-generation stage {operation.kind!r}")
+
+
+def _stage_body(index: int, operation: Operation) -> list[str]:
     if not _is_mixer(operation):
-        raise ValueError(f"unsupported code-generation stage {operation.kind!r}")
+        return [
+            "            " + _channel_assignment(index, operation, channel)
+            for channel in range(4)
+        ]
 
     lines = [
         f"            lavfi_i16x4 n{index} = (lavfi_i16x4){{0, 0, 0, 0}};"
@@ -177,6 +188,125 @@ def _stage_body(index: int, operation: Operation) -> list[str]:
         f"            c{channel} = lavfi_saturate_i32(n{index}[{channel}]);"
         for channel in range(4)
     )
+    return lines
+
+
+def _layout_comment(layout: PixelLayout) -> str:
+    kind = "planar" if layout.planar else "packed"
+    detail = (
+        f"{layout.name} ({kind}, {layout.plane_count} plane"
+        f"{'s' if layout.plane_count != 1 else ''}, step {layout.step})"
+    )
+    if layout.subsampled:
+        shifts = ", ".join(
+            f"plane {plane} is {1 << layout.plane_shift(plane)[0]}x"
+            f"{1 << layout.plane_shift(plane)[1]} subsampled"
+            for plane in range(layout.plane_count)
+            if layout.plane_shift(plane) != (0, 0)
+        )
+        detail += f"; {shifts}"
+    return f"/* byte layout: {detail} */"
+
+
+def _pixel_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
+    """Walk one pixel at a time, loading every channel so a stage may mix them."""
+
+    used_planes = sorted({layout.plane(channel) for channel in layout.stored_channels})
+    lines = ["    for (int y = 0; y < height; ++y) {"]
+    for plane in used_planes:
+        lines.append(
+            f"        const uint8_t *source_row_{plane} = "
+            f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
+        )
+        lines.append(
+            f"        uint8_t *destination_row_{plane} = "
+            f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
+        )
+    lines.append("        for (int x = 0; x < width; ++x) {")
+    for channel in range(4):
+        plane = layout.plane(channel)
+        if plane is None:
+            # Upstream reads no alpha for these layouts and contributes none.
+            lines.append(f"            uint8_t c{channel} = 0;")
+        else:
+            index = _sample_index(layout, channel)
+            lines.append(
+                f"            uint8_t c{channel} = source_row_{plane}[{index}];"
+            )
+    for index, operation in enumerate(stages):
+        lines.append("")
+        lines.append(f"            /* stage {index} */")
+        lines.extend(_stage_body(index, operation))
+    lines.append("")
+    for channel in layout.stored_channels:
+        plane = layout.plane(channel)
+        index = _sample_index(layout, channel)
+        lines.append(f"            destination_row_{plane}[{index}] = c{channel};")
+    lines.extend(["        }", "    }"])
+    return lines
+
+
+def _ceil_shift_expression(name: str, shift: int) -> str:
+    """Render FFmpeg's AV_CEIL_RSHIFT, which is how it sizes a chroma plane."""
+
+    if shift == 0:
+        return name
+    return f"({name} + {(1 << shift) - 1}) >> {shift}"
+
+
+def _plane_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
+    """Walk each plane at its own resolution, one channel at a time.
+
+    ``width`` and ``height`` describe plane 0, so every other plane derives its
+    dimensions the way the rest of libavfilter does.
+    """
+
+    lines: list[str] = []
+    for plane, channels in enumerate(layout.plane_channels):
+        if not channels:
+            continue
+        horizontal, vertical = layout.plane_shift(plane)
+        stored = [channel for channel in channels if channel in layout.stored_channels]
+        lines.append(
+            f"    /* plane {plane} carries channel"
+            f"{'s' if len(channels) != 1 else ''} "
+            f"{', '.join(str(channel) for channel in channels)} */"
+        )
+        lines.append("    {")
+        lines.append(
+            f"        const int plane_width = {_ceil_shift_expression('width', horizontal)};"
+        )
+        lines.append(
+            f"        const int plane_height = {_ceil_shift_expression('height', vertical)};"
+        )
+        lines.append("        for (int y = 0; y < plane_height; ++y) {")
+        lines.append(
+            f"            const uint8_t *source_row = "
+            f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
+        )
+        lines.append(
+            f"            uint8_t *destination_row = "
+            f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
+        )
+        lines.append("            for (int x = 0; x < plane_width; ++x) {")
+        for channel in channels:
+            sample = _sample_index(layout, channel)
+            lines.append(
+                f"                uint8_t c{channel} = source_row[{sample}];"
+            )
+        for index, operation in enumerate(stages):
+            lines.append("")
+            lines.append(f"                /* stage {index} */")
+            for channel in channels:
+                lines.append(
+                    "                "
+                    + _channel_assignment(index, operation, channel)
+                )
+        lines.append("")
+        for channel in stored:
+            sample = _sample_index(layout, channel)
+            lines.append(f"                destination_row[{sample}] = c{channel};")
+        lines.extend(["            }", "        }", "    }"])
     return lines
 
 
@@ -221,56 +351,23 @@ def generate_c(
             ]
         )
     layout = get_layout(ir.layout)
-    used_planes = sorted({layout.plane(channel) for channel in layout.stored_channels})
     lines.extend(_stage_declarations(stages))
-    kind = "planar" if layout.planar else "packed"
     lines.extend(
         [
-            f"/* byte layout: {layout.name} ({kind}, {layout.plane_count} plane"
-            f"{'s' if layout.plane_count != 1 else ''}, step {layout.step}) */",
+            _layout_comment(layout),
             "static void process_rgba8(",
             "    uint8_t *const *dst, const ptrdiff_t *dst_stride,",
             "    const uint8_t *const *src, const ptrdiff_t *src_stride,",
             "    int width, int height)",
             "{",
-            "    for (int y = 0; y < height; ++y) {",
         ]
     )
-    for plane in used_planes:
-        lines.append(
-            f"        const uint8_t *source_row_{plane} = "
-            f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
-        )
-        lines.append(
-            f"        uint8_t *destination_row_{plane} = "
-            f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
-        )
-    lines.append("        for (int x = 0; x < width; ++x) {")
-    for channel in range(4):
-        plane = layout.plane(channel)
-        if plane is None:
-            # Upstream reads no alpha for these layouts and contributes none.
-            lines.append(f"            uint8_t c{channel} = 0;")
-        else:
-            index = _sample_index(layout, channel)
-            lines.append(
-                f"            uint8_t c{channel} = source_row_{plane}[{index}];"
-            )
-    for index, operation in enumerate(stages):
-        lines.append("")
-        lines.append(f"            /* stage {index} */")
-        lines.extend(_stage_body(index, operation))
-    lines.append("")
-    for channel in layout.stored_channels:
-        plane = layout.plane(channel)
-        index = _sample_index(layout, channel)
-        lines.append(
-            f"            destination_row_{plane}[{index}] = c{channel};"
-        )
+    if layout.subsampled:
+        lines.extend(_plane_walk(layout, stages))
+    else:
+        lines.extend(_pixel_walk(layout, stages))
     lines.extend(
         [
-            "        }",
-            "    }",
             "}",
             "",
             f'static const char kernel_plan_hash[] = "{ir.plan_hash}";',
