@@ -111,24 +111,34 @@ def _evaluate(node: ast.AST, variables: dict[str, float]) -> float:
     raise AssertionError(f"unvalidated expression node: {ast.dump(node)}")
 
 
-#: Range every ``lutrgb`` component is defined over.
+#: Range every 8-bit ``lutrgb`` component is defined over.
 FULL_RANGE = (0, 255)
 
 
-def build_lut(source: str, value_range: tuple[int, int] = FULL_RANGE) -> tuple[int, ...]:
-    """Materialize one component's 256-entry table over ``[minval, maxval]``.
+def build_lut(
+    source: str,
+    value_range: tuple[int, int] = FULL_RANGE,
+    depth: int = 8,
+    output_max: int = 255,
+) -> tuple[int, ...]:
+    """Materialize one component's table over ``[minval, maxval]``.
 
     ``clipval`` and ``negval`` are derived exactly as ``config_props`` derives
     them: both are clamped into the component's own range, so on a limited-range
     luma channel ``negval`` is ``av_clip(16 + 235 - val, 16, 235)`` rather than
-    ``255 - val``.  The final clamp stays ``[0, 255]``, which is what upstream
-    uses for every 8-bit format regardless of the component's range.
+    ``255 - val``.  The final clamp is ``[0, output_max]``, which upstream takes
+    from the alpha component's maximum -- the same for every component, and not
+    always ``(1 << depth) - 1``; see :func:`lavfi_cc.filters._lut_ranges`.
+
+    Upstream's table always has 65536 entries whatever the depth, because it is
+    indexed by a raw ``uint16``.  This one covers the format's own domain and is
+    indexed through a clamp; see :mod:`lavfi_cc.interpreter` on why.
     """
 
     minimum, maximum = value_range
     tree = parse_expression(source)
     values: list[int] = []
-    for value in range(256):
+    for value in range(1 << depth):
         clipped = max(minimum, min(value, maximum))
         negated = max(minimum, min(minimum + maximum - value, maximum))
         result = _evaluate(
@@ -146,5 +156,5 @@ def build_lut(source: str, value_range: tuple[int, int] = FULL_RANGE) -> tuple[i
         if result < -(2**31) or result > 2**31 - 1:
             raise ExpressionError(f"expression is outside signed-int range for val={value}")
         quantized = int(result)  # C conversion and Python int both truncate toward zero.
-        values.append(max(0, min(255, quantized)))
+        values.append(max(0, min(output_max, quantized)))
     return tuple(values)

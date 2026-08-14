@@ -1,4 +1,4 @@
-"""Deterministic, readable scalar C generation for the RGBA8 pixel IR.
+"""Deterministic, readable scalar C generation for the pixel IR.
 
 A layout whose planes all share the frame's resolution is walked one pixel at a
 time, loading every channel of that pixel so a stage may mix them.  A
@@ -7,13 +7,19 @@ chroma sample covers four luma samples -- so it is walked one plane at a time
 at that plane's own resolution.  Only channel-independent stages can be emitted
 that way, which :func:`lavfi_cc.interpreter.validate_ir` has already enforced by
 the time code generation runs.
+
+Sample width enters in exactly two places: the type of a row pointer and the
+type of a table entry.  Everything between them is the same text at eight bits
+and above, and the eight-bit rendering is character for character what it was
+before higher depths existed, so no cached or bundled kernel was invalidated by
+adding them.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .expr import C_HELPERS, ExprProgram, render_c
+from .expr import ExprProgram, c_helpers, render_c
 from .ir import Operation, PixelIR
 from .layouts import PixelLayout, get_layout
 from .passes import (
@@ -37,10 +43,11 @@ class GeneratedC:
 def _format_table(
     name: str, c_type: str, rows: tuple[tuple[int, ...], ...]
 ) -> list[str]:
-    lines = [f"static const {c_type} {name}[{len(rows)}][256] = {{"]
+    size = len(rows[0])
+    lines = [f"static const {c_type} {name}[{len(rows)}][{size}] = {{"]
     for row in rows:
         lines.append("    {")
-        for start in range(0, 256, 16):
+        for start in range(0, size, 16):
             values = ", ".join(str(value) for value in row[start : start + 16])
             lines.append(f"        {values},")
         lines.append("    },")
@@ -51,9 +58,11 @@ def _format_table(
 MixerColumn = tuple[tuple[int, int, int, int], ...]
 
 
-def _format_vector_table(name: str, entries: MixerColumn) -> list[str]:
-    lines = [f"static const lavfi_i16x4 {name}[256] = {{"]
-    for start in range(0, 256, 4):
+def _format_vector_table(
+    name: str, entries: MixerColumn, vector_type: str
+) -> list[str]:
+    lines = [f"static const {vector_type} {name}[{len(entries)}] = {{"]
+    for start in range(0, len(entries), 4):
         values = ", ".join(
             "{" + ", ".join(str(value) for value in entry) + "}"
             for entry in entries[start : start + 4]
@@ -65,18 +74,19 @@ def _format_vector_table(name: str, entries: MixerColumn) -> list[str]:
 
 def _mixer_columns(operation: Operation) -> tuple[MixerColumn, ...]:
     tables = operation.parameters["contribution_tables"]
+    size = len(tables[0][0])
     return tuple(
         tuple(
             tuple(tables[output][input_][value] for output in range(4))
-            for value in range(256)
+            for value in range(size)
         )
         for input_ in range(4)
     )
 
 
 def _mixer_column_mode(column: MixerColumn) -> str:
-    zero = (0,) * 256
-    identity = tuple(range(256))
+    zero = (0,) * len(column)
+    identity = tuple(range(len(column)))
     output_tables = tuple(
         tuple(entry[output] for entry in column) for output in range(4)
     )
@@ -87,19 +97,38 @@ def _mixer_column_mode(column: MixerColumn) -> str:
     return "table"
 
 
-def _direct_mixer_vector(input_: int, column: MixerColumn) -> str:
-    zero = (0,) * 256
+def _mixer_vector_type(depth: int) -> str:
+    """The vector the mixer sums its four terms in.
+
+    A term is a sample scaled by at most two, so eight-bit terms and their sum
+    fit an ``int16_t``; above eight bits they do not, which is the whole reason
+    the type is named after its width rather than fixed.
+    """
+
+    return "lavfi_i16x4" if depth == 8 else "lavfi_i32x4"
+
+
+def _mixer_element_type(depth: int) -> str:
+    return "int16_t" if depth == 8 else "int32_t"
+
+
+def _direct_mixer_vector(input_: int, column: MixerColumn, depth: int) -> str:
+    zero = (0,) * len(column)
     lanes = [
         "0"
         if tuple(entry[output] for entry in column) == zero
-        else f"(int16_t)c{input_}"
+        else f"({_mixer_element_type(depth)})c{input_}"
         for output in range(4)
     ]
-    return "(lavfi_i16x4){" + ", ".join(lanes) + "}"
+    return f"({_mixer_vector_type(depth)})" + "{" + ", ".join(lanes) + "}"
 
 
 def _sample_index(layout: PixelLayout, channel: int) -> str:
-    """Render the index of one channel's byte within its plane row."""
+    """Render the index of one channel's sample within its plane row.
+
+    The index is in samples rather than bytes, which is what a row pointer of
+    the layout's own sample type wants.
+    """
 
     offset = layout.offset(channel)
     assert offset is not None
@@ -107,6 +136,10 @@ def _sample_index(layout: PixelLayout, channel: int) -> str:
         return "x" if offset == 0 else f"x + {offset}"
     scaled = f"x * {layout.step}"
     return scaled if offset == 0 else f"{scaled} + {offset}"
+
+
+def _is_lut(operation: Operation) -> bool:
+    return operation.kind in {"lut8", "lut16"}
 
 
 def _is_mixer(operation: Operation) -> bool:
@@ -156,13 +189,17 @@ def _stage_coupling(operation: Operation) -> frozenset[int]:
     return frozenset()
 
 
-def _stage_declarations(stages: list[Operation]) -> list[str]:
+def _stage_declarations(stages: list[Operation], depth: int) -> list[str]:
+    sample_type = _sample_type(depth)
     lines: list[str] = []
     for index, operation in enumerate(stages):
-        if operation.kind == "lut8":
-            lines.append(f"/* stage {index}: four independent byte lookup tables */")
+        if _is_lut(operation):
+            noun = "byte" if depth == 8 else f"{depth}-bit sample"
+            lines.append(
+                f"/* stage {index}: four independent {noun} lookup tables */"
+            )
             rows = tuple(tuple(row) for row in operation.parameters["tables"])
-            lines.extend(_format_table(f"lut_{index}", "uint8_t", rows))
+            lines.extend(_format_table(f"lut_{index}", sample_type, rows))
         elif _is_chroma_rotate(operation):
             lines.append(
                 f"/* stage {index}: chroma rotation, evaluated inline "
@@ -188,7 +225,7 @@ def _stage_declarations(stages: list[Operation]) -> list[str]:
             lines.extend(
                 _format_table(
                     f"levels_{index}",
-                    "uint8_t",
+                    sample_type,
                     materialize_levels_tables(operation),
                 )
             )
@@ -201,7 +238,9 @@ def _stage_declarations(stages: list[Operation]) -> list[str]:
                 if mode == "table":
                     lines.extend(
                         _format_vector_table(
-                            f"mixer_{index}_input_{input_}", column
+                            f"mixer_{index}_input_{input_}",
+                            column,
+                            _mixer_vector_type(depth),
                         )
                     )
                 else:
@@ -214,32 +253,64 @@ def _stage_declarations(stages: list[Operation]) -> list[str]:
     return lines
 
 
-def _channel_assignment(index: int, operation: Operation, channel: int) -> str:
+def _table_index(depth: int, expression: str) -> str:
+    """Render a table subscript, clamping a sample the format cannot hold.
+
+    A table covers the format's own domain, ``1 << depth`` entries.  At eight
+    and sixteen bits that is every value the sample type can hold and the
+    subscript is the sample itself; in between, a malformed frame could carry a
+    value the table has no entry for, and it is clamped rather than read past
+    the end.  See :mod:`lavfi_cc.interpreter` on the domain this is outside of.
+    """
+
+    if depth in (8, 16):
+        return expression
+    maximum = (1 << depth) - 1
+    return f"{expression} > {maximum} ? {maximum} : {expression}"
+
+
+def _channel_assignment(
+    index: int, operation: Operation, channel: int, depth: int
+) -> str:
     """Render one channel's update for a stage that reads only that channel."""
 
-    if operation.kind == "lut8":
-        return f"c{channel} = lut_{index}[{channel}][c{channel}];"
+    subscript = _table_index(depth, f"c{channel}")
+    if _is_lut(operation):
+        return f"c{channel} = lut_{index}[{channel}][{subscript}];"
     if operation.parameters.get("evaluation") == LEVELS_EVALUATION:
-        return f"c{channel} = levels_{index}[{channel}][c{channel}];"
+        return f"c{channel} = levels_{index}[{channel}][{subscript}];"
     raise ValueError(f"unsupported code-generation stage {operation.kind!r}")
 
 
-def _chroma_rotate_body(index: int, operation: Operation, indent: str) -> list[str]:
+def _chroma_rotate_body(
+    index: int, operation: Operation, indent: str, depth: int
+) -> list[str]:
     """Emit ``vf_hue.c``'s chroma rotation inline rather than as its tables.
 
-    Upstream indexes two 64 KiB tables by the ``(u, v)`` pair; the arithmetic
-    behind them is a few int32 operations that cannot overflow at these
-    magnitudes.  The ``>> 16`` is on a signed value, exactly as upstream writes
-    it, so both are the same arithmetic shift under the same compiler.
+    Upstream indexes two tables by the ``(u, v)`` pair -- 64 KiB each at eight
+    bits, 2 MiB each at ten; the arithmetic behind them is a few int32
+    operations that cannot overflow at these magnitudes.  The ``>> 16`` is on a
+    signed value, exactly as upstream writes it, so both are the same
+    arithmetic shift under the same compiler.
+
+    ``apply_lut10`` clamps each sample into the depth before indexing, which
+    ``apply_lut`` does not need to; the clamp below is that, and it is the only
+    difference between the two paths.
     """
 
     cosine = operation.parameters["cosine"]
     sine = operation.parameters["sine"]
-    rounding = f"({1 << 15} + {128 << 16})"
+    centre = 1 << (depth - 1)
+    rounding = f"({1 << 15} + {centre << 16})"
+    load = (
+        (lambda channel: f"(int32_t)c{channel}")
+        if depth == 8
+        else (lambda channel: f"(int32_t)({_table_index(depth, f'c{channel}')})")
+    )
     return [
         f"{indent}{{",
-        f"{indent}    const int32_t u{index} = (int32_t)c1 - 128;",
-        f"{indent}    const int32_t v{index} = (int32_t)c2 - 128;",
+        f"{indent}    const int32_t u{index} = {load(1)} - {centre};",
+        f"{indent}    const int32_t v{index} = {load(2)} - {centre};",
         f"{indent}    c1 = lavfi_saturate_i32("
         f"(({cosine} * u{index}) - ({sine} * v{index}) + {rounding}) >> 16);",
         f"{indent}    c2 = lavfi_saturate_i32("
@@ -251,28 +322,31 @@ def _chroma_rotate_body(index: int, operation: Operation, indent: str) -> list[s
 def _stage_body(
     index: int,
     operation: Operation,
+    depth: int,
     channels: tuple[int, ...] = (0, 1, 2, 3),
     indent: str = "            ",
 ) -> list[str]:
     """Emit one stage for a loop carrying exactly *channels*."""
 
     if _is_chroma_rotate(operation):
-        return _chroma_rotate_body(index, operation, indent)
+        return _chroma_rotate_body(index, operation, indent, depth)
     if _is_expr(operation):
         return render_c(_expr_program(operation), f"e{index}", channels, indent)
     if not _is_mixer(operation):
         return [
-            indent + _channel_assignment(index, operation, channel)
+            indent + _channel_assignment(index, operation, channel, depth)
             for channel in channels
         ]
 
-    lines = [f"{indent}lavfi_i16x4 n{index} = (lavfi_i16x4){{0, 0, 0, 0}};"]
+    vector = _mixer_vector_type(depth)
+    lines = [f"{indent}{vector} n{index} = ({vector}){{0, 0, 0, 0}};"]
     for input_, column in enumerate(_mixer_columns(operation)):
         mode = _mixer_column_mode(column)
         if mode == "table":
-            term = f"mixer_{index}_input_{input_}[c{input_}]"
+            subscript = _table_index(depth, f"c{input_}")
+            term = f"mixer_{index}_input_{input_}[{subscript}]"
         elif mode == "direct":
-            term = _direct_mixer_vector(input_, column)
+            term = _direct_mixer_vector(input_, column, depth)
         else:
             continue
         lines.append(f"{indent}n{index} += {term};")
@@ -285,9 +359,10 @@ def _stage_body(
 
 def _layout_comment(layout: PixelLayout) -> str:
     kind = "planar" if layout.planar else "packed"
+    width = "" if layout.depth == 8 else f", {layout.depth}-bit samples"
     detail = (
         f"{layout.name} ({kind}, {layout.plane_count} plane"
-        f"{'s' if layout.plane_count != 1 else ''}, step {layout.step})"
+        f"{'s' if layout.plane_count != 1 else ''}, step {layout.step}{width})"
     )
     if layout.subsampled:
         shifts = ", ".join(
@@ -300,35 +375,60 @@ def _layout_comment(layout: PixelLayout) -> str:
     return f"/* byte layout: {detail} */"
 
 
+def _sample_type(depth: int) -> str:
+    return "uint8_t" if depth == 8 else "uint16_t"
+
+
+def _row_pointer(depth: int, name: str, buffer: str, stride: str, plane: int) -> str:
+    """Declare one row pointer of the layout's sample type.
+
+    The ABI hands over byte pointers and byte strides whatever the depth is, so
+    a wide layout does the pointer arithmetic in bytes and casts once, which is
+    also what every upstream slice function does.
+    """
+
+    constant = "const " if buffer == "src" else ""
+    address = f"{buffer}[{plane}] + (ptrdiff_t)y * {stride}[{plane}]"
+    if depth == 8:
+        return f"{constant}uint8_t *{name} = {address};"
+    return f"{constant}uint16_t *{name} = ({constant}uint16_t *)({address});"
+
+
 def _pixel_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
     """Walk one pixel at a time, loading every channel so a stage may mix them."""
 
+    depth = layout.depth
+    sample = _sample_type(depth)
     used_planes = sorted({layout.plane(channel) for channel in layout.stored_channels})
     lines = ["    for (int y = 0; y < height; ++y) {"]
     for plane in used_planes:
         lines.append(
-            f"        const uint8_t *source_row_{plane} = "
-            f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
+            "        "
+            + _row_pointer(
+                depth, f"source_row_{plane}", "src", "src_stride", plane  # type: ignore[arg-type]
+            )
         )
         lines.append(
-            f"        uint8_t *destination_row_{plane} = "
-            f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
+            "        "
+            + _row_pointer(
+                depth, f"destination_row_{plane}", "dst", "dst_stride", plane  # type: ignore[arg-type]
+            )
         )
     lines.append("        for (int x = 0; x < width; ++x) {")
     for channel in range(4):
         plane = layout.plane(channel)
         if plane is None:
             # Upstream reads no alpha for these layouts and contributes none.
-            lines.append(f"            uint8_t c{channel} = 0;")
+            lines.append(f"            {sample} c{channel} = 0;")
         else:
             index = _sample_index(layout, channel)
             lines.append(
-                f"            uint8_t c{channel} = source_row_{plane}[{index}];"
+                f"            {sample} c{channel} = source_row_{plane}[{index}];"
             )
     for index, operation in enumerate(stages):
         lines.append("")
         lines.append(f"            /* stage {index} */")
-        lines.extend(_stage_body(index, operation))
+        lines.extend(_stage_body(index, operation, depth))
     lines.append("")
     for channel in layout.stored_channels:
         plane = layout.plane(channel)
@@ -390,6 +490,8 @@ def _plane_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
     pointers plainly; a group spanning planes qualifies them by plane number.
     """
 
+    depth = layout.depth
+    sample_type = _sample_type(depth)
     lines: list[str] = []
     for group in _walk_planes(layout, stages):
         channels = tuple(
@@ -421,19 +523,23 @@ def _plane_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
         lines.append("        for (int y = 0; y < plane_height; ++y) {")
         for plane in group:
             lines.append(
-                f"            const uint8_t *{row('source', plane)} = "
-                f"src[{plane}] + (ptrdiff_t)y * src_stride[{plane}];"
+                "            "
+                + _row_pointer(
+                    depth, row("source", plane), "src", "src_stride", plane
+                )
             )
             lines.append(
-                f"            uint8_t *{row('destination', plane)} = "
-                f"dst[{plane}] + (ptrdiff_t)y * dst_stride[{plane}];"
+                "            "
+                + _row_pointer(
+                    depth, row("destination", plane), "dst", "dst_stride", plane
+                )
             )
         lines.append("            for (int x = 0; x < plane_width; ++x) {")
         for channel in channels:
             sample = _sample_index(layout, channel)
             source = row("source", layout.plane(channel))  # type: ignore[arg-type]
             lines.append(
-                f"                uint8_t c{channel} = {source}[{sample}];"
+                f"                {sample_type} c{channel} = {source}[{sample}];"
             )
         for index, operation in enumerate(stages):
             active = tuple(
@@ -445,7 +551,7 @@ def _plane_walk(layout: PixelLayout, stages: list[Operation]) -> list[str]:
             lines.append("")
             lines.append(f"                /* stage {index} */")
             lines.extend(
-                _stage_body(index, operation, active, "                ")
+                _stage_body(index, operation, depth, active, "                ")
             )
         lines.append("")
         for channel in stored:
@@ -472,12 +578,16 @@ def generate_c(
     body = passes.ir.operations[1:-1]
     stages = [body[index] for index in range(0, len(body), 2)]
     # The vector type is only for the mixer; both it and the chroma rotation
-    # saturate their int32 results to bytes.
+    # saturate their int32 results to a sample.
     uses_mixer = any(_is_mixer(operation) for operation in stages)
     needs_saturation = uses_mixer or any(
         _is_chroma_rotate(operation) for operation in stages
     )
     uses_expression = any(_is_expr(operation) for operation in stages)
+    layout = get_layout(ir.layout)
+    depth = layout.depth
+    sample = _sample_type(depth)
+    maximum = layout.max_value
 
     lines = [
         "/* Generated by lavfi-cc. This file is deterministic for its input IR. */",
@@ -486,31 +596,48 @@ def generate_c(
         '#include "kernel_abi.h"',
         "",
     ]
+    if layout.high_depth:
+        # Samples are stored little-endian and loaded as native words, so this
+        # translation unit is only correct where the two agree.
+        lines.extend(
+            [
+                "#if defined(__BYTE_ORDER__) && "
+                "__BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__",
+                f'#error "{layout.name} kernels load native 16-bit samples and '
+                'need a little-endian host"',
+                "#endif",
+                "",
+            ]
+        )
     if uses_expression:
         # lrintf and fmaf. Both are exactly specified by IEEE-754, unlike the
         # pow and sin this compiler refuses to depend on.
         lines.extend(["#include <math.h>", ""])
-        lines.extend([*C_HELPERS, ""])
+        lines.extend([*c_helpers(depth), ""])
     if uses_mixer:
+        element = _mixer_element_type(depth)
         lines.extend(
-            ["typedef int16_t lavfi_i16x4 __attribute__((ext_vector_type(4)));", ""]
+            [
+                f"typedef {element} {_mixer_vector_type(depth)} "
+                "__attribute__((ext_vector_type(4)));",
+                "",
+            ]
         )
     if needs_saturation:
         lines.extend(
             [
-                "static inline uint8_t lavfi_saturate_i32(int32_t value)",
+                f"static inline {sample} lavfi_saturate_i32(int32_t value)",
                 "{",
                 "    if (value < 0)",
                 "        return 0;",
-                "    if (value > 255)",
-                "        return 255;",
-                "    return (uint8_t)value;",
+                f"    if (value > {maximum})",
+                f"        return {maximum};",
+                f"    return ({sample})value;",
                 "}",
                 "",
             ]
         )
-    layout = get_layout(ir.layout)
-    lines.extend(_stage_declarations(stages))
+    lines.extend(_stage_declarations(stages, depth))
     lines.extend(
         [
             _layout_comment(layout),

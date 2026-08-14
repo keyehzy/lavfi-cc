@@ -116,11 +116,27 @@ class EligibilityTests(unittest.TestCase):
         self.assert_code(graph("negate=enable='gte(t,1)'"), "runtime_option")
         self.assert_code(graph("colorlevels=rimin=-0.1"), "frame_global_extrema")
         self.assert_code(graph("colorlevels=rimin=0.1:rimax=0.101"), "degenerate_levels")
-        self.assert_code(
-            graph("colorlevels=rimin=1:rimax=0:romin=.9:romax=.1"),
-            "target_sensitive_levels",
-        )
         self.assert_code(graph("colorchannelmixer=pc=lum"), "unsupported_preserve")
+
+    def test_contraction_sensitive_levels_states_the_host_instead_of_refusing(
+        self,
+    ) -> None:
+        # This option set is one whose contracted and separate evaluations
+        # disagree; it used to be refused outright. Refusing scaled badly to
+        # higher depths -- at sixteen bits almost every option set disagrees
+        # somewhere in a 65536-value domain -- so the operation names the
+        # contraction the way colorcontrast does, and the plan hash carries it.
+        analysis = analyze_filtergraph(
+            graph("colorlevels=rimin=1:rimax=0:romin=.9:romax=.1")
+        )
+        self.assertTrue(analysis.eligible, analysis.diagnostics)
+        levels = analysis.ir.operations[1]
+        self.assertIn(levels.parameters["contraction"], {"fused", "separate"})
+        # An option set the two evaluations agree on says nothing at all, so it
+        # keeps one plan hash on every host.
+        agreeing = analyze_filtergraph(graph("colorlevels=rimin=0.05:gimax=0.9"))
+        self.assertTrue(agreeing.eligible, agreeing.diagnostics)
+        self.assertNotIn("contraction", agreeing.ir.operations[1].parameters)
 
     def test_rejects_nondeterministic_or_unsupported_lut_expression(self) -> None:
         self.assert_code(graph("lutrgb=r=random(0)"), "unsupported_expression")

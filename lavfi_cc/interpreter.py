@@ -1,4 +1,16 @@
-"""Deliberately simple scalar interpreter for the RGBA8 pixel IR."""
+"""Deliberately simple scalar interpreter for the pixel IR.
+
+**The domain a kernel is defined over.** A sample of a format with depth ``d``
+means a value in ``[0, 2^d - 1]``, and that is the domain this interpreter and
+the generated kernels are bit-exact over.  Outside it the accepted filters do
+not agree with each other about what happens, so no compiler could match all of
+them: ``vf_lut.c`` carries a full 65536-entry table and answers, ``vf_hue.c``
+clamps the sample first, and ``vf_curves.c`` and ``vf_colorchannelmixer.c``
+index a ``1 << d``-entry table with the raw sample and read past its end.  Every
+table here is therefore sized to the format's own domain and indexed through a
+clamp, which is defined and safe for a malformed frame without pretending to
+reproduce an upstream answer that does not exist.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +21,16 @@ import struct
 from typing import Any
 
 from .expr import ExprError, ExprProgram
-from .ir import IR_VERSION, Operation, PixelIR
+from .ir import (
+    IR_VERSION,
+    Operation,
+    PixelIR,
+    load_operation,
+    lut_operation,
+    pixel_format_for,
+    quantize_operation,
+    store_operation,
+)
 from .layouts import LAYOUTS, PixelLayout, get_layout
 
 
@@ -18,13 +39,26 @@ class InterpreterError(ValueError):
 
 
 Pixel = tuple[int, int, int, int]
+
+#: Quantization modes each depth's ``quantize`` operation accepts.  The names
+#: below eight bits' ``lookup_u8`` and ``saturate_i32_to_u8`` say the width they
+#: produce; ``truncate_toward_zero_then_saturate`` clamps to whatever the
+#: operation's own depth is, so it needs no suffix.
 _SUPPORTED_QUANTIZERS = {
-    "lookup_u8",
-    "truncate_toward_zero_then_saturate",
-    "saturate_i32_to_u8",
-    # An expression program carries a quantizer per channel, because its
-    # channels do not have to agree on one.
-    "expression_outputs",
+    8: {
+        "lookup_u8",
+        "truncate_toward_zero_then_saturate",
+        "saturate_i32_to_u8",
+        # An expression program carries a quantizer per channel, because its
+        # channels do not have to agree on one.
+        "expression_outputs",
+    },
+    16: {
+        "lookup_u16",
+        "truncate_toward_zero_then_saturate",
+        "saturate_i32_to_u16",
+        "expression_outputs",
+    },
 }
 
 
@@ -34,8 +68,8 @@ def _f32(value: float) -> float:
     return struct.unpack("=f", struct.pack("=f", value))[0]
 
 
-def _u8(value: int) -> int:
-    return max(0, min(255, value))
+def _saturate(value: int, maximum: int) -> int:
+    return max(0, min(maximum, value))
 
 
 def _sequence(value: Any, length: int, description: str) -> tuple[Any, ...]:
@@ -58,6 +92,17 @@ WHOLE_PIXEL_GROUPS = ((0, 1, 2, 3),)
 CHROMA_PAIR_GROUPS = ((0,), (1, 2), (3,))
 
 
+def _lookup(table: tuple[int, ...], value: int) -> int:
+    """Index a table sized to the format's domain, clamping a stray sample.
+
+    A well-formed sample is always in range and the clamp never fires; see the
+    note on the kernel's domain at the top of this module for why it is here
+    rather than an out-of-bounds read.
+    """
+
+    return table[value if value < len(table) else len(table) - 1]
+
+
 @dataclass(frozen=True)
 class _LutStage:
     tables: tuple[tuple[int, ...], ...]
@@ -67,7 +112,7 @@ class _LutStage:
 
     def evaluate(self, pixel: Pixel) -> Pixel:
         return tuple(  # type: ignore[return-value]
-            self.tables[channel][pixel[channel]] for channel in range(4)
+            _lookup(self.tables[channel], pixel[channel]) for channel in range(4)
         )
 
 
@@ -76,32 +121,35 @@ class _LevelsStage:
     coefficients: tuple[float, ...]
     input_offsets: tuple[int, ...]
     output_offsets: tuple[int, ...]
+    maximum: int
+    #: Whether the host contracts the one multiply-add into a single rounding.
+    #: True unless the operation says otherwise, which it only does when the
+    #: two evaluations disagree somewhere in the format's domain.
+    fused: bool = True
 
     #: The matrix is diagonal, so each channel depends only on itself.
     channel_groups = INDEPENDENT_GROUPS
 
     def evaluate(self, pixel: Pixel) -> Pixel:
-        # The pinned Apple-Clang FFmpeg oracle contracts this expression to one
-        # binary32 FMLA. Both inputs have few enough significant bits for
-        # binary64 to hold the exact intermediate before the single explicit
-        # binary32 rounding below.
-        return tuple(  # type: ignore[return-value]
-            _u8(
-                int(
-                    _f32(
-                        (pixel[channel] - self.input_offsets[channel])
-                        * self.coefficients[channel]
-                        + self.output_offsets[channel]
-                    )
-                )
-            )
-            for channel in range(4)
-        )
+        # Contracted, the whole expression rounds once. Both inputs have few
+        # enough significant bits for binary64 to hold the exact intermediate
+        # before that single explicit binary32 rounding.
+        output = []
+        for channel in range(4):
+            product = (pixel[channel] - self.input_offsets[channel]) * self.coefficients[
+                channel
+            ]
+            if not self.fused:
+                product = _f32(product)
+            value = _f32(product + self.output_offsets[channel])
+            output.append(_saturate(int(value), self.maximum))
+        return tuple(output)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
 class _MixerStage:
     tables: tuple[tuple[tuple[int, ...], ...], ...]
+    maximum: int
 
     #: Every output channel sums terms from all four inputs.
     channel_groups = WHOLE_PIXEL_GROUPS
@@ -111,10 +159,10 @@ class _MixerStage:
         for output_channel in range(4):
             terms = self.tables[output_channel]
             value = sum(
-                terms[input_channel][pixel[input_channel]]
+                _lookup(terms[input_channel], pixel[input_channel])
                 for input_channel in range(4)
             )
-            output.append(_u8(value))
+            output.append(_saturate(value, self.maximum))
         return tuple(output)  # type: ignore[return-value]
 
 
@@ -130,17 +178,30 @@ class _ChromaRotateStage:
 
     cosine: int
     sine: int
+    #: Depth of the chroma samples: 8 for ``apply_lut``, 10 for ``apply_lut10``.
+    depth: int = 8
 
     #: Chroma is a 2D vector here, so the two channels rotate into each other.
     channel_groups = CHROMA_PAIR_GROUPS
 
     def evaluate(self, pixel: Pixel) -> Pixel:
-        u = pixel[1] - 128
-        v = pixel[2] - 128
-        # + (1 << 15) rounds the >> 16 to nearest; + (128 << 16) re-centres.
-        rotated_u = ((self.cosine * u) - (self.sine * v) + (1 << 15) + (128 << 16)) >> 16
-        rotated_v = ((self.sine * u) + (self.cosine * v) + (1 << 15) + (128 << 16)) >> 16
-        return (pixel[0], _u8(rotated_u), _u8(rotated_v), pixel[3])
+        maximum = (1 << self.depth) - 1
+        centre = 1 << (self.depth - 1)
+        # apply_lut10 clamps each sample into the depth before indexing its
+        # table, which apply_lut has no need to do because a byte is always in
+        # range. Reproducing the clamp is what makes the two paths one stage.
+        u = _saturate(pixel[1], maximum) - centre
+        v = _saturate(pixel[2], maximum) - centre
+        # + (1 << 15) rounds the >> 16 to nearest; + (centre << 16) re-centres.
+        rounding = (1 << 15) + (centre << 16)
+        rotated_u = ((self.cosine * u) - (self.sine * v) + rounding) >> 16
+        rotated_v = ((self.sine * u) + (self.cosine * v) + rounding) >> 16
+        return (
+            pixel[0],
+            _saturate(rotated_u, maximum),
+            _saturate(rotated_v, maximum),
+            pixel[3],
+        )
 
 
 @dataclass(frozen=True)
@@ -168,21 +229,34 @@ class _ExprStage:
 Stage = _LutStage | _LevelsStage | _MixerStage | _ChromaRotateStage | _ExprStage
 
 
-def _prepare_lut(operation: Operation) -> _LutStage:
-    if set(operation.parameters) != {"tables"}:
-        raise InterpreterError("lut8 accepts only the tables parameter")
-    tables_value = _sequence(operation.parameters.get("tables"), 4, "lut8 tables")
+def _prepare_lut(operation: Operation, depth: int) -> _LutStage:
+    name = lut_operation(depth)
+    expected = {"tables"} if depth == 8 else {"tables", "depth"}
+    if set(operation.parameters) != expected:
+        raise InterpreterError(
+            f"{name} accepts only the tables parameter"
+            if depth == 8
+            else f"{name} accepts only the tables and depth parameters"
+        )
+    if depth != 8 and operation.parameters["depth"] != depth:
+        raise InterpreterError(
+            f"{name} declares depth {operation.parameters['depth']!r}, but the "
+            f"layout stores {depth}-bit samples"
+        )
+    size = 1 << depth
+    maximum = size - 1
+    tables_value = _sequence(operation.parameters.get("tables"), 4, f"{name} tables")
     tables: list[tuple[int, ...]] = []
     for channel, table_value in enumerate(tables_value):
-        entries = _sequence(table_value, 256, f"lut8 channel {channel} table")
-        table = tuple(_integer(entry, "lut8 table entry") for entry in entries)
-        if any(not 0 <= entry <= 255 for entry in table):
-            raise InterpreterError("lut8 table entries must be in [0, 255]")
+        entries = _sequence(table_value, size, f"{name} channel {channel} table")
+        table = tuple(_integer(entry, f"{name} table entry") for entry in entries)
+        if any(not 0 <= entry <= maximum for entry in table):
+            raise InterpreterError(f"{name} table entries must be in [0, {maximum}]")
         tables.append(table)
     return _LutStage(tuple(tables))
 
 
-def _prepare_levels(operation: Operation) -> _LevelsStage:
+def _prepare_levels(operation: Operation, depth: int) -> _LevelsStage:
     parameters = operation.parameters
     expected_parameters = {
         "evaluation",
@@ -191,10 +265,28 @@ def _prepare_levels(operation: Operation) -> _LevelsStage:
         "input_max",
         "output_max",
     }
+    if depth != 8:
+        expected_parameters.add("depth")
+    # "contraction" is present only when the contracted and separate
+    # evaluations disagree somewhere, so its absence is itself a claim: this
+    # operation means the same bytes on every host.
+    contraction = parameters.get("contraction")
+    if contraction is not None:
+        if contraction not in {"fused", "separate"}:
+            raise InterpreterError(
+                f"unsupported levels contraction {contraction!r}"
+            )
+        expected_parameters.add("contraction")
     if set(parameters) != expected_parameters:
         raise InterpreterError(
             "levels_f32_fma parameters must be evaluation, coefficients, "
             "offsets, input_max, and output_max"
+            + (", and depth" if depth != 8 else "")
+        )
+    if depth != 8 and parameters["depth"] != depth:
+        raise InterpreterError(
+            f"levels_f32_fma declares depth {parameters['depth']!r}, but the "
+            f"layout stores {depth}-bit samples"
         )
     matrix = _sequence(parameters.get("coefficients"), 4, "levels coefficient matrix")
     coefficients: list[float] = []
@@ -231,11 +323,16 @@ def _prepare_levels(operation: Operation) -> _LevelsStage:
         _integer(value, "levels output maximum")
         for value in _sequence(parameters["output_max"], 4, "levels output maxima")
     )
+    # Upstream scales the option's [0, 1] endpoint by UINT8_MAX at one byte per
+    # sample and by UINT16_MAX at two, whatever the actual depth is, so a
+    # 10-bit endpoint runs to 65535 while the stored result still clips to
+    # 1023. That is a quirk of vf_colorlevels.c, reproduced rather than fixed.
+    endpoint_max = 255 if depth == 8 else 65535
     for channel in range(4):
         if input_max[channel] == input_offsets[channel]:
             raise InterpreterError("levels input endpoints must not be equal")
         if not all(
-            0 <= endpoint <= 255
+            0 <= endpoint <= endpoint_max
             for endpoint in (
                 input_offsets[channel],
                 input_max[channel],
@@ -243,17 +340,23 @@ def _prepare_levels(operation: Operation) -> _LevelsStage:
                 output_max[channel],
             )
         ):
-            raise InterpreterError("levels endpoints must be in [0, 255]")
+            raise InterpreterError(f"levels endpoints must be in [0, {endpoint_max}]")
         expected = _f32(
             (output_max[channel] - output_offsets[channel])
             / (input_max[channel] - input_offsets[channel])
         )
         if coefficients[channel] != expected:
             raise InterpreterError("levels coefficient does not match its endpoints")
-    return _LevelsStage(tuple(coefficients), tuple(input_offsets), tuple(output_offsets))
+    return _LevelsStage(
+        tuple(coefficients),
+        tuple(input_offsets),
+        tuple(output_offsets),
+        (1 << depth) - 1,
+        contraction != "separate",
+    )
 
 
-def _prepare_mixer(operation: Operation) -> _MixerStage:
+def _prepare_mixer(operation: Operation, depth: int) -> _MixerStage:
     parameters = operation.parameters
     evaluation = parameters.get("evaluation")
     folded = evaluation == "sum_i32_lut_terms"
@@ -262,6 +365,13 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
         if folded
         else {"evaluation", "coefficients", "offsets", "contribution_tables"}
     )
+    if depth != 8:
+        expected_parameters = expected_parameters | {"depth"}
+        if parameters.get("depth") != depth:
+            raise InterpreterError(
+                f"mixer declares depth {parameters.get('depth')!r}, but the "
+                f"layout stores {depth}-bit samples"
+            )
     if set(parameters) != expected_parameters:
         if folded:
             raise InterpreterError(
@@ -302,6 +412,9 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
                 values.append(coefficient)
             coefficients.append(tuple(values))
 
+    size = 1 << depth
+    # A term is at most twice the widest sample, either way round.
+    term_bound = 2 * (size - 1)
     rows = _sequence(parameters["contribution_tables"], 4, "mixer table rows")
     prepared_rows: list[tuple[tuple[int, ...], ...]] = []
     for output_channel, row_value in enumerate(rows):
@@ -310,20 +423,21 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
         for input_channel, table_value in enumerate(row):
             entries = _sequence(
                 table_value,
-                256,
+                size,
                 f"mixer table {output_channel},{input_channel}",
             )
             table = tuple(_integer(entry, "mixer table entry") for entry in entries)
             if folded:
-                if any(not -510 <= entry <= 510 for entry in table):
+                if any(not -term_bound <= entry <= term_bound for entry in table):
                     raise InterpreterError(
-                        "folded mixer contribution entries must be in [-510, 510]"
+                        "folded mixer contribution entries must be in "
+                        f"[-{term_bound}, {term_bound}]"
                     )
             else:
                 assert coefficients is not None
                 expected = tuple(
                     round(value * coefficients[output_channel][input_channel])
-                    for value in range(256)
+                    for value in range(size)
                 )
                 if table != expected:
                     raise InterpreterError(
@@ -331,7 +445,7 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
                     )
             tables.append(table)
         prepared_rows.append(tuple(tables))
-    return _MixerStage(tuple(prepared_rows))
+    return _MixerStage(tuple(prepared_rows), size - 1)
 
 
 #: Widest ``hue`` coefficient: ``lrint(1.0 * (1 << 16) * 10)``, the saturation
@@ -339,11 +453,18 @@ def _prepare_mixer(operation: Operation) -> _MixerStage:
 _CHROMA_COEFFICIENT_LIMIT = 10 * (1 << 16)
 
 
-def _prepare_chroma_rotate(operation: Operation) -> _ChromaRotateStage:
+def _prepare_chroma_rotate(operation: Operation, depth: int) -> _ChromaRotateStage:
     parameters = operation.parameters
-    if set(parameters) != {"cosine", "sine"}:
+    expected = {"cosine", "sine"} if depth == 8 else {"cosine", "sine", "depth"}
+    if set(parameters) != expected:
         raise InterpreterError(
             "chroma_rotate_i32 parameters must be cosine and sine"
+            + (" and depth" if depth != 8 else "")
+        )
+    if depth != 8 and parameters["depth"] != depth:
+        raise InterpreterError(
+            f"chroma_rotate_i32 declares depth {parameters['depth']!r}, but the "
+            f"layout stores {depth}-bit samples"
         )
     cosine = _integer(parameters["cosine"], "chroma rotation cosine")
     sine = _integer(parameters["sine"], "chroma rotation sine")
@@ -353,16 +474,22 @@ def _prepare_chroma_rotate(operation: Operation) -> _ChromaRotateStage:
                 "chroma rotation coefficients must be within "
                 f"+/-{_CHROMA_COEFFICIENT_LIMIT}"
             )
-    return _ChromaRotateStage(cosine, sine)
+    return _ChromaRotateStage(cosine, sine, depth)
 
 
-def _prepare_expr(operation: Operation) -> _ExprStage:
+def _prepare_expr(operation: Operation, depth: int) -> _ExprStage:
     if set(operation.parameters) != {"program"}:
         raise InterpreterError("expr_f32 accepts only the program parameter")
     try:
         program = ExprProgram.from_dict(operation.parameters["program"])
     except ExprError as error:
         raise InterpreterError(f"invalid expr_f32 program: {error}") from error
+    for channel, output in enumerate(program.outputs):
+        if output is not None and not output.quantize.endswith(f"_u{depth}"):
+            raise InterpreterError(
+                f"expr_f32 output {channel} quantizes to {output.quantize!r}, "
+                f"which is not the layout's {depth}-bit width"
+            )
     return _ExprStage(program)
 
 
@@ -371,48 +498,61 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
         raise InterpreterError(
             f"unsupported IR version {ir.ir_version}; expected {IR_VERSION}"
         )
-    if ir.pixel_format != "rgba8":
-        raise InterpreterError(f"unsupported pixel format {ir.pixel_format!r}")
     if ir.layout not in LAYOUTS:
         raise InterpreterError(f"unsupported pixel layout {ir.layout!r}")
+    depth = LAYOUTS[ir.layout].depth
+    if ir.pixel_format != pixel_format_for(depth):
+        raise InterpreterError(
+            f"pixel format {ir.pixel_format!r} does not describe the "
+            f"{depth}-bit samples of layout {ir.layout!r}"
+        )
+    load, store = load_operation(depth), store_operation(depth)
+    quantize_kind = quantize_operation(depth)
+    lut_kind = lut_operation(depth)
+    lookup_mode = "lookup_u8" if depth == 8 else "lookup_u16"
+    saturate_mode = "saturate_i32_to_u8" if depth == 8 else "saturate_i32_to_u16"
+    supported_modes = _SUPPORTED_QUANTIZERS[8 if depth == 8 else 16]
+
     if len(ir.operations) < 2:
         raise InterpreterError("IR must contain a load and a store")
-    if ir.operations[0].kind != "load_rgba8" or ir.operations[-1].kind != "store_rgba8":
-        raise InterpreterError("IR must begin with load_rgba8 and end with store_rgba8")
+    if ir.operations[0].kind != load or ir.operations[-1].kind != store:
+        raise InterpreterError(f"IR must begin with {load} and end with {store}")
     if ir.operations[0].parameters or ir.operations[-1].parameters:
-        raise InterpreterError("load_rgba8 and store_rgba8 do not accept parameters")
+        raise InterpreterError(f"{load} and {store} do not accept parameters")
 
     body = ir.operations[1:-1]
     if len(body) % 2:
-        raise InterpreterError("each transform must be followed by quantize_rgba8")
+        raise InterpreterError(f"each transform must be followed by {quantize_kind}")
     stages: list[Stage] = []
     for index in range(0, len(body), 2):
         transform = body[index]
         quantize = body[index + 1]
-        if quantize.kind != "quantize_rgba8":
+        if quantize.kind != quantize_kind:
             raise InterpreterError(
-                f"operation {index + 2} must be quantize_rgba8, got {quantize.kind!r}"
+                f"operation {index + 2} must be {quantize_kind}, got {quantize.kind!r}"
             )
         mode = quantize.parameters.get("mode")
-        if set(quantize.parameters) != {"mode"} or mode not in _SUPPORTED_QUANTIZERS:
+        if set(quantize.parameters) != {"mode"} or mode not in supported_modes:
             raise InterpreterError(f"unsupported quantization mode {mode!r}")
 
-        if transform.kind == "lut8":
-            if mode not in {"lookup_u8", "truncate_toward_zero_then_saturate"}:
-                raise InterpreterError(f"lut8 cannot use quantization mode {mode!r}")
-            stages.append(_prepare_lut(transform))
+        if transform.kind == lut_kind:
+            if mode not in {lookup_mode, "truncate_toward_zero_then_saturate"}:
+                raise InterpreterError(
+                    f"{lut_kind} cannot use quantization mode {mode!r}"
+                )
+            stages.append(_prepare_lut(transform, depth))
         elif transform.kind == "expr_f32":
             if mode != "expression_outputs":
                 raise InterpreterError(
                     f"expr_f32 cannot use quantization mode {mode!r}"
                 )
-            stages.append(_prepare_expr(transform))
+            stages.append(_prepare_expr(transform, depth))
         elif transform.kind == "chroma_rotate_i32":
-            if mode != "saturate_i32_to_u8":
+            if mode != saturate_mode:
                 raise InterpreterError(
                     f"chroma_rotate_i32 cannot use quantization mode {mode!r}"
                 )
-            stages.append(_prepare_chroma_rotate(transform))
+            stages.append(_prepare_chroma_rotate(transform, depth))
         elif transform.kind == "matrix4x4":
             evaluation = transform.parameters.get("evaluation")
             if evaluation == "levels_f32_fma":
@@ -420,16 +560,16 @@ def _prepare(ir: PixelIR) -> tuple[Stage, ...]:
                     raise InterpreterError(
                         f"levels_f32_fma cannot use quantization mode {mode!r}"
                     )
-                stages.append(_prepare_levels(transform))
+                stages.append(_prepare_levels(transform, depth))
             elif evaluation in {
                 "sum_i32_terms_rounded_ties_even",
                 "sum_i32_lut_terms",
             }:
-                if mode != "saturate_i32_to_u8":
+                if mode != saturate_mode:
                     raise InterpreterError(
                         f"mixer contribution tables cannot use quantization mode {mode!r}"
                     )
-                stages.append(_prepare_mixer(transform))
+                stages.append(_prepare_mixer(transform, depth))
             else:
                 raise InterpreterError(f"unsupported matrix evaluation {evaluation!r}")
         else:
@@ -468,11 +608,11 @@ def _check_sampling_groups(name: str, stages: list[Stage]) -> None:
                 )
 
 
-def _validate_pixel(pixel: tuple[int, ...] | list[int]) -> Pixel:
+def _validate_pixel(pixel: tuple[int, ...] | list[int], maximum: int) -> Pixel:
     values = _sequence(pixel, 4, "pixel")
     prepared = tuple(_integer(value, "pixel channel") for value in values)
-    if any(not 0 <= value <= 255 for value in prepared):
-        raise InterpreterError("pixel channels must be in [0, 255]")
+    if any(not 0 <= value <= maximum for value in prepared):
+        raise InterpreterError(f"pixel channels must be in [0, {maximum}]")
     return prepared  # type: ignore[return-value]
 
 
@@ -483,13 +623,15 @@ def _run_pixel(stages: tuple[Stage, ...], pixel: Pixel) -> Pixel:
 
 
 def interpret_pixel(ir: PixelIR, pixel: tuple[int, ...] | list[int]) -> Pixel:
-    """Interpret one RGBA8 pixel and return its four output channels."""
+    """Interpret one pixel and return its four output channels."""
 
-    return _run_pixel(_prepare(ir), _validate_pixel(pixel))
+    return _run_pixel(
+        _prepare(ir), _validate_pixel(pixel, get_layout(ir.layout).max_value)
+    )
 
 
 def validate_ir(ir: PixelIR) -> None:
-    """Validate that *ir* has the executable RGBA8 reference shape."""
+    """Validate that *ir* has the executable reference shape."""
 
     _prepare(ir)
 
@@ -562,6 +704,34 @@ def _plane_strides(
     )
 
 
+def _sample_reader(view: memoryview, sample_bytes: int) -> Any:
+    """Return a function reading one sample at a byte offset.
+
+    Above eight bits a sample is a little-endian pair, which is what every
+    layout in the table stores; see the module docstring on why the big-endian
+    members are not listed.
+    """
+
+    if sample_bytes == 1:
+        return lambda index: view[index]
+    return lambda index: view[index] | (view[index + 1] << 8)
+
+
+def _sample_writer(view: memoryview, sample_bytes: int) -> Any:
+    if sample_bytes == 1:
+
+        def write_byte(index: int, value: int) -> None:
+            view[index] = value
+
+        return write_byte
+
+    def write_word(index: int, value: int) -> None:
+        view[index] = value & 0xFF
+        view[index + 1] = value >> 8
+
+    return write_word
+
+
 def interpret_into(
     ir: PixelIR,
     source: Any,
@@ -630,17 +800,20 @@ def interpret_into(
 
     # Every plane shares the frame's resolution here, so one pixel is one
     # iteration and a stage may read all four channels of it.
-    step = layout.step
+    step = layout.step * layout.sample_bytes
+    read_sample = _sample_reader(source_view, layout.sample_bytes)
+    write_sample = _sample_writer(destination_view, layout.sample_bytes)
     stored = layout.stored_channels
     origins = [
         layout.plane_origin(plane, width, height)
         for plane in range(layout.plane_count)
     ]
-    # Per channel: the plane it lives in and its offset in a sample group.
+    # Per channel: the plane it lives in and the byte offset of its sample
+    # inside a group.
     reads = tuple(
         None
         if layout.plane(channel) is None
-        else (layout.plane(channel), layout.offset(channel))
+        else (layout.plane(channel), layout.offset(channel) * layout.sample_bytes)
         for channel in range(4)
     )
     for y in range(height):
@@ -657,17 +830,17 @@ def interpret_into(
             pixel: Pixel = tuple(  # type: ignore[assignment]
                 0
                 if reads[channel] is None
-                else source_view[
+                else read_sample(
                     source_rows[reads[channel][0]] + x * step + reads[channel][1]
-                ]
+                )
                 for channel in range(4)
             )
             output = _run_pixel(stages, pixel)
             for channel in stored:
                 plane, offset = reads[channel]  # type: ignore[misc]
-                destination_view[
-                    destination_rows[plane] + x * step + offset
-                ] = output[channel]
+                write_sample(
+                    destination_rows[plane] + x * step + offset, output[channel]
+                )
 
 
 def _interpret_groups(
@@ -691,9 +864,14 @@ def _interpret_groups(
     them.
     """
 
+    read_sample = _sample_reader(source_view, layout.sample_bytes)
+    write_sample = _sample_writer(destination_view, layout.sample_bytes)
     for channels in layout.sampling_groups:
         planes = tuple(layout.plane(channel) for channel in channels)
-        offsets = tuple(layout.offset(channel) for channel in channels)
+        offsets = tuple(
+            layout.offset(channel) * layout.sample_bytes  # type: ignore[operator]
+            for channel in channels
+        )
         # Every channel of a group shares one resolution, by construction.
         group_width = layout.plane_width(planes[0], width)  # type: ignore[arg-type]
         group_height = layout.plane_height(planes[0], height)  # type: ignore[arg-type]
@@ -712,24 +890,25 @@ def _interpret_groups(
             )
             for x in range(group_width):
                 indices = tuple(
-                    x * layout.step + offset  # type: ignore[operator]
+                    x * layout.step * layout.sample_bytes + offset
                     for offset in offsets
                 )
                 loaded = [0, 0, 0, 0]
                 for position, channel in enumerate(channels):
-                    loaded[channel] = source_view[
+                    loaded[channel] = read_sample(
                         source_rows[position] + indices[position]
-                    ]
+                    )
                 pixel: Pixel = tuple(loaded)  # type: ignore[assignment]
                 output = _run_pixel(stages, pixel)
                 for position, channel in enumerate(channels):
-                    destination_view[
-                        destination_rows[position] + indices[position]
-                    ] = output[channel]
+                    write_sample(
+                        destination_rows[position] + indices[position],
+                        output[channel],
+                    )
 
 
 def interpret_rgba8(ir: PixelIR, source: Any, width: int, height: int) -> bytes:
-    """Interpret one tightly packed RGBA8 frame."""
+    """Interpret one tightly packed frame in the IR's own layout."""
 
     if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
         raise InterpreterError("width must be a positive integer")

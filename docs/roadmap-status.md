@@ -6,8 +6,9 @@ specific finding that determines how much work is left.
 
 All six have now landed. Item 3 was the last one still half-open; its RGB half
 has since landed too, together with the cross-channel float IR operation that
-was blocking it. Item 4 has since been extended once more, with the `yuva`
-layouts that were the first entry on the recommended-order list below.
+was blocking it. Item 4 was then extended with the `yuva` layouts, and item 2
+has now been extended from fourteen eight-bit layouts to 47 layouts spanning
+eight through sixteen bits per component.
 
 The framing changed twice during this work. Both changes are stated first,
 because each one reorders the roadmap.
@@ -63,12 +64,13 @@ baseline x86-64. For `colorcontrast` that is 147 bytes out of the 50,331,648
 its complete `256^3` RGB domain covers: about three pixels in a million, or
 roughly eighteen bytes in a 1080p frame.
 
-Until now this compiler could treat contraction as a rounding it does not
-decide, and refuse anything that depends on it — which is what `colorlevels`'s
-`target_sensitive_levels` does. That works when the dependence is rare. It does
-not work here: essentially every useful `colorcontrast` option set is
-contraction-sensitive, so refusing them all would be the same as not
-implementing the filter.
+Initially this compiler treated contraction as a rounding it did not decide
+and refused anything that depended on it; `colorlevels` used that policy when
+only eight-bit formats existed. It does not work for `colorcontrast`:
+essentially every useful option set is contraction-sensitive, so refusing them
+all would be the same as not implementing the filter. High depth later made the
+same policy untenable for `colorlevels` too: ordinary fourteen- and sixteen-bit
+option sets frequently differ at some sample.
 
 So the IR states the contraction instead of leaving it to whichever compiler
 sees the generated C. The expression operation has an explicit `fma`, the
@@ -91,8 +93,10 @@ served from a cache or a bundle to the other. Nothing extra enforces that; it
 falls out of hashing the IR.
 
 The cost is contained. Only arithmetic that can actually tell the difference
-pays it: `colorbalance` cannot, and `curves` usually cannot, so both keep one
-plan hash everywhere. See those items below.
+pays it: `colorlevels` and `curves` compare both evaluations across the whole
+format domain and consult the host only when an output differs;
+`colorcontrast` always states the host; and `colorbalance` cannot differ. See
+those items below.
 
 ## 1. Automatically discover fusible islands — done
 
@@ -114,24 +118,37 @@ What this added over the explicit-boundary path:
 A run is only fused when its format is one the backend implements natively.
 Everything else is reported and refused — see the correctness note above.
 
-## 2. Widen pixel-format reach — done for 8-bit RGB and planar YUV, deferred above that
+## 2. Widen pixel-format reach — done for 47 formats at 8–16 bits
 
-Supported today: packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, `bgr24`,
-planar RGB `gbrp`, `gbrap`, and planar YUV `yuv444p`, `yuv422p`, `yuv420p`,
-`yuva444p`, `yuva422p`, `yuva420p` (item 4).
+Supported today: fourteen eight-bit formats, 29 deep planar formats, and four
+packed 16-bit formats. In full, those are:
 
-The byte offsets and the planar plane order in `lavfi_cc/layouts.py` were taken
-from the pinned binary rather than from format descriptors, by converting one
-known `0x11223344` pixel into each format and reading the bytes back.
+- packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24`, plus
+  `rgb48le`, `rgba64le`, `bgr48le`, and `bgra64le`;
+- planar `gbrp` and `gbrap`, plus `gbrp` at 9, 10, 12, 14, and 16 bits and the
+  alpha-carrying 10-, 12-, and 16-bit members upstream's accepted filters
+  advertise; and
+- planar `yuv444p`, `yuv422p`, and `yuv420p` at 8, 9, 10, 12, 14, and 16 bits,
+  plus their alpha-carrying 8-, 10-, and 16-bit members where an accepted
+  filter advertises them.
 
-The reduction that makes this cheap: the operations are layout-independent, so
-only the load and store ends change. Both families share one addressing scheme
-— a channel lives in some plane at some offset, with samples `step` bytes apart
-— so packed is simply the one-plane case. An alpha-less layout loads `a = 0`
-and stores only three components, which is exactly what upstream does: the
-`colorchannelmixer` templates omit every alpha term when `have_alpha` is unset,
-and the other accepted filters treat channels independently, so an alpha lane
-that is never stored cannot affect the stored ones.
+That is 20 RGB layouts and 27 YUV layouts. The exact names and per-filter
+format matrix are in [`supported-filters.md`](supported-filters.md).
+
+The packed offsets and planar plane order in `lavfi_cc/layouts.py` were taken
+from the pinned binary rather than inferred from format descriptors, by
+converting known component values into each family and reading the samples
+back.
+
+The reduction that keeps the layout count manageable is that operations remain
+layout-independent: only the load and store ends change. Both families and
+both sample widths share one addressing scheme — a channel lives in some plane
+at a sample offset, consecutive groups are `step` samples apart, and a sample
+is one byte through eight bits and two above. Packed is simply the one-plane
+case. An alpha-less layout loads `a = 0` and stores only three components,
+which is exactly what upstream does: the `colorchannelmixer` templates omit
+every alpha term when `have_alpha` is unset, and the other accepted filters
+cannot let an unstored alpha lane affect a stored component.
 
 **Kernel ABI 2** replaced the single plane and stride with per-plane arrays
 shaped like `AVFrame`'s `data[]` and `linesize[]`. Packed kernels use index 0
@@ -144,32 +161,58 @@ Three format-dependent constraints were found and are enforced:
   otherwise FFmpeg converts in the middle of the run and one kernel is no longer
   equivalent to the filters it replaced. `colorlevels` and `colorchannelmixer`
   accept the `0rgb`/`rgb0` family that `negate` and `lutrgb` do not, so that
-  family is outside the common subset.
+  family is outside the common subset. Depth narrows the overlap again:
+  `eq` advertises no deep format, `hue` advertises only ten-bit deep formats,
+  and `lutrgb` omits the packed deep BGR orders.
 - `negate=components=…a` on an alpha-less format is a hard configuration
   failure upstream, not a silent no-op, so the compiler rejects it too.
-- `negate_alpha` sets a *plane* mask that only packed RGB ignores. On `gbrap`
-  it really does negate alpha, so the same option means different things in
-  different layouts. The compiler accepts it where it provably has no alpha
-  effect and rejects it on `gbrap`, pointing at `components=r+g+b+a` instead.
-  Item 4 made the lowering layout-aware, so honouring it on `gbrap` is now a
-  small change; it is still refused because refusing it is not wrong and
-  `components=r+g+b+a` already states the intent. The `yuva` layouts landed on
-  the same side of this rule for the same reason — what decides it upstream is
-  `is_packed`, not the colour family.
+- `negate_alpha` sets a *plane* mask that only packed RGB ignores. On a `gbrap`
+  or `yuva` layout it really does negate alpha, so the same option means
+  different things in different layouts. The compiler accepts it where it
+  provably has no alpha effect and rejects it on every alpha-carrying planar
+  layout, pointing at an explicit component mask instead. Item 4 made the
+  lowering layout-aware, so honouring it is now a small change; it is still
+  refused because refusing it is not wrong and an explicit mask already states
+  the intent: `components=r+g+b+a` for planar RGB and
+  `components=y+u+v+a` for planar YUV. What decides the legacy option upstream
+  is `is_packed`, not the colour family.
 
-**Deferred:** the 9–16-bit formats, which need 65536-entry tables and a
-re-derivation of every quantization rule at that depth. That framing is now
-half out of date: item 3's `expr_f32` filters compute rather than tabulate, so
-at higher depth they need a wider load and a wider quantizer instead of a wider
-table. The tabulated filters are still the expensive ones.
+### What depth changed
+
+Every deep sample is a little-endian 16-bit word, but its legal domain is the
+format's own `[0, 2^depth - 1]`. The IR kept all eight-bit spellings unchanged,
+so existing plan hashes did not move; a deep plan uses the parallel
+`load_rgba16`, `lut16`, `quantize_rgba16`, and `store_rgba16` operations and
+records its actual depth. Generated source fails at compile time on a
+big-endian host rather than reading an `le` format as a native word.
+
+Tables are sized to the format domain rather than unconditionally to 65536
+entries. A 10-bit LUT therefore has 1024 entries. The generated code clamps a
+raw 16-bit sample before indexing a 9-, 10-, 12-, or 14-bit table; at eight and
+sixteen bits the table already covers every value the storage type can hold and
+the clamp disappears. This makes malformed input safe without claiming to
+reproduce an upstream result where some accepted filters themselves read past
+the end of their tables.
+
+The arithmetic was re-derived rather than mechanically widened. The important
+differences are recorded in `supported-filters.md`: `lutyuv` shifts its limited
+range by `depth - 8`; deep planar `lutrgb` uses `255 << (depth - 8)` rather than
+the format maximum; `colorlevels` scales option endpoints by `UINT16_MAX` for
+every two-byte format; `hue` scales luma by the sample count and rotates chroma
+about the depth's own midpoint; and every float expression quantizes to that
+format's maximum. Contribution sums widen to `int32_t` above eight bits.
+
+This is checked directly in `tests/test_high_depth.py`, while
+`tests/test_layouts.py` runs the pinned FFmpeg oracle, interpreter, native
+kernel, and patched-filter paths over every one of the 47 layouts.
 
 ## 3. More pointwise filters — done, both halves
 
 `lutyuv`, `eq`, and `hue` are implemented and bit-exact against the pinned
-oracle in all three accepted YUV layouts. `colorbalance`, `colorcontrast`, and
-`curves` are implemented and bit-exact in all eight accepted RGB layouts. The
-RGB half needed the cross-channel float IR operation the roadmap predicted —
-though not for the filter the roadmap predicted; see below.
+oracle in every accepted YUV layout each one advertises. `colorbalance`,
+`colorcontrast`, and `curves` are implemented and bit-exact in all 20 accepted
+RGB layouts. The RGB half needed the cross-channel float IR operation the
+roadmap predicted — though not for the filter the roadmap predicted; see below.
 
 ### `lutyuv` is `lutrgb` with a different range, and the range is the whole point
 
@@ -228,11 +271,11 @@ channel groups it reads across, and `validate_ir` requires each stage group to
 fit inside one sampling group. A colour matrix is still refused on `yuv420p`,
 for the original reason; a chroma rotation is not.
 
-Upstream materializes the rotation as two 64 KiB tables indexed by the `(u, v)`
-pair. The arithmetic behind them is a handful of int32 operations that cannot
-overflow at these magnitudes — saturation is bounded at 10, so the coefficients
-fit in 16.16 with room to spare — so the kernel evaluates it inline instead:
-same bytes, 128 KiB less generated C.
+At eight bits upstream materializes the rotation as two 64 KiB tables indexed
+by the `(u, v)` pair; the ten-bit path grows them with the domain. The
+arithmetic behind them is a handful of int32 operations that cannot overflow
+at these magnitudes — saturation is bounded at 10, so the coefficients fit in
+16.16 with room to spare — so the kernel evaluates it inline instead.
 
 Luma is a separate matter: upstream copies the plane when brightness is zero
 and applies `lut_l` otherwise, and `lut_l` is the identity at zero brightness,
@@ -264,12 +307,15 @@ and every one was byte-identical to the oracle.
 
 ### What is checked
 
-`tests/test_layouts.py` runs sixteen YUV chains across all three layouts
-through the interpreter, the compiled kernel, and patched FFmpeg at
-`-filter_threads 4`. `tests/test_yuv_filters.py` pins the reasoning: which
-upstream path each option set selects, which spellings are refused, and the
-sampling-group rule including IR built by hand to prove it cannot be dodged.
-The ASan/UBSan gate gained a third case for the two-planes-in-one-loop shape.
+`tests/test_layouts.py` runs a format-filtered matrix of 339 YUV
+layout-and-chain combinations across all 27 YUV layouts through the interpreter
+and pinned oracle, then checks a compiled kernel and patched FFmpeg for every
+layout at `-filter_threads 4`. `tests/test_yuv_filters.py` pins the reasoning:
+which upstream path each option set selects, which spellings are refused, and
+the sampling-group rule including IR built by hand to prove it cannot be
+dodged. The sanitizer gate includes both a deep full-width `yuva` walk and a
+ten-bit subsampled one whose random 16-bit storage values exercise the table
+index clamp.
 
 Checked once by hand, not automated: `eq` against the oracle over 120 random
 option sets, and `hue` over its complete `256x256` chroma domain — every
@@ -283,19 +329,20 @@ found by.
 The new operation in `lavfi_cc/expr.py` is a single-assignment list of float32
 instructions — `channel`, `const`, the four arithmetic operations, `min`,
 `max`, `neg`, and `fma` — plus one optional output per channel with its own
-quantizer. A channel with no output keeps the byte it arrived with, which is
-what upstream does with alpha in all three filters.
+depth-specific quantizer. A channel with no output keeps the sample it arrived
+with, which is what upstream does with alpha in all three filters.
 
 Everything about it is aimed at one property: that it says exactly which
 roundings happen, in exactly which order. Every instruction rounds once.
-Reassociating `(a + b) + c` changes bytes, so a lowering transcribes upstream's
-expression rather than simplifying it. `min` and `max` are FFmpeg's `FFMIN` and
-`FFMAX` verbatim — ternaries on `>`, not `fminf`/`fmaxf`, which return the
-other operand when given two zeros of opposite sign. The two quantizers are
-`av_clip_uint8` of an `lrintf` and of a truncating conversion; both clamp in
-float first, which is the same mapping for every input C defines and is defined
-for the ones it is not. And `fma` is there for the reason stated at the top of
-this document.
+Reassociating `(a + b) + c` can change stored samples, so a lowering
+transcribes upstream's expression rather than simplifying it. `min` and `max`
+are FFmpeg's `FFMIN` and `FFMAX` verbatim — ternaries on `>`, not
+`fminf`/`fmaxf`, which return the
+other operand when given two zeros of opposite sign. The quantizers use either
+`lrintf` or a truncating conversion and saturate to the format's depth; both
+clamp in float first, which is the same mapping for every input C defines and
+is defined for the ones it is not. And `fma` is there for the reason stated at
+the top of this document.
 
 The interpreter and the C generator sit next to each other in that file,
 because the only thing that makes them correct is that they agree instruction
@@ -356,8 +403,9 @@ The roadmap listed `curves` with the other two. That was wrong, and it is worth
 saying why, because the mistake was in the wrong place.
 
 `curves`' slice functions are `dst[x + r] = graph[R][src[x + r]]` and nothing
-else: one 256-entry table per colour channel, alpha copied. It is
-channel-independent, and it lowers to the same `lut8` `lutrgb` lowers to.
+else: one `1 << depth`-entry table per colour channel, alpha copied. It is
+channel-independent, and it lowers to the same depth-sized LUT `lutrgb` lowers
+to.
 Everything difficult about it happens once, in `config_input`, where key points
 become a curve — a natural cubic spline or PCHIP, both in `double`, with a
 tridiagonal solve, edge-case derivatives, and a master curve composed on top of
@@ -384,9 +432,10 @@ which is the point.
 
 ### What the RGB half is checked against
 
-In the suite: `tests/test_layouts.py` now runs ten RGB chains across all eight
-RGB layouts through the interpreter, the compiled kernel, and patched FFmpeg at
-`-filter_threads 4`. `tests/test_rgb_filters.py` pins the reasoning — the
+In the suite: `tests/test_layouts.py` now runs a format-filtered matrix of 230
+RGB layout-and-chain combinations across all 20 RGB layouts through the
+interpreter and pinned oracle, then checks a compiled kernel and patched FFmpeg
+for every layout at `-filter_threads 4`. `tests/test_rgb_filters.py` pins the reasoning — the
 expression IR's validation and evaluation rules, the sampling-group refusal
 including IR built by hand, which option spellings are refused and why, that
 `colorbalance` has one plan hash on both kinds of host and `colorcontrast` two,
@@ -415,7 +464,7 @@ binaries in `.build/` are GPL rather than LGPL as a result; they are local
 artifacts and are not distributed. `lutyuv` and `hue` are LGPL and were present
 all along.
 
-## 4. Avoid boundary conversion — done for the six planar YUV formats
+## 4. Avoid boundary conversion — done for 27 planar YUV formats
 
 The roadmap offered two routes: fuse the format conversion into the island
 boundary, or introduce a YUV IR. The first should not be attempted. Fusing the
@@ -488,13 +537,14 @@ two jobs would write the same chroma sample.
 
 ### What this is checked against
 
-In the suite: byte-exact against the pinned `.build/ffmpeg-macos` oracle through
-the interpreter, the compiled kernel, and patched FFmpeg, for every accepted
-layout. `tests/test_layouts.py` runs at `17x5` and `21x7`, odd in both
-dimensions so the `AV_CEIL_RSHIFT` rounding is exercised, and the end-to-end
-case passes `-filter_threads 4` so the slice alignment is too. The sanitizer
-gate builds and runs a `yuv420p` kernel alongside the packed one, with each
-plane's geometry passed to the harness rather than duplicated in C.
+In the suite: byte-exact against the pinned oracle through the interpreter, the
+compiled kernel, and patched FFmpeg, for every accepted layout.
+`tests/test_layouts.py` runs at `17x5` and `21x7`, odd in both dimensions so the
+`AV_CEIL_RSHIFT` rounding is exercised, and the end-to-end case passes
+`-filter_threads 4` so the slice alignment is too. The sanitizer gate covers
+eight-bit and deep packed, planar, subsampled, and full-resolution-alpha kernel
+shapes, with each plane's geometry passed to the harness rather than duplicated
+in C.
 
 Checked once by hand, not automated: a sweep over `1x1`, `2x3`, `3x2`, `17x9`,
 `64x33`, `65x64`, and `127x71` at one, three, and eight filter threads, which
@@ -584,8 +634,9 @@ Checked once by hand, not automated:
   frame: no mismatches and no refusals.
 
 **Deferred:** the `yuvj` full-range family and the remaining ratios `yuv411p`,
-`yuv410p`, and `yuv440p`. Each is a table entry rather than a design question,
-and none of them appears in the corpus.
+`yuv410p`, `yuv440p`, and `yuv440p10le`. Each is a table entry rather than a
+design question, and only `yuv410p` appears in the corpus, as a deliberate
+unsupported-format case.
 
 ## 5. Analysis-only scanner — done
 
@@ -595,9 +646,12 @@ compiles or runs anything. A lenient parser records per-filter option problems
 instead of failing the graph, so a scan still explains what blocked an island.
 
 The corpus in `tests/corpus/filtergraphs.txt` grew from 40 graphs to 45 in item
-4, to 58 in item 3's YUV half, to 69 in its RGB half, and to 77 with `yuva` —
-five grading chains on video that carries an alpha plane, and three graphs
-where the alpha plane itself decides the refusal. The YUV additions are
+4, to 58 in item 3's YUV half, to 69 in its RGB half, to 77 with `yuva`, and to
+89 with high-depth formats. The last twelve are nine grading chains over
+10-, 12-, and 16-bit YUV/RGB plus three same-family format refusals whose answer
+depends on depth. The `yuva` addition was five grading chains on video that
+carries an alpha plane and three graphs where the alpha plane itself decides
+the refusal. The earlier YUV additions are
 seven grading chains of the shape people actually write — `eq` and `hue`
 together, sometimes with `lutyuv` or a `crop` between them — four graphs where
 an accepted filter is pinned to a format it does not advertise, and three where
@@ -612,18 +666,18 @@ filters that really are outside the subset rather than by ones waiting on it.
 
 ```console
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt
-  graphs scanned:            77
-  islands found:             75
-  islands fusible today:     60
-  frame passes eliminated:   54
-  frame passes blocked:      11
+  graphs scanned:            89
+  islands found:             88
+  islands fusible today:     70
+  frame passes eliminated:   73
+  frame passes blocked:      12
   blocked passes by working format:
-    negotiated   9 passes across 14 islands
+    negotiated  10 passes across 17 islands
     yuv410p      2 passes across 1 island
 
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt --entry-format yuv420p
-  frame passes eliminated:   57
-  frame passes blocked:      5
+  frame passes eliminated:   76
+  frame passes blocked:      6
 ```
 
 Blockers are ranked by the frame passes they withhold rather than by how often
@@ -720,12 +774,20 @@ Measured on the *unchanged* 69-graph corpus the movement is 47 to 47: no gain,
 because that corpus contained no alpha-carrying YUV graph at all. As with the
 RGB half, the headline number measures runs removed, not formats supported.
 
+High depth adds twelve graphs to that 77-graph corpus. The nine grading chains
+account for all nineteen newly eliminated passes, taking the total from 54 to
+73; the three refusal graphs make the scanner state that `eq` is eight-bit
+only, `lutyuv` and `hue` do not overlap on deep `yuva`, and `lutrgb` omits the
+packed deep BGR orders. On the unchanged 77 graphs, widening the backend alone
+does not move the headline count because none of those graphs names a deep
+format. That is the same corpus lesson as the RGB and `yuva` additions: reach
+only becomes measurable after the sample contains it.
+
 Item 4 removed the format barrier and named the filter subset as the next
-binding constraint. Item 3 widened the subset on both sides, and `yuva` has now
-widened the format reach again. What binds now is the remaining formats: the
-high-depth families, which are the widest change left, and the flat table
-entries — `yuvj*`, `yuv411p`, `yuv410p`, `yuv440p` — none of which the corpus
-asks for.
+binding constraint. Item 3 widened the subset on both sides, then `yuva` and
+high depth widened format reach again. What binds now is the filter subset and
+the few flat format entries still missing — `yuvj*`, `yuv411p`, `yuv410p`,
+`yuv440p`, and `yuv440p10le` — none of which appears in a grading chain.
 
 ## 6. Build-time integration — done for the compiler, unchanged for the patch
 
@@ -760,29 +822,26 @@ silently ignored on rebuild.
 
 ## Recommended order from here
 
-1. **High-depth formats**: the widest change for the least corpus reach. Note
-   that `expr_f32` makes this cheaper than it was. The 9–16-bit paths of these
-   filters are the same expressions with a different `max`, so they need a
-   wider quantizer and a wider channel load rather than 65536-entry tables —
-   which is the opposite of the situation for `lutrgb` and `negate`.
-2. **More filters on the operation that now exists.** `vibrance`,
+1. **More filters on the operation that now exists.** `vibrance`,
    `colortemperature`, and `selectivecolor` are all pixel-local float
    expressions of the shape `expr_f32` already carries, and each is now a
    transcription rather than a design question. They are in the corpus as
    refusals, so their reach can be measured before any of them is written.
-3. **The remaining YUV table entries** — `yuvj*`, `yuv411p`, `yuv410p`,
-   `yuv440p` — if a real corpus ever asks for them. Each is a row in
+2. **The remaining YUV table entries** — `yuvj*`, `yuv411p`, `yuv410p`,
+   `yuv440p`, and `yuv440p10le` — if a real corpus ever asks for them. Each is a row in
    `layouts.py` plus an ABI identifier now that subsampling is general; only
    `yuv410p` appears in this corpus, and only as the "format the kernel cannot
    run" case. `yuvj*` is the one with a semantic question rather than a
    geometric one: it is full-range, which is what `lutyuv`'s `minval` and
    `maxval` are derived from, so its tables are not the limited-range ones.
 
-Four entries left this list by being done. Layout-aware lowering landed as
+Five entries left this list by being done. Layout-aware lowering landed as
 part of item 4, because `negate`'s component mask could not be expressed in YUV
 without it. `lutyuv`, `eq`, and `hue` landed as item 3's YUV half. The
 cross-channel float operation landed as `expr_f32`, with `colorbalance`,
 `colorcontrast`, and `curves` on top of it — and `curves`, which was expected
 to need it, turned out not to. `yuva*` landed as part of item 4, and was the
 one entry whose predicted shape was wrong: two sampling groups rather than
-three, because alpha is co-sited with luma.
+three, because alpha is co-sited with luma. High-depth support then widened the
+same load, store, table, quantizer, expression, interpreter, ABI, and FFmpeg
+paths across the 33 accepted deep layouts without changing the eight-bit IR.

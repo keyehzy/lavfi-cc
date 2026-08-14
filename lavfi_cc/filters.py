@@ -12,7 +12,14 @@ configuration failure in ``rgba``, and the reverse holds for
 ``components=r``.  The layout is ``None`` when the working format is still
 undecided, which happens only on the scanner's reporting path; a lowerer then
 checks what it can decide without a format and leaves the rest to the caller,
-which has already refused to fuse a run whose format it cannot name.
+which has already refused to fuse a run whose format it cannot name.  An
+undecided layout is lowered at eight bits, which is a reporting convenience
+rather than a claim: the run cannot be fused either way.
+
+The layout also carries the sample depth, and every table and every clamp below
+is sized from it.  What changes with depth is never the shape of a lowering,
+only its constants -- which is what made this item cheap for the filters that
+compute and expensive for the ones that tabulate.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from .curves import compose as compose_curves
 from .curves import parse_points as parse_curve_points
 from .expr import ExprBuilder, ExprProgram, multiply_is_exact
 from .expressions import ExpressionError, build_lut
-from .ir import CHANNELS, Operation, source_ref
+from .ir import CHANNELS, Operation, lut_operation, quantize_operation, source_ref
 from .layouts import PixelLayout
 from .parser import FilterInvocation
 from .target import UnknownTargetError, target_fuses_multiply_add
@@ -135,14 +142,23 @@ def _float32(value: float) -> float:
 
 
 def _levels_rounding_is_target_independent(
-    input_min: int, output_min: int, coefficient: float
+    input_min: int, output_min: int, coefficient: float, depth: int = 8
 ) -> bool:
-    """Return whether contracted and separate float32 evaluation agree as bytes."""
+    """Return whether contracted and separate float32 evaluation agree.
+
+    Checked over the format's whole domain, which is the whole domain the
+    kernel is defined over, so a wider sample is a longer loop and nothing else.
+    A wider domain is also many more chances to disagree: an ordinary option set
+    is target-independent at eight bits and almost never is at sixteen, which is
+    what :func:`_lower_colorlevels` has to state the contraction for.
+    """
+
+    maximum = (1 << depth) - 1
 
     def quantize(value: float) -> int:
-        return max(0, min(255, int(value)))
+        return max(0, min(maximum, int(value)))
 
-    for pixel in range(256):
+    for pixel in range(1 << depth):
         product = (pixel - input_min) * coefficient
         contracted = _float32(product + output_min)
         separate = _float32(_float32(product) + output_min)
@@ -195,12 +211,67 @@ def _clipf(value: float, minimum: float, maximum: float) -> float:
     )
 
 
-def _identity_table() -> tuple[int, ...]:
-    return tuple(range(256))
+def _depth(layout: PixelLayout | None) -> int:
+    """The sample depth to lower for; see the module docstring on ``None``."""
+
+    return 8 if layout is None else layout.depth
 
 
-def _table_hash(table: tuple[int, ...]) -> str:
-    return hashlib.sha256(bytes(table)).hexdigest()
+def _maximum(layout: PixelLayout | None) -> int:
+    return (1 << _depth(layout)) - 1
+
+
+def _identity_table(depth: int = 8) -> tuple[int, ...]:
+    return tuple(range(1 << depth))
+
+
+def _table_hash(table: tuple[int, ...], depth: int = 8) -> str:
+    width = 1 if depth == 8 else 2
+    return hashlib.sha256(
+        b"".join(entry.to_bytes(width, "little") for entry in table)
+    ).hexdigest()
+
+
+def _lut(
+    tables: tuple[tuple[int, ...], ...],
+    depth: int,
+    invocation: FilterInvocation,
+    index: int,
+) -> Operation:
+    """One four-channel table operation, sized to the layout's own domain."""
+
+    parameters: dict[str, Any] = {"tables": tables}
+    if depth != 8:
+        parameters["depth"] = depth
+    return Operation(lut_operation(depth), parameters, source_ref(index, invocation))
+
+
+#: Quantization modes, by the rule they apply and the width they store into.
+_QUANTIZE_MODES = {
+    ("lookup", 8): "lookup_u8",
+    ("lookup", 16): "lookup_u16",
+    ("saturate", 8): "saturate_i32_to_u8",
+    ("saturate", 16): "saturate_i32_to_u16",
+    ("truncate", 8): "truncate_toward_zero_then_saturate",
+    ("truncate", 16): "truncate_toward_zero_then_saturate",
+    ("expression", 8): "expression_outputs",
+    ("expression", 16): "expression_outputs",
+}
+
+
+def _quantize(
+    rule: str, depth: int, invocation: FilterInvocation, index: int
+) -> Operation:
+    mode = _QUANTIZE_MODES[(rule, 8 if depth == 8 else 16)]
+    return Operation(
+        quantize_operation(depth), {"mode": mode}, source_ref(index, invocation)
+    )
+
+
+def _expression_quantizer(rule: str, depth: int) -> str:
+    """Name the per-channel quantizer an expression program stores through."""
+
+    return f"{rule}_u{depth}"
 
 
 #: Every component name the accepted filters use, and the logical channel it
@@ -307,17 +378,18 @@ def _lower_negate(
     channels = _negate_channels(invocation, layout)
     _check_negate_alpha(invocation, layout)
 
-    identity = _identity_table()
-    inverse = tuple(255 - value for value in range(256))
+    # vf_negate.c is its own filter rather than a vf_lut.c entry point, and its
+    # whole arithmetic is "max - src" with max = (1 << depth) - 1. The limited
+    # luma and chroma ranges lutyuv derives play no part here.
+    depth = _depth(layout)
+    maximum = _maximum(layout)
+    identity = _identity_table(depth)
+    inverse = tuple(maximum - value for value in range(1 << depth))
     tables = tuple(
         inverse if channel in channels else identity for channel in range(4)
     )
-    operation = Operation("lut8", {"tables": tables}, source_ref(index, invocation))
-    quantize = Operation(
-        "quantize_rgba8",
-        {"mode": "lookup_u8"},
-        source_ref(index, invocation),
-    )
+    operation = _lut(tables, depth, invocation, index)
+    quantize = _quantize("lookup", depth, invocation, index)
     names = layout.component_names if layout is not None else CHANNELS
     ordered = "+".join(
         names[channel] or CHANNELS[channel] for channel in sorted(channels)
@@ -325,47 +397,77 @@ def _lower_negate(
     return Lowered((operation, quantize), f"negate=components={ordered}")
 
 
-#: Component names and per-channel ``[minval, maxval]`` range of each
-#: ``vf_lut.c`` entry point at 8-bit depth.
+#: Component names of each ``vf_lut.c`` entry point.
 #:
 #: The two entry points are the same filter with a different component
-#: vocabulary and a different range.  ``lutrgb`` falls into ``config_props``'s
-#: default branch, which gives every component ``0..255``; ``lutyuv`` falls into
-#: the YUV branch, which gives luma ``16..235`` and each chroma channel
-#: ``16..240``.  Alpha is full range in both, and the final ``av_clip((int)res,
-#: 0, max[A])`` is ``[0, 255]`` either way.
+#: vocabulary and a different range; :func:`_lut_ranges` derives the range.
 #:
 #: Upstream also accepts ``c0``..``c3`` as slot-numbered aliases for these
 #: names, and the RGB names alias the YUV slots in ``lutyuv`` and vice versa.
 #: Both spellings are refused here: they name the same option twice with no
 #: added expressiveness, and ``lutyuv=r=…`` silently means luma.
-_LUT_VARIANTS: dict[str, tuple[tuple[str, ...], tuple[tuple[int, int], ...]]] = {
-    "lutrgb": (CHANNELS, ((0, 255), (0, 255), (0, 255), (0, 255))),
-    "lutyuv": (("y", "u", "v", "a"), ((16, 235), (16, 240), (16, 240), (0, 255))),
+_LUT_VARIANTS: dict[str, tuple[str, ...]] = {
+    "lutrgb": CHANNELS,
+    "lutyuv": ("y", "u", "v", "a"),
 }
 
+#: The two formats ``config_props`` gives a full 16-bit range rather than the
+#: scaled 8-bit one.  They are the only members of their switch case.
+_LUT_FULL_RANGE_FORMATS = frozenset({"rgb48le", "rgba64le"})
 
-def _lower_lut(invocation: FilterInvocation, index: int) -> Lowered:
-    """Lower one ``vf_lut.c`` entry point into a four-channel byte table."""
 
-    names, ranges = _LUT_VARIANTS[invocation.name]
+def _lut_ranges(
+    name: str, layout: PixelLayout | None
+) -> tuple[tuple[tuple[int, int], ...], int]:
+    """Per-channel ``[minval, maxval]`` and the final clip bound, as upstream.
+
+    ``config_props`` is a switch over the pixel format with three arms, and
+    each entry point only ever reaches the arms its own format list can land
+    in.  The planar YUV arm scales the limited range with the depth: luma runs
+    ``16 << (d - 8) .. 235 << (d - 8)`` and each chroma channel to ``240``,
+    while alpha is full range and sets the ``max[A]`` every component is finally
+    clipped to.  ``rgb48le`` and ``rgba64le`` get a true ``0..65535``.  Every
+    other format falls into the default arm, whose maximum is ``255 << (d - 8)``
+    -- so a ``gbrp10le`` component runs to 1020 rather than 1023, and that
+    quirk is the clip bound too.
+    """
+
+    depth = _depth(layout)
+    scale = 1 << (depth - 8)
+    if name == "lutyuv":
+        full = (1 << depth) - 1
+        return (
+            ((16 * scale, 235 * scale), (16 * scale, 240 * scale),
+             (16 * scale, 240 * scale), (0, full)),
+            full,
+        )
+    if layout is not None and layout.name in _LUT_FULL_RANGE_FORMATS:
+        return (((0, 65535),) * 4, 65535)
+    maximum = 255 * scale
+    return (((0, maximum),) * 4, maximum)
+
+
+def _lower_lut(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    """Lower one ``vf_lut.c`` entry point into a four-channel sample table."""
+
+    names = _LUT_VARIANTS[invocation.name]
+    ranges, output_max = _lut_ranges(invocation.name, layout)
+    depth = _depth(layout)
     options = _check_options(invocation, set(names))
     expressions = {name: "clipval" for name in names}
     expressions.update({name: option.value for name, option in options.items()})
     tables: list[tuple[int, ...]] = []
     for name, value_range in zip(names, ranges, strict=True):
         try:
-            tables.append(build_lut(expressions[name], value_range))
+            tables.append(build_lut(expressions[name], value_range, depth, output_max))
         except ExpressionError as error:
             raise LoweringError("unsupported_expression", str(error), name) from error
-    operation = Operation("lut8", {"tables": tuple(tables)}, source_ref(index, invocation))
-    quantize = Operation(
-        "quantize_rgba8",
-        {"mode": "truncate_toward_zero_then_saturate"},
-        source_ref(index, invocation),
-    )
+    operation = _lut(tuple(tables), depth, invocation, index)
+    quantize = _quantize("truncate", depth, invocation, index)
     canonical = f"{invocation.name}=" + ":".join(
-        f"{name}=table:{_table_hash(table)}"
+        f"{name}=table:{_table_hash(table, depth)}"
         for name, table in zip(names, tables, strict=True)
     )
     # vf_lut.c drops colour-dependent side data unconditionally, for every one
@@ -376,13 +478,13 @@ def _lower_lut(invocation: FilterInvocation, index: int) -> Lowered:
 def _lower_lutrgb(
     invocation: FilterInvocation, index: int, layout: PixelLayout | None
 ) -> Lowered:
-    return _lower_lut(invocation, index)
+    return _lower_lut(invocation, index, layout)
 
 
 def _lower_lutyuv(
     invocation: FilterInvocation, index: int, layout: PixelLayout | None
 ) -> Lowered:
-    return _lower_lut(invocation, index)
+    return _lower_lut(invocation, index, layout)
 
 
 #: ``eq``'s options, their defaults, and the range ``av_clipf`` clamps them to.
@@ -500,6 +602,14 @@ def _eq_channel_table(
 def _lower_eq(
     invocation: FilterInvocation, index: int, layout: PixelLayout | None
 ) -> Lowered:
+    if _depth(layout) != 8:
+        # vf_eq.c advertises no format above eight bits, so a caller reaching
+        # here has already gone around FILTER_FORMATS.
+        raise LoweringError(
+            "format_not_advertised",
+            f"eq is an 8-bit filter upstream and does not advertise "
+            f"{layout.name!r}",  # type: ignore[union-attr]
+        )
     options = _check_options(invocation, set(_EQ_OPTIONS) | {"eval"})
 
     evaluation = options.get("eval")
@@ -537,12 +647,8 @@ def _lower_eq(
         paths.append(path)
     tables.append(_identity_table())
 
-    operation = Operation(
-        "lut8", {"tables": tuple(tables)}, source_ref(index, invocation)
-    )
-    quantize = Operation(
-        "quantize_rgba8", {"mode": "lookup_u8"}, source_ref(index, invocation)
-    )
+    operation = _lut(tuple(tables), 8, invocation, index)
+    quantize = _quantize("lookup", 8, invocation, index)
     canonical = (
         "eq="
         + ":".join(f"{name}={values[name].hex()}" for name in _EQ_OPTIONS)
@@ -602,9 +708,25 @@ def _hue_coefficient(
     return coefficient
 
 
+#: What ``create_luma_lut`` scales the brightness by, per depth.
+#:
+#: The two literals are not the same number scaled: ``25.5`` is ``255 / 10`` and
+#: ``102.4`` is ``1024 / 10``, so upstream's own two paths disagree about
+#: whether the divisor is the maximum or the count.  Both are transcribed as
+#: written.  ``vf_hue.c`` advertises no depth but these two.
+_HUE_BRIGHTNESS_SCALE = {8: 25.5, 10: 102.4}
+
+
 def _lower_hue(
     invocation: FilterInvocation, index: int, layout: PixelLayout | None
 ) -> Lowered:
+    depth = _depth(layout)
+    if depth not in _HUE_BRIGHTNESS_SCALE:
+        raise LoweringError(
+            "format_not_advertised",
+            f"hue advertises eight- and ten-bit formats only, not "
+            f"{layout.name!r}",  # type: ignore[union-attr]
+        )
     options = _check_options(invocation, {"h", "H", "s", "b"})
     if "h" in options and "H" in options:
         raise LoweringError(
@@ -662,29 +784,25 @@ def _lower_hue(
     # Luma only carries the brightness offset. Upstream copies the plane when
     # brightness is zero and applies this table otherwise; the table is the
     # identity at zero, so one path describes both.
+    maximum = _maximum(layout)
+    scale = _HUE_BRIGHTNESS_SCALE[depth]
     luma = tuple(
-        max(0, min(255, int(value + brightness * 25.5))) for value in range(256)
+        max(0, min(maximum, int(value + brightness * scale)))
+        for value in range(1 << depth)
     )
-    identity = _identity_table()
-    lut = Operation(
-        "lut8",
-        {"tables": (luma, identity, identity, identity)},
-        source_ref(index, invocation),
-    )
-    lut_quantize = Operation(
-        "quantize_rgba8", {"mode": "lookup_u8"}, source_ref(index, invocation)
-    )
+    identity = _identity_table(depth)
+    lut = _lut((luma, identity, identity, identity), depth, invocation, index)
+    lut_quantize = _quantize("lookup", depth, invocation, index)
+    rotation: dict[str, Any] = {"cosine": cosine, "sine": sine}
+    if depth != 8:
+        rotation["depth"] = depth
     rotate = Operation(
-        "chroma_rotate_i32",
-        {"cosine": cosine, "sine": sine},
-        source_ref(index, invocation),
+        "chroma_rotate_i32", rotation, source_ref(index, invocation)
     )
-    rotate_quantize = Operation(
-        "quantize_rgba8",
-        {"mode": "saturate_i32_to_u8"},
-        source_ref(index, invocation),
-    )
+    rotate_quantize = _quantize("saturate", depth, invocation, index)
     canonical = f"hue=cos={cosine}:sin={sine}:b={brightness.hex()}"
+    if depth != 8:
+        canonical += f":depth={depth}"
     return Lowered((lut, lut_quantize, rotate, rotate_quantize), canonical)
 
 
@@ -703,6 +821,16 @@ def _lower_colorlevels(
             "unsupported_preserve", "only preserve=none is pixel-local in the MVP", "preserve"
         )
 
+    # The option's [0, 1] endpoint is scaled by UINT8_MAX at one byte per
+    # sample and by UINT16_MAX at two, whatever the depth actually is: a
+    # gbrp10le endpoint runs to 65535 while the samples it is compared against
+    # stop at 1023. That is upstream's arithmetic, reproduced rather than fixed.
+    depth = _depth(layout)
+    endpoint_scale = 255.0 if depth == 8 else 65535.0
+    # Whether any channel's bytes depend on the host contracting its one
+    # multiply-add. Almost never at eight bits, almost always at sixteen: the
+    # question is asked once over each channel's whole domain below.
+    target_dependent = False
     input_min: list[int] = []
     input_max: list[int] = []
     output_min: list[int] = []
@@ -725,10 +853,10 @@ def _lower_colorlevels(
                 "negative colorlevels input points trigger a per-frame extrema scan",
                 offending,
             )
-        imin = round(parsed["imin"] * 255.0)
-        imax = round(parsed["imax"] * 255.0)
-        omin = round(parsed["omin"] * 255.0)
-        omax = round(parsed["omax"] * 255.0)
+        imin = round(parsed["imin"] * endpoint_scale)
+        imax = round(parsed["imax"] * endpoint_scale)
+        omin = round(parsed["omin"] * endpoint_scale)
+        omax = round(parsed["omax"] * endpoint_scale)
         if imax == imin:
             raise LoweringError(
                 "degenerate_levels",
@@ -736,13 +864,8 @@ def _lower_colorlevels(
                 f"{channel}imax",
             )
         coefficient = _float32((omax - omin) / float(imax - imin))
-        if not _levels_rounding_is_target_independent(imin, omin, coefficient):
-            raise LoweringError(
-                "target_sensitive_levels",
-                f"{channel} channel produces different bytes with contracted and "
-                "separate binary32 multiply-add evaluation",
-                f"{channel}imin",
-            )
+        if not _levels_rounding_is_target_independent(imin, omin, coefficient, depth):
+            target_dependent = True
         input_min.append(imin)
         input_max.append(imax)
         output_min.append(omin)
@@ -757,22 +880,15 @@ def _lower_colorlevels(
         {"input": input_min[channel], "output": output_min[channel]}
         for channel in range(4)
     ]
-    operation = Operation(
-        "matrix4x4",
-        {
-            "evaluation": "levels_f32_fma",
-            "coefficients": matrix,
-            "offsets": offsets,
-            "input_max": input_max,
-            "output_max": output_max,
-        },
-        source_ref(index, invocation),
-    )
-    quantize = Operation(
-        "quantize_rgba8",
-        {"mode": "truncate_toward_zero_then_saturate"},
-        source_ref(index, invocation),
-    )
+    parameters: dict[str, Any] = {
+        "evaluation": "levels_f32_fma",
+        "coefficients": matrix,
+        "offsets": offsets,
+        "input_max": input_max,
+        "output_max": output_max,
+    }
+    if depth != 8:
+        parameters["depth"] = depth
     canonical = (
         "colorlevels="
         + ":".join(
@@ -782,6 +898,21 @@ def _lower_colorlevels(
         )
         + ":preserve=none"
     )
+    if target_dependent:
+        # The operation's single rounding is the contracted evaluation, so
+        # while the two agree there is nothing to say and the plan hash is the
+        # same on every host. When they part, the host decides, exactly as it
+        # does for colorcontrast -- and it has to be stated rather than
+        # refused, because at fourteen and sixteen bits nearly every option set
+        # lands here.
+        try:
+            fused = target_fuses_multiply_add()
+        except UnknownTargetError as error:
+            raise LoweringError("unknown_target", str(error)) from error
+        parameters["contraction"] = "fused" if fused else "separate"
+        canonical += f":fused_multiply_add={int(fused)}"
+    operation = Operation("matrix4x4", parameters, source_ref(index, invocation))
+    quantize = _quantize("truncate", depth, invocation, index)
     return Lowered((operation, quantize), canonical)
 
 
@@ -798,6 +929,10 @@ def _lower_colorchannelmixer(
     if "pa" in options:
         _parse_number(options["pa"].value, "pa", 0.0, 1.0)
 
+    # config_output allocates one term table per (output, input) pair over the
+    # format's own domain and fills it with lrint(value * coefficient), so the
+    # table grows with the depth while the arithmetic does not change at all.
+    depth = _depth(layout)
     coefficients: list[list[float]] = []
     coefficient_hex: list[list[str]] = []
     tables: list[list[tuple[int, ...]]] = []
@@ -815,26 +950,23 @@ def _lower_colorchannelmixer(
             )
             row.append(coefficient)
             row_hex.append(coefficient.hex())
-            row_tables.append(tuple(round(value * coefficient) for value in range(256)))
+            row_tables.append(
+                tuple(round(value * coefficient) for value in range(1 << depth))
+            )
         coefficients.append(row)
         coefficient_hex.append(row_hex)
         tables.append(row_tables)
 
-    operation = Operation(
-        "matrix4x4",
-        {
-            "evaluation": "sum_i32_terms_rounded_ties_even",
-            "coefficients": coefficient_hex,
-            "offsets": [0, 0, 0, 0],
-            "contribution_tables": tables,
-        },
-        source_ref(index, invocation),
-    )
-    quantize = Operation(
-        "quantize_rgba8",
-        {"mode": "saturate_i32_to_u8"},
-        source_ref(index, invocation),
-    )
+    parameters: dict[str, Any] = {
+        "evaluation": "sum_i32_terms_rounded_ties_even",
+        "coefficients": coefficient_hex,
+        "offsets": [0, 0, 0, 0],
+        "contribution_tables": tables,
+    }
+    if depth != 8:
+        parameters["depth"] = depth
+    operation = Operation("matrix4x4", parameters, source_ref(index, invocation))
+    quantize = _quantize("saturate", depth, invocation, index)
     canonical = "colorchannelmixer=" + ":".join(
         f"{output}{input_}={coefficient_hex[o][i]}"
         for o, output in enumerate(CHANNELS)
@@ -844,19 +976,19 @@ def _lower_colorchannelmixer(
 
 
 def _expr_operations(
-    program: ExprProgram, invocation: FilterInvocation, index: int
+    program: ExprProgram, invocation: FilterInvocation, index: int, depth: int
 ) -> tuple[Operation, Operation]:
     """Wrap one expression program in the IR's transform/quantize pair.
 
     The quantization is per channel and already inside the program, because an
-    expression's channels need not agree on one rule; the mode here only says
-    so.
+    expression's channels need not agree on one rule -- nor on one width; the
+    mode here only says so.
     """
 
     reference = source_ref(index, invocation)
     return (
         Operation("expr_f32", {"program": program.as_dict()}, reference),
-        Operation("quantize_rgba8", {"mode": "expression_outputs"}, reference),
+        _quantize("expression", depth, invocation, index),
     )
 
 
@@ -875,13 +1007,13 @@ _BALANCE_SCALE = 0.7
 
 #: Widest value reaching ``get_component``'s multiply by ``_BALANCE_SLOPE``.
 #:
-#: ``l`` is a sum of two channel values already divided by 255, so it lies in
-#: ``[0, 2]``, and each of the four multiplicands is ``l`` offset by a constant
-#: below one.  Two bounds every one of them.
+#: ``l`` is a sum of two channel values already divided by the format maximum,
+#: so it lies in ``[0, 2]``, and each of the four multiplicands is ``l`` offset
+#: by a constant below one.  Two bounds every one of them.
 _BALANCE_SLOPE_OPERAND_BOUND = 2.0
 
 
-def _colorbalance_program(weights: dict[str, float]) -> ExprProgram:
+def _colorbalance_program(weights: dict[str, float], depth: int) -> ExprProgram:
     """Transcribe ``vf_colorbalance.c``'s ``get_component`` for all three channels.
 
     The four multiply-adds below are the only ones upstream contains, and each
@@ -896,7 +1028,7 @@ def _colorbalance_program(weights: dict[str, float]) -> ExprProgram:
         raise LoweringError(
             "target_sensitive_balance",
             "colorbalance's multiply-adds are no longer exact, so whether the "
-            "host fuses them would decide output bytes",
+            "host fuses them would decide output samples",
         )
 
     builder = ExprBuilder()
@@ -906,7 +1038,11 @@ def _colorbalance_program(weights: dict[str, float]) -> ExprProgram:
     slope = builder.const(_BALANCE_SLOPE)
     pivot = builder.const(_BALANCE_PIVOT)
     scale = builder.const(_BALANCE_SCALE)
-    maximum = builder.const(255.0)
+    # color_balance16_p is color_balance8_p with s->max widened; every channel
+    # is divided by it on the way in and multiplied by it on the way out, so
+    # the whole lightness argument stays in [0, 2] at any depth and the
+    # exactness argument above is unchanged.
+    maximum = builder.const(float((1 << depth) - 1))
 
     def scaled(difference: int) -> int:
         """``av_clipf((difference) * a + 0.5f, 0.f, 1.f)``."""
@@ -942,7 +1078,10 @@ def _colorbalance_program(weights: dict[str, float]) -> ExprProgram:
             weight = builder.const(weights[f"{prefix}{suffix}"])
             value = builder.add(value, builder.mul(weight, factor))
         clipped = builder.clipf(value, zero, one)
-        outputs[channel] = (builder.mul(clipped, maximum), "lrintf_saturate_u8")
+        outputs[channel] = (
+            builder.mul(clipped, maximum),
+            _expression_quantizer("lrintf_saturate", depth),
+        )
     # Alpha is copied rather than computed, so the program never stores it.
     return builder.build(outputs)
 
@@ -962,7 +1101,7 @@ def _lower_colorbalance(
         raise LoweringError(
             "unsupported_preserve",
             "pl=1 runs preservel, whose multiply-adds are not exact, so whether "
-            "the host compiler fuses them would decide output bytes",
+            "the host compiler fuses them would decide output samples",
             "pl",
         )
 
@@ -974,13 +1113,14 @@ def _lower_colorbalance(
         )
         for name in names
     }
-    program = _colorbalance_program(weights)
+    depth = _depth(layout)
+    program = _colorbalance_program(weights, depth)
     canonical = "colorbalance=" + ":".join(
         f"{prefix}{suffix}={weights[f'{prefix}{suffix}'].hex()}"
         for prefix, _ in _COLORBALANCE_RANGES
         for suffix, _ in _COLORBALANCE_WEIGHTS
     ) + ":pl=0"
-    return Lowered(_expr_operations(program, invocation, index), canonical)
+    return Lowered(_expr_operations(program, invocation, index, depth), canonical)
 
 
 #: ``colorcontrast``'s contrast axes, their weights, and the channels each
@@ -993,19 +1133,25 @@ _COLORCONTRAST_OPTIONS = ("rc", "gm", "by", "rcw", "gmw", "byw", "pl")
 _FLT_EPSILON = 2.0**-23
 
 
-def _colorcontrast_program(values: dict[str, float], *, fused: bool) -> ExprProgram:
+def _colorcontrast_program(
+    values: dict[str, float], *, fused: bool, depth: int
+) -> ExprProgram:
     """Transcribe ``vf_colorcontrast.c``'s ``PROCESS`` macro.
 
     Every multiply-add here scales by a user coefficient, so none of them is
-    exact and each one is a place where the host compiler's contraction decides
-    a byte.  ``fused`` says which way this host goes; the eighteen sites below
-    are exactly the ones Clang contracts, checked against a contracted build
-    over the complete ``256^3`` domain.
+    exact and each one is a place where the host compiler's contraction can
+    decide an output sample.  ``fused`` says which way this host goes; the
+    eighteen sites below are exactly the ones Clang contracts, checked against
+    a contracted build over the complete ``256^3`` domain.
+
+    ``PROCESS`` takes its clamp bound as a macro argument, so the ten- and
+    sixteen-bit slice functions are the same eighteen sites with ``max``
+    widened.  Nothing else about the transcription moves with the depth.
     """
 
     builder = ExprBuilder()
     zero = builder.const(0.0)
-    maximum = builder.const(255.0)
+    maximum = builder.const(float((1 << depth) - 1))
     half = builder.const(0.5)
 
     # Loop-invariant scalars upstream computes once per slice, in float32.
@@ -1030,8 +1176,9 @@ def _colorcontrast_program(values: dict[str, float], *, fused: bool) -> ExprProg
             return builder.fma(builder.neg(left), right, minuend)
         return builder.sub(minuend, builder.mul(left, right))
 
-    # Channels enter as raw byte values here; unlike colorbalance nothing is
-    # normalized, and the clamps below are against 255 rather than 1.
+    # Channels enter as raw sample values here; unlike colorbalance nothing is
+    # normalized, and the clamps below are against the format maximum rather
+    # than 1.
     red = builder.channel(0)
     green = builder.channel(1)
     blue = builder.channel(2)
@@ -1086,7 +1233,10 @@ def _colorcontrast_program(values: dict[str, float], *, fused: bool) -> ExprProg
         blended = mul_add(
             builder.sub(restored, mixed[channel]), preserve, mixed[channel]
         )
-        outputs[channel] = (blended, "truncate_saturate_u8")
+        outputs[channel] = (
+            blended,
+            _expression_quantizer("truncate_saturate", depth),
+        )
     return builder.build(outputs)
 
 
@@ -1103,6 +1253,7 @@ def _lower_colorcontrast(
             else 0.0
         )
 
+    depth = _depth(layout)
     total = _float32(_float32(values["gmw"] + values["byw"]) + values["rcw"])
     canonical = "colorcontrast=" + ":".join(
         f"{name}={values[name].hex()}" for name in _COLORCONTRAST_OPTIONS
@@ -1112,16 +1263,17 @@ def _lower_colorcontrast(
         # frame is left untouched -- which is what the defaults do.
         program = ExprBuilder().build({})
         return Lowered(
-            _expr_operations(program, invocation, index), canonical + ":identity=1"
+            _expr_operations(program, invocation, index, depth),
+            canonical + ":identity=1",
         )
 
     try:
         fused = target_fuses_multiply_add()
     except UnknownTargetError as error:
         raise LoweringError("unknown_target", str(error)) from error
-    program = _colorcontrast_program(values, fused=fused)
+    program = _colorcontrast_program(values, fused=fused, depth=depth)
     return Lowered(
-        _expr_operations(program, invocation, index),
+        _expr_operations(program, invocation, index, depth),
         f"{canonical}:fused_multiply_add={int(fused)}",
     )
 
@@ -1247,7 +1399,7 @@ def _lower_curves(
     ``curves`` is channel-independent: ``dst[x + r] = graph[R][src[x + r]]``,
     with alpha copied.  All of its difficulty is in ``config_input``, which
     :mod:`lavfi_cc.curves` reproduces, so the operation this emits is the same
-    ``lut8`` ``lutrgb`` emits.
+    depth-sized LUT ``lutrgb`` emits.
     """
 
     names = {name for long_name, short, _ in _CURVES_COMPONENTS for name in (long_name, short)}
@@ -1277,16 +1429,20 @@ def _lower_curves(
             )
 
     def resolve_fusion() -> bool:
-        # Only reached by a curve that passes exactly through a byte boundary,
+        # Only reached by a curve that passes exactly through a sample boundary,
         # where upstream's own output differs between hosts.
         try:
             return target_fuses_multiply_add()
         except UnknownTargetError as error:
             raise CurveError(
-                f"this curve passes exactly through a byte boundary, so its "
+                f"this curve passes exactly through a sample boundary, so its "
                 f"table depends on the host: {error}"
             ) from error
 
+    # config_input sizes every graph at 1 << depth and passes the depth to both
+    # interpolators, so the curve is the same shape sampled more finely.
+    depth = _depth(layout)
+    size = 1 << depth
     strings = _curves_component_strings(options)
     tables: list[tuple[int, ...]] = []
     try:
@@ -1294,16 +1450,17 @@ def _lower_curves(
             None
             if strings[3] is None
             else build_curve_table(
-                parse_curve_points(strings[3], "master"),
+                parse_curve_points(strings[3], "master", size - 1),
                 interpolation,
                 "master",
                 resolve_fusion,
+                size,
             )
         )
         for long_name, _, slot in _CURVES_COMPONENTS[:3]:
-            points = parse_curve_points(strings[slot] or "", long_name)
+            points = parse_curve_points(strings[slot] or "", long_name, size - 1)
             table = build_curve_table(
-                points, interpolation, long_name, resolve_fusion
+                points, interpolation, long_name, resolve_fusion, size
             )
             # config_input composes the master on top of every component, and
             # only when its point string was set at all.
@@ -1313,15 +1470,11 @@ def _lower_curves(
 
     # Alpha is copied rather than curved: NB_COMP is three, and graph[3] is the
     # master curve, not an alpha one.
-    tables.append(_identity_table())
-    operation = Operation(
-        "lut8", {"tables": tuple(tables)}, source_ref(index, invocation)
-    )
-    quantize = Operation(
-        "quantize_rgba8", {"mode": "lookup_u8"}, source_ref(index, invocation)
-    )
+    tables.append(_identity_table(depth))
+    operation = _lut(tuple(tables), depth, invocation, index)
+    quantize = _quantize("lookup", depth, invocation, index)
     canonical = "curves=" + ":".join(
-        f"{name}=table:{_table_hash(table)}"
+        f"{name}=table:{_table_hash(table, depth)}"
         for name, table in zip(("r", "g", "b", "a"), tables, strict=True)
     )
     return Lowered((operation, quantize), canonical)
@@ -1345,51 +1498,88 @@ LOWERERS: dict[str, Lowerer] = {
 SUPPORTED_FILTERS = tuple(LOWERERS)
 
 
-#: The 8-bit formats each filter advertises in pinned FFmpeg.
+#: The formats each filter advertises in pinned FFmpeg.
 #:
 #: A run may only be fused in a format that *every* filter in it accepts.
 #: Otherwise FFmpeg negotiation inserts a conversion in the middle of the run
 #: and one kernel would no longer be equivalent to the filters it replaced.
 #:
-#: These sets cover only the 8-bit formats the backend implements.  Every
-#: accepted filter also advertises higher-depth formats, and ``negate``
-#: advertises far more YUV formats than the three planar ones here; those are
-#: deliberately out of scope, so callers must only consult this table for a
-#: format in :data:`lavfi_cc.layouts.LAYOUTS`.  ``colorlevels`` and
-#: ``colorchannelmixer`` additionally accept the ``0rgb``/``rgb0`` family that
-#: ``negate`` and ``lutrgb`` do not, so it is outside the common subset.
+#: These sets cover only the formats the backend implements.  ``negate``
+#: advertises far more YUV ratios than the ones here, and several filters
+#: advertise float formats; those are deliberately out of scope, so callers
+#: must only consult this table for a format in
+#: :data:`lavfi_cc.layouts.LAYOUTS`.  ``colorlevels`` and ``colorchannelmixer``
+#: additionally accept the ``0rgb``/``rgb0`` family that ``negate`` and
+#: ``lutrgb`` do not, so it is outside the common subset.
 #:
 #: The two families barely overlap: ``negate`` advertises both, while
 #: ``lutrgb``, ``colorlevels``, and ``colorchannelmixer`` are RGB-only and
 #: ``lutyuv`` is YUV-only.  A run mixing the two families is therefore not
 #: contiguous in one format and is refused rather than fused.
 #:
-#: The ``yuva`` trio needs no separate column: every filter that advertises a
-#: planar YUV format at this depth advertises its alpha-carrying twin as well,
-#: so the two move together and nothing can be fusible in ``yuv420p`` but not
-#: in ``yuva420p``.
+#: The ``yuva`` trio needs no separate column at eight bits: every filter that
+#: advertises a planar YUV format there advertises its alpha-carrying twin as
+#: well, so the two move together.  Above eight bits that stops being true, and
+#: the alpha-bearing sets below are separate columns because of it.
 _RGB8 = frozenset(
     {"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24", "gbrp", "gbrap"}
 )
 _YUVA8 = frozenset({"yuva444p", "yuva422p", "yuva420p"})
 _YUV8 = frozenset({"yuv444p", "yuv422p", "yuv420p"}) | _YUVA8
 
+#: Planar RGB above eight bits, which every accepted RGB filter advertises
+#: identically, plus the two packed orders they do not all agree on.
+_GBRP_HIGH = frozenset(
+    {
+        "gbrp9le",
+        "gbrp10le",
+        "gbrap10le",
+        "gbrp12le",
+        "gbrap12le",
+        "gbrp14le",
+        "gbrp16le",
+        "gbrap16le",
+    }
+)
+#: ``vf_lut.c``'s RGB list carries the two ``rgb`` orders and not the ``bgr``
+#: ones, so a 16-bit packed BGR run may contain the grading filters but not
+#: ``lutrgb``.  ``vf_negate.c`` has its own list and does carry all four.
+_PACKED_RGB_HIGH = frozenset({"rgb48le", "rgba64le"})
+_PACKED_BGR_HIGH = frozenset({"bgr48le", "bgra64le"})
+_RGB_HIGH = _GBRP_HIGH | _PACKED_RGB_HIGH | _PACKED_BGR_HIGH
+
+#: Planar YUV above eight bits.  ``vf_lut.c`` lists the alpha-bearing members
+#: only at sixteen bits; ``vf_hue.c`` lists them only at ten.  Nothing lists
+#: ``yuva*9le``, so those are not layouts at all.
+_YUV_HIGH = frozenset(
+    f"yuv{ratio}p{depth}le"
+    for depth in (9, 10, 12, 14, 16)
+    for ratio in (444, 422, 420)
+)
+_YUVA_HIGH_10 = frozenset({"yuva444p10le", "yuva422p10le", "yuva420p10le"})
+_YUVA_HIGH_16 = frozenset({"yuva444p16le", "yuva422p16le", "yuva420p16le"})
+
 FILTER_FORMATS: dict[str, frozenset[str]] = {
-    "negate": _RGB8 | _YUV8,
-    "lutrgb": _RGB8,
-    "lutyuv": _YUV8,
+    "negate": _RGB8 | _YUV8 | _RGB_HIGH | _YUV_HIGH | _YUVA_HIGH_10 | _YUVA_HIGH_16,
+    "lutrgb": _RGB8 | _GBRP_HIGH | _PACKED_RGB_HIGH,
+    "lutyuv": _YUV8 | _YUV_HIGH | _YUVA_HIGH_16,
+    # vf_eq.c is 8-bit only, so it is the one accepted filter that a deep YUV
+    # island cannot contain.
     "eq": _YUV8,
-    "hue": _YUV8,
-    "colorlevels": _RGB8,
-    "colorchannelmixer": _RGB8,
-    "colorbalance": _RGB8,
-    "colorcontrast": _RGB8,
-    "curves": _RGB8,
+    # vf_hue.c advertises ten bits and nothing else above eight.
+    "hue": _YUV8
+    | frozenset({"yuv444p10le", "yuv422p10le", "yuv420p10le"})
+    | _YUVA_HIGH_10,
+    "colorlevels": _RGB8 | _RGB_HIGH,
+    "colorchannelmixer": _RGB8 | _RGB_HIGH,
+    "colorbalance": _RGB8 | _RGB_HIGH,
+    "colorcontrast": _RGB8 | _RGB_HIGH,
+    "curves": _RGB8 | _RGB_HIGH,
 }
 
 
 def filter_supports_format(name: str, pixel_format: str) -> bool:
-    """Whether *name* advertises this 8-bit format upstream.
+    """Whether *name* advertises this format upstream.
 
     Only meaningful for a format in :data:`lavfi_cc.layouts.LAYOUTS`.
     """

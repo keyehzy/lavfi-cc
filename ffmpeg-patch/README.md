@@ -2,11 +2,17 @@
 
 ## Week 5 dynamic kernel filter
 
-`vf_fused.c` is the Week 5 integration filter. It loads the generated Week 4
-kernel ABI, validates its version, RGBA8 pixel-format identifier, and plan hash,
-then invokes the kernel in row slices through FFmpeg's worker executor. It also
-copies all frame properties and applies the compiler IR's requested removal of
-color-dependent side data.
+`vf_fused.c` is the Week 5 integration filter. It loads the generated kernel
+ABI, validates its version, selected pixel-format identifier, and plan hash,
+then invokes the kernel in row slices through FFmpeg's worker executor. The
+filter maps all 47 accepted packed and planar RGB/YUV layouts, from eight to
+sixteen bits per component, and aligns slice boundaries to the chroma grid. It
+also copies all frame properties and applies the compiler IR's requested
+removal of color-dependent side data.
+
+Formats above eight bits store little-endian 16-bit samples. The generated
+kernel refuses a big-endian build rather than silently interpreting those
+samples in native byte order.
 
 The loader requires an absolute kernel path under an absolute, private trusted
 root. Both must belong to the current user; the root cannot be group- or

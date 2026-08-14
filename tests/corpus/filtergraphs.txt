@@ -61,14 +61,31 @@ format=rgba,lutrgb=r=val*1.05,colorbalance=rs=0.1,curves=g='0/0 1/0.95',colorlev
 format=rgba,colorcontrast=rc=0.25:gm=-0.15:by=0.1:rcw=0.7:gmw=0.7:byw=0.7:pl=0.5,negate,format=yuv420p
 curves=preset=darker,colorbalance=rs=0.1:bh=0.1,negate
 
+# --- Grading above eight bits, where broadcast and film pipelines live -------
+format=yuv420p10le,negate,lutyuv=y='clip(val,64,940)',hue=h=6:s=1.05
+format=yuv422p10le,lutyuv=y=val*1.02+8:u=val*0.98+10,hue=s=1.1,negate=components=y
+format=yuv420p10le,negate,negate,crop=1280:720:0:0,lutyuv=y=negval,hue=h=-4
+format=yuv444p12le,lutyuv=y=val*1.05:u=val*0.95+120,negate,negate
+format=yuv420p16le,negate,lutyuv=y=negval,negate=components=u+v
+format=gbrp10le,curves=all='0/0 0.25/0.2 0.75/0.8 1/1',colorbalance=rs=0.15:gm=0.1,colorcontrast=rc=0.3:rcw=0.8:gmw=0.4
+format=rgba64le,negate,lutrgb=r=val*1.05,colorlevels=rimin=0.05,colorchannelmixer=rr=0.95:gg=0.95:bb=0.95
+format=gbrp16le,colorbalance=rs=0.2:bh=-0.15,curves=m='0/0 0.5/0.55 1/1',negate
+format=bgr48le,curves=preset=increase_contrast,colorbalance=bh=0.25,negate
+
 # --- Accepted filters pinned to a format they do not advertise ---------------
 # eq, hue, and lutyuv are YUV-only upstream and lutrgb is RGB-only, so FFmpeg
-# converts around them and the run is not contiguous in one format.
+# converts around them and the run is not contiguous in one format. The last
+# three are the same rule inside one colour family, which only the depths tell
+# apart: eq is 8-bit only, vf_lut.c lists no 10-bit yuva format although
+# vf_hue.c does, and its RGB list carries rgb48le but not the bgr orders.
 format=rgba,eq=brightness=0.06:saturation=1.2,format=yuv420p
 format=rgba,hue=h=90:s=1.2,format=yuv420p
 format=yuv420p,lutrgb=r=val*1.2,eq=contrast=1.1
 format=rgba,negate,lutyuv=y=negval,format=yuv420p
 format=yuva420p,curves=preset=darker,negate
+format=yuv420p10le,eq=contrast=1.1:saturation=1.2,negate
+format=yuva420p10le,lutyuv=y=negval,hue=s=1.1
+format=bgra64le,lutrgb=r=val*1.1,curves=r='0/0 1/1',negate
 
 # --- YUV options inside the subset that are still rejected -------------------
 format=yuv420p,eq=eval=frame:contrast=1.4,negate

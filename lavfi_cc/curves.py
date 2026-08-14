@@ -2,10 +2,10 @@
 
 ``curves`` is the one filter of this group that needs no IR extension.  Its
 slice functions are ``dst[x + r] = graph[R][src[x + r]]`` and nothing else: one
-256-entry table per colour channel, alpha copied.  Everything interesting
-happens once, in ``config_input``, where the key points become a curve.  So the
-lowering is a ``lut8`` like ``lutrgb``'s, and this module is the part that has
-to be exact.
+``1 << depth``-entry table per colour channel, alpha copied.  Everything
+interesting happens once, in ``config_input``, where the key points become a
+curve.  So the lowering is the same depth-sized LUT as ``lutrgb``'s, and this
+module is the part that has to be exact.
 
 Two interpolators produce those tables, and both run in ``double``: a natural
 cubic spline through the key points, or PCHIP, which is monotonic between them.
@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
+import functools
 import math
 import re
 
@@ -38,22 +39,32 @@ class CurveError(ValueError):
 
 
 #: The 8-bit table upstream builds: 256 entries indexed by the input byte.
+#:
+#: Above eight bits ``config_input`` allocates ``1 << depth`` entries instead
+#: and passes the depth to both interpolators as ``nbits``, so every function
+#: here takes the size rather than reading this.
 LUT_SIZE = 256
 #: ``lut_size - 1``: what upstream calls ``scale``, the white value.
 SCALE = LUT_SIZE - 1
 
 Point = tuple[float, float]
 
+_MATH_FMA = getattr(math, "fma", None)
+
 
 def _fused(left: float, right: float, addend: float) -> float:
     """One correctly rounded ``double`` fused multiply-add.
 
-    ``math.fma`` only exists from Python 3.13, and this has to run on 3.12, so
-    the product and sum are formed exactly as rationals and rounded once.
-    ``int.__truediv__`` is correctly rounded, which is what makes the final
-    conversion the single rounding a hardware ``fma`` performs.
+    ``math.fma`` only exists from Python 3.13 and this has to run on 3.12 too,
+    so there is a fallback that forms the product and sum exactly as rationals
+    and rounds once.  ``int.__truediv__`` is correctly rounded, which is what
+    makes that final conversion the single rounding a hardware ``fma``
+    performs, so the two agree bit for bit -- the fast path only matters
+    because a 16-bit table is 65536 entries rather than 256.
     """
 
+    if _MATH_FMA is not None:
+        return _MATH_FMA(left, right, addend)  # type: ignore[no-any-return]
     if not (math.isfinite(left) and math.isfinite(right) and math.isfinite(addend)):
         return left * right + addend
     exact = Fraction(left) * Fraction(right) + Fraction(addend)
@@ -96,20 +107,24 @@ class Arithmetic:
 ARITHMETICS = (Arithmetic(True), Arithmetic(False))
 
 
-def _clip(value: float) -> int:
-    """``CLIP(v)`` at 8-bit depth: ``av_clip_uint8`` of a truncating conversion."""
+def _clip(value: float, scale: int = SCALE) -> int:
+    """``CLIP(v)``: ``av_clip_uint8`` at eight bits, ``av_clip_uintp2_c`` above.
+
+    Both are a truncating conversion followed by a clamp to ``[0, scale]``,
+    where ``scale`` is ``lut_size - 1``.
+    """
 
     if not value > 0.0:
         return 0
-    if value >= 255.0:
-        return 255
+    if value >= float(scale):
+        return scale
     return int(value)
 
 
-def _table_index(value: float) -> int:
+def _table_index(value: float, scale: int = SCALE) -> int:
     """``(int)(point->x * scale)``, which truncates toward zero."""
 
-    return int(value * SCALE)
+    return int(value * scale)
 
 
 #: A plain decimal literal.  ``av_strtod`` additionally accepts SI postfixes,
@@ -118,13 +133,18 @@ def _table_index(value: float) -> int:
 _NUMBER = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
-def parse_points(text: str, option: str) -> tuple[Point, ...]:
+def parse_points(text: str, option: str, scale: int = SCALE) -> tuple[Point, ...]:
     """Reproduce ``parse_points_str``, refusing what it would misread.
 
     Upstream reads a number, steps over exactly one character, reads another,
     and steps again -- so the separators are positional rather than meaningful
     and ``0/0 1/1`` and ``0-0*1-1`` parse the same.  That control flow is kept;
     what is not kept is ``av_strtod`` accepting anything but a decimal literal.
+
+    ``scale`` is ``lut_size - 1``, which decides how close two key points may
+    be: two that share a table entry are a configuration failure, and a deeper
+    table has finer entries, so a pair upstream rejects at eight bits it can
+    accept at ten.
     """
 
     points: list[Point] = []
@@ -152,7 +172,7 @@ def parse_points(text: str, option: str) -> tuple[Point, ...]:
                 f"{option} key point ({x:g};{y:g}) is outside the [0;1] range, "
                 "which upstream fails to configure"
             )
-        if points and _table_index(points[-1][0]) >= _table_index(x):
+        if points and _table_index(points[-1][0], scale) >= _table_index(x, scale):
             raise CurveError(
                 f"{option} key points ({points[-1][0]:g};{points[-1][1]:g}) and "
                 f"({x:g};{y:g}) are too close together or not strictly "
@@ -162,18 +182,21 @@ def parse_points(text: str, option: str) -> tuple[Point, ...]:
     return tuple(points)
 
 
-def _identity_table() -> list[int]:
-    return list(range(LUT_SIZE))
+def _identity_table(size: int) -> list[int]:
+    return list(range(size))
 
 
-def interpolate_natural(points: tuple[Point, ...], arithmetic: Arithmetic) -> list[int]:
+def interpolate_natural(
+    points: tuple[Point, ...], arithmetic: Arithmetic, size: int = LUT_SIZE
+) -> list[int]:
     """``interpolate``: a natural cubic spline through the key points."""
 
+    scale = size - 1
     count = len(points)
     if count == 0:
-        return _identity_table()
+        return _identity_table(size)
     if count == 1:
-        return [_clip(points[0][1] * SCALE)] * LUT_SIZE
+        return [_clip(points[0][1] * scale, scale)] * size
 
     widths = [points[i + 1][0] - points[i][0] for i in range(count - 1)]
 
@@ -208,10 +231,10 @@ def interpolate_natural(points: tuple[Point, ...], arithmetic: Arithmetic) -> li
     for i in range(count - 2, -1, -1):
         right[i] = arithmetic.subtract_product(right[i], above[i], right[i + 1])
 
-    table = [0] * LUT_SIZE
+    table = [0] * size
     first_x, first_y = points[0]
-    for index in range(_table_index(first_x)):
-        table[index] = _clip(first_y * SCALE)
+    for index in range(_table_index(first_x, scale)):
+        table[index] = _clip(first_y * scale, scale)
 
     for i in range(count - 1):
         current_y = points[i][1]
@@ -225,22 +248,22 @@ def interpolate_natural(points: tuple[Point, ...], arithmetic: Arithmetic) -> li
         c = right[i] / 2.0
         d = (right[i + 1] - right[i]) / (6.0 * widths[i])
 
-        start = _table_index(points[i][0])
-        end = _table_index(points[i + 1][0])
+        start = _table_index(points[i][0], scale)
+        end = _table_index(points[i + 1][0], scale)
         for x in range(start, end + 1):
             # (x - x_start) * 1./scale, which * and / being left-associative
             # makes a division by scale rather than a multiply by its inverse.
-            offset = (x - start) * 1.0 / SCALE
+            offset = (x - start) * 1.0 / scale
             # a + b*xx + c*xx*xx + d*xx*xx*xx, left to right, with each
             # multiply folded into the add that follows it.
             value = arithmetic.multiply_add(b, offset, a)
             value = arithmetic.multiply_add(c * offset, offset, value)
             value = arithmetic.multiply_add(d * offset * offset, offset, value)
-            table[x] = _clip(value * SCALE)
+            table[x] = _clip(value * scale, scale)
 
     last_x, last_y = points[-1]
-    for index in range(_table_index(last_x), LUT_SIZE):
-        table[index] = _clip(last_y * SCALE)
+    for index in range(_table_index(last_x, scale), size):
+        table[index] = _clip(last_y * scale, scale)
     return table
 
 
@@ -313,17 +336,20 @@ def _hermite_half(
     )
 
 
-def interpolate_pchip(points: tuple[Point, ...], arithmetic: Arithmetic) -> list[int]:
+def interpolate_pchip(
+    points: tuple[Point, ...], arithmetic: Arithmetic, size: int = LUT_SIZE
+) -> list[int]:
     """``interpolate_pchip``: monotonic piecewise cubic through the key points."""
 
+    scale = size - 1
     count = len(points)
     if count == 0:
-        return _identity_table()
+        return _identity_table(size)
     if count == 1:
-        return [_clip(points[0][1] * SCALE)] * LUT_SIZE
+        return [_clip(points[0][1] * scale, scale)] * size
 
-    inputs = [point[0] * SCALE for point in points]
-    values = [point[1] * SCALE for point in points]
+    inputs = [point[0] * scale for point in points]
+    values = [point[1] * scale for point in points]
     widths: list[float] = []
     slopes: list[float] = []
     for i in range(count - 1):
@@ -331,19 +357,21 @@ def interpolate_pchip(points: tuple[Point, ...], arithmetic: Arithmetic) -> list
         widths.append(width)
         slopes.append((values[i + 1] - values[i]) / width)
 
-    table = [0] * LUT_SIZE
+    table = [0] * size
     if count == 2:
         slope = slopes[0]
         intercept = arithmetic.subtract_product(values[0], inputs[0], slope)
-        for index in range(LUT_SIZE):
-            table[index] = _clip(arithmetic.multiply_add(index, slope, intercept))
+        for index in range(size):
+            table[index] = _clip(
+                arithmetic.multiply_add(index, slope, intercept), scale
+            )
         return table
 
     derivatives = _pchip_derivatives(widths, slopes, arithmetic)
 
     x = 0
     if inputs[0] > 0:
-        entry = _clip(values[0])
+        entry = _clip(values[0], scale)
         while x < inputs[0]:
             table[x] = entry
             x += 1
@@ -359,12 +387,12 @@ def interpolate_pchip(points: tuple[Point, ...], arithmetic: Arithmetic) -> list
             ) + _hermite_half(
                 offset, values[i + 1], width * derivatives[i + 1], arithmetic
             )
-            table[x] = _clip(value)
+            table[x] = _clip(value, scale)
             x += 1
 
-    if x and x < LUT_SIZE:
-        entry = _clip(values[count - 1])
-        while x < LUT_SIZE:
+    if x and x < size:
+        entry = _clip(values[count - 1], scale)
+        while x < size:
             table[x] = entry
             x += 1
     return table
@@ -376,11 +404,28 @@ INTERPOLATORS = {
 }
 
 
+@functools.lru_cache(maxsize=256)
+def _interpolate_both(
+    points: tuple[Point, ...], interpolation: str, size: int
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Build one curve under both arithmetics, memoized on its inputs.
+
+    The same key points appear once per layout a chain is compiled for, and a
+    16-bit table is 65536 entries built twice, so this is worth remembering.
+    """
+
+    interpolator = INTERPOLATORS[interpolation]
+    return tuple(
+        tuple(interpolator(points, arithmetic, size)) for arithmetic in ARITHMETICS
+    )  # type: ignore[return-value]
+
+
 def build_table(
     points: tuple[Point, ...],
     interpolation: str,
     option: str,
     resolve_fusion: Callable[[], bool],
+    size: int = LUT_SIZE,
 ) -> tuple[int, ...]:
     """Build one component's table under whichever arithmetic the host uses.
 
@@ -388,20 +433,21 @@ def build_table(
     then the table is the same on every host and ``resolve_fusion`` is never
     called -- which is what keeps a curve's plan hash portable.
 
-    They disagree when the curve passes exactly through a byte boundary, which
-    ordinary key points do more often than the tiny ``double`` rounding gap
-    suggests: ``0/0.05 1/1`` is the straight line ``y = (0.05 + 0.95x)``, and at
-    input 155 that is exactly ``160/255``.  One evaluation order lands just
-    below and the other just above, and the truncating ``CLIP`` turns that into
-    159 or 160.  Upstream's own output is not portable there, so the only way
-    to be bit-exact against the pinned oracle is to ask which host this is.
+    They disagree when the curve passes exactly through a table-entry boundary,
+    which ordinary key points do more often than the tiny ``double`` rounding
+    gap suggests: ``0/0.05 1/1`` is the straight line ``y = (0.05 + 0.95x)``,
+    and at input 155 that is exactly ``160/255``.  One evaluation order lands
+    just below and the other just above, and the truncating ``CLIP`` turns that
+    into 159 or 160.  Upstream's own output is not portable there, so the only
+    way to be bit-exact against the pinned oracle is to ask which host this is.
+    A deeper table has more entries to land on, so this happens more often
+    rather than less.
     """
 
-    interpolator = INTERPOLATORS[interpolation]
-    fused, separate = (interpolator(points, arithmetic) for arithmetic in ARITHMETICS)
+    fused, separate = _interpolate_both(points, interpolation, size)
     if fused == separate:
         return tuple(fused)
-    entry = next(index for index in range(LUT_SIZE) if fused[index] != separate[index])
+    entry = next(index for index in range(size) if fused[index] != separate[index])
     try:
         fuses = resolve_fusion()
     except CurveError:

@@ -12,14 +12,15 @@ filter's observable behaviour::
 
 An :class:`ExprProgram` is how the IR says that.  It is a single-assignment
 list of float32 instructions -- no branches, no loops, no memory -- plus one
-optional output per channel.  A channel with no output keeps the byte it came
+optional output per channel.  A channel with no output keeps the sample it came
 in with, which is what upstream does with alpha.
 
 **Why the operation order is spelled out.** Every instruction here rounds its
 result to binary32, exactly once, and the order they appear in is the order
 upstream evaluates them.  Reassociating ``(a + b) + c`` into ``a + (b + c)``
-changes bytes, so the program is a transcription rather than a formula.  For
-the same reason ``min`` and ``max`` reproduce FFmpeg's ``FFMIN``/``FFMAX``
+can change stored samples, so the program is a transcription rather than a
+formula.  For the same reason ``min`` and ``max`` reproduce FFmpeg's
+``FFMIN``/``FFMAX``
 macros -- ternaries on ``>``, not ``fminf``/``fmaxf``, which disagree with them
 on signed zeros.
 
@@ -84,12 +85,28 @@ OPCODES: dict[str, int] = {
     "fma": 3,
 }
 
-#: How a channel's final float becomes its byte.
+#: Component depths a stored sample can have, from the layout table.
+SAMPLE_DEPTHS = (8, 9, 10, 12, 14, 16)
+
+#: How a channel's final float becomes its stored sample.
 #:
-#: Both reproduce an ``av_clip_uint8`` of a float that C converts to ``int``
-#: first.  Clamping in float ahead of the conversion is the same mapping for
-#: every input C defines and leaves nothing undefined for the ones it does not.
-QUANTIZERS = ("lrintf_saturate_u8", "truncate_saturate_u8")
+#: Each reproduces an ``av_clip_uint8`` -- or, above eight bits, the
+#: ``av_clip_uintp2_c`` upstream switches to -- of a float that C converts to
+#: ``int`` first.  Clamping in float ahead of the conversion is the same mapping
+#: for every input C defines and leaves nothing undefined for the ones it does
+#: not.  The name carries the depth because a program is otherwise
+#: self-contained: nothing else in it says how wide its outputs are.
+QUANTIZERS = tuple(
+    f"{rule}_u{depth}"
+    for depth in SAMPLE_DEPTHS
+    for rule in ("lrintf_saturate", "truncate_saturate")
+)
+
+
+def quantizer_maximum(rule: str) -> int:
+    """Largest value *rule* can produce."""
+
+    return (1 << int(rule.rpartition("_u")[2])) - 1
 
 
 def _hex_float32(value: float) -> str:
@@ -229,7 +246,7 @@ class ExprProgram:
         return not self.channels_written
 
     def evaluate(self, pixel: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-        """Run the program over one pixel and return its four output bytes."""
+        """Run the program over four logical channels and return output samples."""
 
         values: list[float] = []
         for instruction in self.instructions:
@@ -280,13 +297,14 @@ def _divide(left: float, right: float) -> float:
 
 
 def _quantize(value: float, rule: str) -> int:
+    maximum = quantizer_maximum(rule)
     # "not (value > 0)" rather than "value <= 0" so a NaN takes this branch,
     # which is what the generated C does too.
     if not value > 0.0:
         return 0
-    if value >= 255.0:
-        return 255
-    if rule == "truncate_saturate_u8":
+    if value >= float(maximum):
+        return maximum
+    if rule.startswith("truncate_saturate"):
         return int(value)  # C's float-to-int conversion truncates toward zero.
     return round(value)  # lrintf under the default mode: nearest, ties to even.
 
@@ -418,7 +436,7 @@ def c_float_literal(value: float) -> str:
     return f"{mantissa}p{exponent}f"
 
 
-#: Helpers the generated C needs when a program is present.
+#: Helpers the generated C needs when an 8-bit program is present.
 C_HELPERS = (
     "static inline uint8_t lavfi_truncate_saturate_u8(float value)",
     "{",
@@ -440,6 +458,42 @@ C_HELPERS = (
     "    return (uint8_t)lrintf(value);",
     "}",
 )
+
+
+def c_helpers(depth: int) -> tuple[str, ...]:
+    """The quantizer helpers a program at *depth* calls.
+
+    At eight bits this is :data:`C_HELPERS` verbatim, so a kernel generated
+    before depths existed is still generated character for character.  Above
+    it, the same two functions are emitted against ``av_clip_uintp2_c``'s bound
+    and return a ``uint16_t``.
+    """
+
+    if depth == 8:
+        return C_HELPERS
+    maximum = (1 << depth) - 1
+    return (
+        f"static inline uint16_t lavfi_truncate_saturate_u{depth}(float value)",
+        "{",
+        f"    /* av_clip_uintp2_c((int)value, {depth}), clamped in float first: the",
+        "     * same mapping for every input C defines, and defined for the",
+        "     * ones it does not. */",
+        "    if (!(value > 0.0f))",
+        "        return 0;",
+        f"    if (value >= {maximum}.0f)",
+        f"        return {maximum};",
+        "    return (uint16_t)(int)value;",
+        "}",
+        "",
+        f"static inline uint16_t lavfi_lrintf_saturate_u{depth}(float value)",
+        "{",
+        "    if (!(value > 0.0f))",
+        "        return 0;",
+        f"    if (value >= {maximum}.0f)",
+        f"        return {maximum};",
+        "    return (uint16_t)lrintf(value);",
+        "}",
+    )
 
 _C_BINARY = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 

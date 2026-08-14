@@ -8,10 +8,12 @@ import sys
 import tempfile
 import unittest
 
+from lavfi_cc.filters import filter_supports_format
 from lavfi_cc.frontend import analyze_filtergraph
 from lavfi_cc.interpreter import interpret_rgba8
-from lavfi_cc.layouts import LAYOUTS, get_layout
+from lavfi_cc.layouts import LAYOUTS, PixelLayout, get_layout
 from lavfi_cc.native import NativeKernel, compile_kernel, library_suffix
+from lavfi_cc.parser import parse_filtergraph
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,11 +92,71 @@ YUVA_CHAINS = YUV_CHAINS + (
 )
 
 
+# Chains written for the wider range itself: a lutyuv expression whose bounds
+# only exist above eight bits, and a curve whose key points land on entries a
+# 256-entry table has not got.
+HIGH_DEPTH_YUV_CHAINS = (
+    "lutyuv=y='clip(val,64,940)':u='clip(val,64,960)'",
+    "lutyuv=y=minval+maxval-val:v=negval",
+    "negate=components=y,lutyuv=u=val*1.03125+3",
+)
+HIGH_DEPTH_RGB_CHAINS = (
+    "curves=r='0/0.05 1/1'",
+    "lutrgb=r=negval:g='clip(val,300,3000)'",
+    "colorlevels=rimin=.05:gimax=.9,colorbalance=rs=.25:bh=-.3",
+)
+
+
+def filters_in(chain: str) -> tuple[str, ...]:
+    return tuple(
+        invocation.name for invocation in parse_filtergraph(chain).filters
+    )
+
+
 def chains_for(name: str) -> tuple[str, ...]:
+    """Every chain above that is contiguous in *name*.
+
+    A chain is only a differential case where every filter in it advertises the
+    format, since otherwise FFmpeg converts in the middle of the run and the
+    compiler refuses it -- which is the same rule the frontend applies, asked
+    here rather than restated. It does most of its work above eight bits, where
+    ``eq`` drops out of every chain and ``hue`` out of all but the ten-bit ones.
+    """
+
     layout = get_layout(name)
     if layout.family != "yuv":
-        return RGB_CHAINS
-    return YUVA_CHAINS if layout.has_alpha else YUV_CHAINS
+        candidates = RGB_CHAINS + (HIGH_DEPTH_RGB_CHAINS if layout.high_depth else ())
+    else:
+        candidates = YUVA_CHAINS if layout.has_alpha else YUV_CHAINS
+        if layout.high_depth:
+            candidates += HIGH_DEPTH_YUV_CHAINS
+    return tuple(
+        chain
+        for chain in candidates
+        if all(filter_supports_format(item, name) for item in filters_in(chain))
+    )
+
+
+def random_frame(
+    layout: PixelLayout, width: int, height: int, generator: random.Random
+) -> bytes:
+    """One tightly packed frame of samples the format can actually hold.
+
+    Above eight bits a sample is a little-endian word bounded by the format's
+    own maximum rather than sixteen random bits. That bound is the domain the
+    kernels are defined over, and it is not a convenience: ``vf_curves.c`` and
+    ``vf_colorchannelmixer.c`` index a ``1 << depth``-entry table with the raw
+    sample, so a wider value makes the oracle itself read past the end of its
+    table and there is no answer to be exact against.
+    """
+
+    size = layout.frame_size(width, height)
+    if not layout.high_depth:
+        return bytes(generator.randrange(256) for _ in range(size))
+    return b"".join(
+        generator.randrange(layout.max_value + 1).to_bytes(2, "little")
+        for _ in range(size // 2)
+    )
 
 
 def _executable(candidates: tuple[Path, ...], override: str | None) -> Path | None:
@@ -440,9 +502,9 @@ class LayoutDifferentialTests(unittest.TestCase):
         return result.stdout
 
     def frame(self, layout: str, seed: int) -> bytes:
-        generator = random.Random(seed)
-        size = get_layout(layout).frame_size(self.WIDTH, self.HEIGHT)
-        return bytes(generator.randrange(256) for _ in range(size))
+        return random_frame(
+            get_layout(layout), self.WIDTH, self.HEIGHT, random.Random(seed)
+        )
 
     def test_interpreter_matches_ffmpeg_for_every_layout(self) -> None:
         for seed, name in enumerate(LAYOUTS):
@@ -503,10 +565,7 @@ class LayoutEndToEndTests(unittest.TestCase):
         generator = random.Random(0xB17E)
         for name in LAYOUTS:
             layout = get_layout(name)
-            source = bytes(
-                generator.randrange(256)
-                for _ in range(layout.frame_size(self.WIDTH, self.HEIGHT))
-            )
+            source = random_frame(layout, self.WIDTH, self.HEIGHT, generator)
             graph = f"format={name},{chains_for(name)[-1]},format={name}"
             arguments = self.arguments(name, graph)
             with self.subTest(layout=name):

@@ -127,7 +127,7 @@ def _parser() -> argparse.ArgumentParser:
         "--pixel-format",
         choices=("rgba", "rgba8"),
         default="rgba",
-        help="internal pixel format (the Week 4 backend supports RGBA8)",
+        help="legacy entry-format hint for an unbounded graph (currently RGBA only)",
     )
     compile_parser.add_argument(
         "--output",

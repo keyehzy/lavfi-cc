@@ -20,7 +20,13 @@ from .filters import (
     filter_supports_format,
     format_value,
 )
-from .ir import Operation, PixelIR
+from .ir import (
+    Operation,
+    PixelIR,
+    load_operation,
+    pixel_format_for,
+    store_operation,
+)
 from .layouts import DEFAULT_LAYOUT, LAYOUTS
 from .islands import Island, scan_chain, select_islands
 from .parser import (
@@ -261,14 +267,20 @@ def _planned_filter(ir: PixelIR) -> str:
 def build_island_ir(
     lowered: tuple[Lowered, ...], layout: str = DEFAULT_LAYOUT
 ) -> PixelIR:
-    operations: list[Operation] = [Operation("load_rgba8", {})]
+    depth = LAYOUTS[layout].depth
+    operations: list[Operation] = [Operation(load_operation(depth), {})]
     removes_color_side_data = False
     for item in lowered:
         operations.extend(item.operations)
         removes_color_side_data |= item.removes_color_side_data
-    operations.append(Operation("store_rgba8", {}))
+    operations.append(Operation(store_operation(depth), {}))
     effects = ("remove_color_dependent_side_data",) if removes_color_side_data else ()
-    return PixelIR(tuple(operations), effects, layout=layout)
+    return PixelIR(
+        tuple(operations),
+        effects,
+        pixel_format=pixel_format_for(depth),
+        layout=layout,
+    )
 
 
 def rewrite_with(

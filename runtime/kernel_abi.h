@@ -34,6 +34,50 @@
 #define LAVFI_PIXEL_FORMAT_YUVA422P8 13u
 #define LAVFI_PIXEL_FORMAT_YUVA420P8 14u
 
+/* Formats above eight bits per component. Every one of them stores each sample
+ * as a little-endian uint16 whose top 16 - depth bits are zero, so a kernel
+ * built for one loads a native uint16 and is only valid on a little-endian
+ * host; the generated source says so with a #error. The plane geometry is the
+ * same as at eight bits -- what changes is that a row is twice as many bytes
+ * as it is samples, which the caller sees only through linesize. */
+#define LAVFI_PIXEL_FORMAT_YUV444P9LE  15u
+#define LAVFI_PIXEL_FORMAT_YUV422P9LE  16u
+#define LAVFI_PIXEL_FORMAT_YUV420P9LE  17u
+#define LAVFI_PIXEL_FORMAT_YUV444P10LE 18u
+#define LAVFI_PIXEL_FORMAT_YUV422P10LE 19u
+#define LAVFI_PIXEL_FORMAT_YUV420P10LE 20u
+#define LAVFI_PIXEL_FORMAT_YUV444P12LE 21u
+#define LAVFI_PIXEL_FORMAT_YUV422P12LE 22u
+#define LAVFI_PIXEL_FORMAT_YUV420P12LE 23u
+#define LAVFI_PIXEL_FORMAT_YUV444P14LE 24u
+#define LAVFI_PIXEL_FORMAT_YUV422P14LE 25u
+#define LAVFI_PIXEL_FORMAT_YUV420P14LE 26u
+#define LAVFI_PIXEL_FORMAT_YUV444P16LE 27u
+#define LAVFI_PIXEL_FORMAT_YUV422P16LE 28u
+#define LAVFI_PIXEL_FORMAT_YUV420P16LE 29u
+#define LAVFI_PIXEL_FORMAT_YUVA444P10LE 30u
+#define LAVFI_PIXEL_FORMAT_YUVA422P10LE 31u
+#define LAVFI_PIXEL_FORMAT_YUVA420P10LE 32u
+#define LAVFI_PIXEL_FORMAT_YUVA444P16LE 33u
+#define LAVFI_PIXEL_FORMAT_YUVA422P16LE 34u
+#define LAVFI_PIXEL_FORMAT_YUVA420P16LE 35u
+
+/* Planar RGB above eight bits: plane 0 green, 1 blue, 2 red, 3 alpha. */
+#define LAVFI_PIXEL_FORMAT_GBRP9LE   36u
+#define LAVFI_PIXEL_FORMAT_GBRP10LE  37u
+#define LAVFI_PIXEL_FORMAT_GBRAP10LE 38u
+#define LAVFI_PIXEL_FORMAT_GBRP12LE  39u
+#define LAVFI_PIXEL_FORMAT_GBRAP12LE 40u
+#define LAVFI_PIXEL_FORMAT_GBRP14LE  41u
+#define LAVFI_PIXEL_FORMAT_GBRP16LE  42u
+#define LAVFI_PIXEL_FORMAT_GBRAP16LE 43u
+
+/* Packed 16-bit RGB: one plane, three or four samples per pixel. */
+#define LAVFI_PIXEL_FORMAT_RGB48LE  44u
+#define LAVFI_PIXEL_FORMAT_RGBA64LE 45u
+#define LAVFI_PIXEL_FORMAT_BGR48LE  46u
+#define LAVFI_PIXEL_FORMAT_BGRA64LE 47u
+
 #if defined(__GNUC__) || defined(__clang__)
 #define LAVFI_KERNEL_EXPORT __attribute__((visibility("default")))
 #else

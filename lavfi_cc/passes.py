@@ -8,13 +8,17 @@ from typing import Any
 
 from .expr import ExprProgram
 from .interpreter import validate_ir
-from .ir import Operation, PixelIR
+from .ir import Operation, PixelIR, lut_operation
+from .layouts import get_layout
 
 
 LEVELS_EVALUATION = "levels_f32_fma"
 MIXER_EVALUATION = "sum_i32_terms_rounded_ties_even"
 FOLDED_MIXER_EVALUATION = "sum_i32_lut_terms"
 MIXER_EVALUATIONS = frozenset((MIXER_EVALUATION, FOLDED_MIXER_EVALUATION))
+
+#: Operation kinds that are a per-channel table, at either sample width.
+LUT_KINDS = frozenset(("lut8", "lut16"))
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,7 @@ class PassResult:
 
 def _identity_lut(operation: Operation) -> bool:
     tables = operation.parameters["tables"]
-    identity = tuple(range(256))
+    identity = tuple(range(len(tables[0])))
     return all(tuple(table) == identity for table in tables)
 
 
@@ -56,8 +60,9 @@ def _identity_levels(operation: Operation) -> bool:
 
 def _identity_mixer(operation: Operation) -> bool:
     tables = operation.parameters["contribution_tables"]
-    identity = tuple(range(256))
-    zero = (0,) * 256
+    size = len(tables[0][0])
+    identity = tuple(range(size))
+    zero = (0,) * size
     return all(
         tuple(tables[output][input_]) == (identity if output == input_ else zero)
         for output in range(4)
@@ -68,9 +73,9 @@ def _identity_mixer(operation: Operation) -> bool:
 def _identity_chroma_rotate(operation: Operation) -> bool:
     """A zero-degree rotation at unit saturation leaves both channels alone.
 
-    ``(u - 128) << 16`` plus the half-step rounding term shifts back to exactly
-    ``u`` for every byte, so this is an identity rather than an approximation
-    of one.
+    ``(u - centre) << 16`` plus the half-step rounding term shifts back to
+    exactly ``u`` for every sample in the format's domain, so this is an
+    identity rather than an approximation of one.
     """
 
     return (
@@ -91,7 +96,7 @@ def _identity_expr(operation: Operation) -> bool:
 
 
 def _is_identity(operation: Operation) -> bool:
-    if operation.kind == "lut8":
+    if operation.kind in LUT_KINDS:
         return _identity_lut(operation)
     if operation.kind == "chroma_rotate_i32":
         return _identity_chroma_rotate(operation)
@@ -111,33 +116,29 @@ def _f32(value: float) -> float:
     return struct.unpack("=f", struct.pack("=f", value))[0]
 
 
-def _u8(value: int) -> int:
-    return max(0, min(255, value))
-
-
 def materialize_levels_tables(
     operation: Operation,
 ) -> tuple[tuple[int, ...], ...]:
-    """Materialize the exact byte mapping of a validated levels operation."""
+    """Materialize the exact sample mapping of a validated levels operation."""
 
     parameters = operation.parameters
+    depth = parameters.get("depth", 8)
+    maximum = (1 << depth) - 1
+    # Absent means the two evaluations agree, so either one materializes the
+    # same table; present means the host has already decided which.
+    fused = parameters.get("contraction") != "separate"
     output: list[tuple[int, ...]] = []
     for channel in range(4):
         coefficient = _f32(float.fromhex(parameters["coefficients"][channel][channel]))
         input_offset = parameters["offsets"][channel]["input"]
         output_offset = parameters["offsets"][channel]["output"]
-        output.append(
-            tuple(
-                _u8(
-                    int(
-                        _f32(
-                            (value - input_offset) * coefficient + output_offset
-                        )
-                    )
-                )
-                for value in range(256)
-            )
-        )
+        entries: list[int] = []
+        for value in range(1 << depth):
+            product = (value - input_offset) * coefficient
+            if not fused:
+                product = _f32(product)
+            entries.append(max(0, min(maximum, int(_f32(product + output_offset)))))
+        output.append(tuple(entries))
     return tuple(output)
 
 
@@ -169,8 +170,16 @@ def _remove_identities(
     return kept, len(stages) - len(kept)
 
 
+def _lut_parameters(depth: int, tables: tuple[tuple[int, ...], ...]) -> dict[str, Any]:
+    """Parameters for a table operation, which name their depth above eight."""
+
+    if depth == 8:
+        return {"tables": tables}
+    return {"tables": tables, "depth": depth}
+
+
 def _materialize_levels(
-    stages: list[tuple[Operation, Operation]],
+    stages: list[tuple[Operation, Operation]], depth: int
 ) -> tuple[list[tuple[Operation, Operation]], int]:
     output: list[tuple[Operation, Operation]] = []
     changes = 0
@@ -180,8 +189,8 @@ def _materialize_levels(
             and transform.parameters.get("evaluation") == LEVELS_EVALUATION
         ):
             transform = Operation(
-                "lut8",
-                {"tables": materialize_levels_tables(transform)},
+                lut_operation(depth),
+                _lut_parameters(depth, materialize_levels_tables(transform)),
                 transform.source,
             )
             changes += 1
@@ -190,14 +199,16 @@ def _materialize_levels(
 
 
 def _compose_luts(
-    stages: list[tuple[Operation, Operation]],
+    stages: list[tuple[Operation, Operation]], depth: int
 ) -> tuple[list[tuple[Operation, Operation]], int]:
+    kind = lut_operation(depth)
+    size = 1 << depth
     output: list[tuple[Operation, Operation]] = []
     compositions = 0
     index = 0
     while index < len(stages):
         transform, quantize = stages[index]
-        if transform.kind != "lut8":
+        if transform.kind != kind:
             output.append((transform, quantize))
             index += 1
             continue
@@ -206,11 +217,11 @@ def _compose_luts(
         final_transform = transform
         final_quantize = quantize
         index += 1
-        while index < len(stages) and stages[index][0].kind == "lut8":
+        while index < len(stages) and stages[index][0].kind == kind:
             next_transform, next_quantize = stages[index]
             next_tables = next_transform.parameters["tables"]
             tables = tuple(
-                tuple(next_tables[channel][tables[channel][value]] for value in range(256))
+                tuple(next_tables[channel][tables[channel][value]] for value in range(size))
                 for channel in range(4)
             )
             final_transform = next_transform
@@ -219,14 +230,16 @@ def _compose_luts(
             index += 1
         output.append(
             (
-                Operation("lut8", {"tables": tables}, final_transform.source),
+                Operation(
+                    kind, _lut_parameters(depth, tables), final_transform.source
+                ),
                 final_quantize,
             )
         )
     return output, compositions
 
 
-def _fold_lut_into_mixer(lut: Operation, mixer: Operation) -> Operation:
+def _fold_lut_into_mixer(lut: Operation, mixer: Operation, depth: int) -> Operation:
     lut_tables = lut.parameters["tables"]
     mixer_tables = mixer.parameters["contribution_tables"]
     tables = tuple(
@@ -235,26 +248,26 @@ def _fold_lut_into_mixer(lut: Operation, mixer: Operation) -> Operation:
                 mixer_tables[output_channel][input_channel][
                     lut_tables[input_channel][value]
                 ]
-                for value in range(256)
+                for value in range(1 << depth)
             )
             for input_channel in range(4)
         )
         for output_channel in range(4)
     )
-    return Operation(
-        "matrix4x4",
-        {
-            "evaluation": FOLDED_MIXER_EVALUATION,
-            "offsets": [0, 0, 0, 0],
-            "contribution_tables": tables,
-        },
-        mixer.source,
-    )
+    parameters: dict[str, Any] = {
+        "evaluation": FOLDED_MIXER_EVALUATION,
+        "offsets": [0, 0, 0, 0],
+        "contribution_tables": tables,
+    }
+    if depth != 8:
+        parameters["depth"] = depth
+    return Operation("matrix4x4", parameters, mixer.source)
 
 
 def _fold_luts_into_mixers(
-    stages: list[tuple[Operation, Operation]],
+    stages: list[tuple[Operation, Operation]], depth: int
 ) -> tuple[list[tuple[Operation, Operation]], int]:
+    kind = lut_operation(depth)
     output: list[tuple[Operation, Operation]] = []
     changes = 0
     index = 0
@@ -263,12 +276,12 @@ def _fold_luts_into_mixers(
         if index + 1 < len(stages):
             mixer, mixer_quantize = stages[index + 1]
             if (
-                transform.kind == "lut8"
+                transform.kind == kind
                 and mixer.kind == "matrix4x4"
                 and mixer.parameters.get("evaluation") in MIXER_EVALUATIONS
             ):
                 output.append(
-                    (_fold_lut_into_mixer(transform, mixer), mixer_quantize)
+                    (_fold_lut_into_mixer(transform, mixer, depth), mixer_quantize)
                 )
                 changes += 1
                 index += 2
@@ -287,6 +300,7 @@ def optimize_ir(
     """Run the semantics-preserving pixel optimization passes."""
 
     validate_ir(ir)
+    depth = get_layout(ir.layout).depth
     stages = _stages(ir)
     changes: list[tuple[str, int]] = []
 
@@ -299,9 +313,9 @@ def optimize_ir(
     composition_changes = 0
     mixer_folding_changes = 0
     if lut_composition:
-        stages, levels_changes = _materialize_levels(stages)
-        stages, composition_changes = _compose_luts(stages)
-        stages, mixer_folding_changes = _fold_luts_into_mixers(stages)
+        stages, levels_changes = _materialize_levels(stages, depth)
+        stages, composition_changes = _compose_luts(stages, depth)
+        stages, mixer_folding_changes = _fold_luts_into_mixers(stages, depth)
     changes.append(("levels_materialization", levels_changes))
     changes.append(("lut_composition", composition_changes))
     changes.append(("lut_mixer_folding", mixer_folding_changes))

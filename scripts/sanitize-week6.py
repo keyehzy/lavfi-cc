@@ -29,6 +29,13 @@ from lavfi_cc.layouts import get_layout
 #: plane-3 pointer walked at a chroma plane's row count would run off the end of
 #: the frame. The dimensions are odd so a chroma plane's AV_CEIL_RSHIFT rounding
 #: is exercised.
+#:
+#: The last two cases are the 16-bit sample walk, where a row is twice as many
+#: bytes as it is samples, and the 10-bit one, whose tables cover 1024 entries
+#: while the sample type holds 65536 values. The frames below are random bytes
+#: rather than samples in the format's domain, deliberately: that is what makes
+#: ASan check the clamp that keeps a stray sample from indexing past the end of
+#: a table, and the interpreter clamps identically so the comparison still holds.
 CASES = (
     (
         "format=rgba,negate=components=r+g+b+a,"
@@ -65,6 +72,20 @@ CASES = (
         "eq=contrast=1.3:saturation=0.8,hue=h=37.5:s=1.4:b=-0.35,"
         "negate=components=y+u+v+a,format=yuva420p",
         257,
+        5,
+    ),
+    (
+        "format=rgba64le,negate=components=r+g+b+a,lutrgb=r=negval:g=val*1.08+2,"
+        "colorbalance=rs=.3:gm=-.2:bh=.5,"
+        "colorcontrast=rc=.4:gm=.25:by=-.15:rcw=.9:gmw=.7:byw=.3:pl=.35,"
+        "format=rgba64le",
+        129,
+        3,
+    ),
+    (
+        "format=yuva420p10le,negate=components=y+u+v+a,"
+        "hue=h=37.5:s=1.4:b=-0.35,format=yuva420p10le",
+        129,
         5,
     ),
 )

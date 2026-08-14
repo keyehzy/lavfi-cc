@@ -1,20 +1,22 @@
 # lavfi-cc
 
 `lavfi-cc` is an experimental compiler for fusing compatible FFmpeg video
-filters into one native kernel over an 8-bit frame. The repository
+filters into one native kernel. The repository
 has completed the Week 5 FFmpeg-integration and Week 6 cache/operational-safety
 milestones described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md), plus the reach
 work recorded in [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
-Accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and
-`bgr24`, the planar RGB `gbrp` and `gbrap`, and the planar YUV `yuv444p`,
-`yuv422p`, `yuv420p`, `yuva444p`, `yuva422p`, and `yuva420p`. A run is only
-fused when it already works in one of
-them: a pointwise filter produces different bytes in different pixel formats,
-so fusing a run into a kernel built for another format would change the output,
-and no conversion is ever introduced at an island boundary. Runs that cannot be
-fused are reported rather than guessed at.
+Accepted layouts are 47 formats from eight to sixteen bits per component: the
+packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24` and their 16-bit
+`rgb48le`, `rgba64le`, `bgr48le`, and `bgra64le`; planar `gbrp` at 8, 9, 10,
+12, 14, and 16 bits and `gbrap` at 8, 10, 12, and 16 bits; planar YUV 4:4:4,
+4:2:2, and 4:2:0 at 8, 9, 10, 12, 14, and 16 bits; and their alpha-carrying
+`yuva` members at 8, 10, and 16 bits. A run is only fused when it already works
+in one of them: a pointwise filter produces different bytes in different pixel
+formats, so fusing a run into a kernel built for another format would change
+the output, and no conversion is ever introduced at an island boundary. Runs
+that cannot be fused are reported rather than guessed at.
 
 YUV support is native rather than converted: a `yuv420p` island is fused in
 `yuv420p`, with the chroma planes walked at their own resolution. The `yuva`
@@ -26,13 +28,24 @@ may only be fused in a format *every* filter in it accepts:
 
 | filter | formats | notes |
 |---|---|---|
-| `negate` | RGB and YUV | the only one in both families |
-| `lutrgb`, `colorlevels`, `colorchannelmixer` | RGB only | refused in a YUV run |
-| `colorbalance`, `colorcontrast`, `curves` | RGB only | refused in a YUV run |
-| `lutyuv`, `eq`, `hue` | YUV only | refused in an RGB run |
+| `negate` | RGB and YUV, 8–16 bits | the only one in both families |
+| `lutrgb`, `colorlevels`, `colorchannelmixer` | RGB only, 8–16 bits | refused in a YUV run |
+| `colorbalance`, `colorcontrast`, `curves` | RGB only, 8–16 bits | refused in a YUV run |
+| `lutyuv` | YUV only, 8–16 bits | above 8 bits, alpha is available only at 16 bits |
+| `hue` | YUV only, 8 and 10 bits | refused in an RGB run |
+| `eq` | YUV only, 8 bits | the one filter with no deep format at all |
 
 A run mixing the two families is not one run: FFmpeg converts around the odd
-filter out, so no single kernel is equivalent to it.
+filter out, so no single kernel is equivalent to it. The same rule cuts inside
+a family once depths are involved: `eq` drops out of every run above eight
+bits, and `lutyuv` and `hue` never share an alpha-carrying deep format.
+
+A sample of a format with depth *d* means a value in `[0, 2^d - 1]`, and that
+is the domain the kernels are bit-exact over. Outside it the accepted filters
+do not agree with each other about what happens — `vf_lut.c` answers from a
+full 65536-entry table, `vf_hue.c` clamps, and `vf_curves.c` reads past the end
+of its own — so a table here is sized to the format's domain and indexed
+through a clamp.
 
 `hue` rotates Cb into Cr, so it is the one accepted YUV filter that reads across
 channels on a subsampled layout. That is admissible because the two chroma
@@ -136,8 +149,10 @@ Omit `--input` or `--output` to use standard input or standard output. Input
 must contain only complete frames, sized for that layout — `width * height * 4`
 for `rgba`, `width * height * 3 / 2` for `yuv420p`, and `width * height * 5 / 2`
 for `yuva420p`, whose planes sit back to back with chroma dimensions rounded up
-and alpha at full resolution. The Python API also supports padded and negative
-frame strides, per plane, through `interpret_into`.
+and alpha at full resolution. Above eight bits every sample is a little-endian
+16-bit word, so the same frame is twice the size: `width * height * 3` for
+`yuv420p10le`. The Python API also supports padded and negative frame strides,
+per plane, through `interpret_into`.
 
 Compile and run the same stream through a cached, checked native kernel:
 
