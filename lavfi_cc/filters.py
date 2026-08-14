@@ -24,7 +24,10 @@ compute and expensive for the ones that tabulate.
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import math
 import re
@@ -1278,6 +1281,545 @@ def _lower_colorcontrast(
     )
 
 
+def _target_contraction() -> bool:
+    """Return the pinned build's multiply-add behavior as a lowering error."""
+
+    try:
+        return target_fuses_multiply_add()
+    except UnknownTargetError as error:
+        raise LoweringError("unknown_target", str(error)) from error
+
+
+def _sign(value: float) -> float:
+    """FFSIGN as a float constant, including its zero result."""
+
+    return float((value > 0.0) - (value < 0.0))
+
+
+def _vibrance_program(
+    values: dict[str, float], *, fused: bool, depth: int
+) -> ExprProgram:
+    """Transcribe ``vf_vibrance.c``'s normalized RGB slice expression."""
+
+    builder = ExprBuilder()
+    one = builder.const(1.0)
+    maximum = builder.const(float((1 << depth) - 1))
+    scale = builder.const(_float32(1.0 / ((1 << depth) - 1)))
+
+    raw = [builder.channel(channel) for channel in range(3)]
+    normalized = [builder.mul(channel, scale) for channel in raw]
+    red, green, blue = normalized
+    saturation = builder.sub(
+        builder.max3(red, green, blue), builder.min3(red, green, blue)
+    )
+
+    red_luma = builder.const(values["rlum"])
+    green_luma = builder.const(values["glum"])
+    blue_luma = builder.const(values["blum"])
+    if fused:
+        # This is the order Clang emits for the pinned source on a target with
+        # FMA: seed with r*rc, add g*gc, then b*bc.  Without contraction the C
+        # expression below remains left-associative as written upstream.
+        luma = builder.fma(
+            blue,
+            blue_luma,
+            builder.fma(green, green_luma, builder.mul(red, red_luma)),
+        )
+    else:
+        luma = builder.add(
+            builder.add(
+                builder.mul(green, green_luma), builder.mul(red, red_luma)
+            ),
+            builder.mul(blue, blue_luma),
+        )
+
+    alternate = 1.0 if values["alternate"] else -1.0
+    outputs: dict[int, tuple[int, str]] = {}
+    for channel, balance_name in enumerate(("rbal", "gbal", "bbal")):
+        intensity = _float32(values["intensity"] * values[balance_name])
+        signed = _float32(alternate * _sign(intensity))
+        # 1 + intensity * (1 - signed * saturation), with both multiply-adds
+        # contracted by the pinned AArch64 build and separate on baseline x86.
+        inner = builder.multiply_add(
+            builder.const(-signed), saturation, one, fused=fused
+        )
+        coefficient = builder.multiply_add(
+            builder.const(intensity), inner, one, fused=fused
+        )
+        mixed = builder.multiply_add(
+            builder.sub(normalized[channel], luma), coefficient, luma, fused=fused
+        )
+        outputs[channel] = (
+            builder.mul(mixed, maximum),
+            _expression_quantizer("truncate_saturate", depth),
+        )
+    return builder.build(outputs)
+
+
+def _lower_vibrance(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    ranges = {
+        "intensity": (-2.0, 2.0, 0.0),
+        "rbal": (-10.0, 10.0, 1.0),
+        "gbal": (-10.0, 10.0, 1.0),
+        "bbal": (-10.0, 10.0, 1.0),
+        "rlum": (0.0, 1.0, 0.212656),
+        "glum": (0.0, 1.0, 0.715158),
+        "blum": (0.0, 1.0, 0.072186),
+    }
+    options = _check_options(invocation, set(ranges) | {"alternate"})
+    values = {
+        name: _float32(
+            _parse_number(options[name].value, name, minimum, maximum)
+            if name in options
+            else default
+        )
+        for name, (minimum, maximum, default) in ranges.items()
+    }
+    values["alternate"] = float(
+        _parse_bool(options["alternate"].value, "alternate")
+        if "alternate" in options
+        else False
+    )
+    depth = _depth(layout)
+    canonical = "vibrance=" + ":".join(
+        [f"{name}={values[name].hex()}" for name in ranges]
+        + [f"alternate={int(values['alternate'])}"]
+    )
+
+    # Every balance is multiplied by intensity before the pixel loop.  When
+    # all three are zero, cg/cb/cr are exactly one.  A fused lerp then recovers
+    # the input exactly, but the separately rounded `(input - luma) + luma`
+    # used on baseline x86 can lose a low bit, so even the default filter has
+    # to consult the target.
+    active = any(
+        _float32(values["intensity"] * values[name]) != 0.0
+        for name in ("rbal", "gbal", "bbal")
+    )
+    fused = _target_contraction()
+    if not active and fused:
+        program = ExprBuilder().build({})
+        return Lowered(
+            _expr_operations(program, invocation, index, depth),
+            canonical + ":identity=1:fused_multiply_add=1",
+        )
+
+    program = _vibrance_program(values, fused=fused, depth=depth)
+    return Lowered(
+        _expr_operations(program, invocation, index, depth),
+        f"{canonical}:fused_multiply_add={int(fused)}",
+    )
+
+
+@lru_cache(maxsize=1)
+def _libm() -> ctypes.CDLL:
+    """The process libm, which is also what the pinned FFmpeg binary uses."""
+
+    name = ctypes.util.find_library("m")
+    return ctypes.CDLL(name) if name else ctypes.CDLL(None)
+
+
+def _libm_unary(name: str, value: float) -> float:
+    try:
+        function = getattr(_libm(), name)
+    except (AttributeError, OSError) as error:
+        raise LoweringError(
+            "libm_unavailable",
+            f"the host C library does not expose {name}(), which colortemperature needs",
+            "temperature",
+        ) from error
+    function.argtypes = (ctypes.c_float,)
+    function.restype = ctypes.c_float
+    return float(function(ctypes.c_float(value)))
+
+
+def _libm_binary(name: str, left: float, right: float) -> float:
+    try:
+        function = getattr(_libm(), name)
+    except (AttributeError, OSError) as error:
+        raise LoweringError(
+            "libm_unavailable",
+            f"the host C library does not expose {name}(), which colortemperature needs",
+            "temperature",
+        ) from error
+    function.argtypes = (ctypes.c_float, ctypes.c_float)
+    function.restype = ctypes.c_float
+    return float(function(ctypes.c_float(left), ctypes.c_float(right)))
+
+
+def _f32_multiply_add(left: float, right: float, addend: float, fused: bool) -> float:
+    if fused:
+        # Binary64 carries an exact binary32 product with enough guard bits for
+        # the final binary32 rounding, as in ExprProgram.evaluate's fma path.
+        return _float32(left * right + addend)
+    return _float32(_float32(left * right) + addend)
+
+
+def _temperature_color(
+    temperature: float, *, fused: bool
+) -> tuple[float, float, float]:
+    """Run ``kelvin2rgb`` once using the host's float libm entry points."""
+
+    kelvin = _float32(temperature / _float32(100.0))
+    zero = _float32(0.0)
+    one = _float32(1.0)
+
+    def saturate(value: float) -> float:
+        return _float32(min(max(value, zero), one))
+
+    if kelvin <= _float32(66.0):
+        red = one
+        logged = _libm_unary("logf", kelvin)
+        green = saturate(
+            _f32_multiply_add(
+                _float32(0.39008157876901960784),
+                logged,
+                _float32(-0.63184144378862745098),
+                fused,
+            )
+        )
+    else:
+        t = max(_float32(kelvin - _float32(60.0)), zero)
+        red = saturate(
+            _float32(
+                _float32(1.29293618606274509804)
+                * _libm_binary("powf", t, _float32(-0.1332047592))
+            )
+        )
+        green = saturate(
+            _float32(
+                _float32(1.12989086089529411765)
+                * _libm_binary("powf", t, _float32(-0.0755148492))
+            )
+        )
+
+    if kelvin >= _float32(66.0):
+        blue = one
+    elif kelvin <= _float32(19.0):
+        blue = zero
+    else:
+        logged = _libm_unary("logf", _float32(kelvin - _float32(10.0)))
+        blue = saturate(
+            _f32_multiply_add(
+                _float32(0.54320678911019607843),
+                logged,
+                _float32(-1.19625408914),
+                fused,
+            )
+        )
+    return red, green, blue
+
+
+def _colortemperature_program(
+    color: tuple[float, float, float],
+    values: dict[str, float],
+    *,
+    fused: bool,
+    depth: int,
+) -> ExprProgram:
+    builder = ExprBuilder()
+    epsilon = builder.const(_FLT_EPSILON)
+    mix = builder.const(values["mix"])
+    preserve = builder.const(values["pl"])
+    inputs = [builder.channel(channel) for channel in range(3)]
+    colored = [
+        builder.mul(inputs[channel], builder.const(color[channel]))
+        for channel in range(3)
+    ]
+    mixed = [
+        builder.multiply_add(
+            builder.sub(colored[channel], inputs[channel]),
+            mix,
+            inputs[channel],
+            fused=fused,
+        )
+        for channel in range(3)
+    ]
+    input_lightness = builder.add(
+        builder.add(builder.max3(*inputs), builder.min3(*inputs)), epsilon
+    )
+    output_lightness = builder.add(
+        builder.add(builder.max3(*mixed), builder.min3(*mixed)), epsilon
+    )
+    lightness = builder.div(input_lightness, output_lightness)
+    restored = [builder.mul(value, lightness) for value in mixed]
+    outputs = {
+        channel: (
+            builder.multiply_add(
+                builder.sub(restored[channel], mixed[channel]),
+                preserve,
+                mixed[channel],
+                fused=fused,
+            ),
+            _expression_quantizer("truncate_saturate", depth),
+        )
+        for channel in range(3)
+    }
+    return builder.build(outputs)
+
+
+def _lower_colortemperature(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    options = _check_options(invocation, {"temperature", "mix", "pl"})
+    specifications = {
+        "temperature": (1000.0, 40000.0, 6500.0),
+        "mix": (0.0, 1.0, 1.0),
+        "pl": (0.0, 1.0, 0.0),
+    }
+    values = {
+        name: _float32(
+            _parse_number(options[name].value, name, minimum, maximum)
+            if name in options
+            else default
+        )
+        for name, (minimum, maximum, default) in specifications.items()
+    }
+    depth = _depth(layout)
+    canonical = "colortemperature=" + ":".join(
+        f"{name}={values[name].hex()}" for name in specifications
+    )
+    if values["mix"] == 0.0:
+        return Lowered(
+            _expr_operations(ExprBuilder().build({}), invocation, index, depth),
+            canonical + ":identity=1",
+        )
+
+    fused = _target_contraction()
+    color = _temperature_color(values["temperature"], fused=fused)
+    program = _colortemperature_program(color, values, fused=fused, depth=depth)
+    return Lowered(
+        _expr_operations(program, invocation, index, depth),
+        canonical
+        + ":color="
+        + "+".join(value.hex() for value in color)
+        + f":fused_multiply_add={int(fused)}",
+    )
+
+
+_SELECTIVE_RANGES = (
+    ("reds", "maximum", 0),
+    ("yellows", "minimum", 2),
+    ("greens", "maximum", 1),
+    ("cyans", "minimum", 0),
+    ("blues", "maximum", 2),
+    ("magentas", "minimum", 1),
+    ("whites", "white", None),
+    ("neutrals", "neutral", None),
+    ("blacks", "black", None),
+)
+
+
+def _parse_selective_adjustments(
+    value: str, option: str
+) -> tuple[float, float, float, float]:
+    fields = value.split()
+    if not 1 <= len(fields) <= 4:
+        raise LoweringError(
+            "invalid_value",
+            f"{option} must contain one to four whitespace-separated CMYK numbers",
+            option,
+        )
+    parsed: list[float] = []
+    for field in fields:
+        try:
+            number = float(field)
+        except ValueError as error:
+            raise LoweringError(
+                "invalid_value", f"expected a CMYK number, got {field!r}", option
+            ) from error
+        if not math.isfinite(number):
+            raise LoweringError(
+                "non_finite", "non-finite CMYK adjustments are not supported", option
+            )
+        if not -1.0 <= number <= 1.0:
+            raise LoweringError(
+                "out_of_range", f"CMYK adjustment {field!r} is outside [-1, 1]", option
+            )
+        parsed.append(_float32(0.0 if number == 0.0 else number))
+    parsed.extend([0.0] * (4 - len(parsed)))
+    return tuple(parsed)  # type: ignore[return-value]
+
+
+def _selectivecolor_program(
+    ranges: dict[str, tuple[float, float, float, float]],
+    *,
+    relative: bool,
+    fused: bool,
+    depth: int,
+) -> ExprProgram:
+    """Transcribe selectivecolor's classification and per-range rounding."""
+
+    builder = ExprBuilder()
+    zero = builder.const(0.0)
+    one = builder.const(1.0)
+    half = builder.const(0.5)
+    maximum_value = (1 << depth) - 1
+    maximum = builder.const(float(maximum_value))
+    midpoint = builder.const(float(1 << (depth - 1)))
+    normalization = builder.const(_float32(1.0 / maximum_value))
+    inputs = [builder.channel(channel) for channel in range(3)]
+    normalized = [builder.mul(value, normalization) for value in inputs]
+    minimum = builder.min3(*inputs)
+    maximum_channel = builder.max3(*inputs)
+    middle = builder.sub(
+        builder.sub(
+            builder.add(builder.add(*inputs[:2]), inputs[2]), minimum
+        ),
+        maximum_channel,
+    )
+
+    rgb_scale = builder.sub(maximum_channel, middle)
+    cmy_scale = builder.sub(middle, minimum)
+    doubled_maximum = builder.const(float(maximum_value * 2))
+    neutral_scale = builder.floor(
+        builder.mul(
+            builder.add(
+                builder.sub(
+                    doubled_maximum,
+                    builder.add(
+                        builder.abs(
+                            builder.sub(
+                                builder.mul(maximum_channel, builder.const(2.0)),
+                                maximum,
+                            )
+                        ),
+                        builder.abs(
+                            builder.sub(
+                                builder.mul(minimum, builder.const(2.0)), maximum
+                            )
+                        ),
+                    ),
+                ),
+                one,
+            ),
+            half,
+        )
+    )
+    white_scale = builder.sub(builder.mul(minimum, builder.const(2.0)), maximum)
+    black_scale = builder.sub(
+        maximum, builder.mul(maximum_channel, builder.const(2.0))
+    )
+
+    white_flag = builder.mul(
+        builder.mul(
+            builder.gt(inputs[0], midpoint), builder.gt(inputs[1], midpoint)
+        ),
+        builder.gt(inputs[2], midpoint),
+    )
+    neutral_flag = builder.mul(
+        builder.gt(maximum_channel, zero),
+        builder.sub(one, builder.eq(minimum, maximum)),
+    )
+    black_flag = builder.mul(
+        builder.mul(
+            builder.gt(midpoint, inputs[0]), builder.gt(midpoint, inputs[1])
+        ),
+        builder.gt(midpoint, inputs[2]),
+    )
+
+    adjustments = [zero, zero, zero]
+    for option, kind, channel in _SELECTIVE_RANGES:
+        configured = ranges.get(option)
+        if configured is None:
+            continue
+        if kind == "maximum":
+            scale = rgb_scale
+            flag = builder.eq(inputs[channel], maximum_channel)  # type: ignore[index]
+        elif kind == "minimum":
+            scale = cmy_scale
+            flag = builder.eq(inputs[channel], minimum)  # type: ignore[index]
+        elif kind == "white":
+            scale, flag = white_scale, white_flag
+        elif kind == "neutral":
+            scale, flag = neutral_scale, neutral_flag
+        else:
+            scale, flag = black_scale, black_flag
+        active = builder.mul(flag, builder.gt(scale, zero))
+        k = builder.const(configured[3])
+        for output, adjustment in enumerate(configured[:3]):
+            adjust = builder.const(adjustment)
+            product_left = builder.sub(builder.const(-1.0), adjust)
+            result = builder.multiply_add(
+                product_left, k, builder.neg(adjust), fused=fused
+            )
+            if relative:
+                result = builder.mul(result, builder.sub(one, normalized[output]))
+            clipped = builder.clipf(
+                result,
+                builder.neg(normalized[output]),
+                builder.sub(one, normalized[output]),
+            )
+            rounded = builder.lrintf(builder.mul(clipped, scale))
+            adjustments[output] = builder.add(
+                adjustments[output], builder.mul(active, rounded)
+            )
+
+    outputs = {
+        channel: (
+            builder.add(inputs[channel], adjustments[channel]),
+            _expression_quantizer("truncate_saturate", depth),
+        )
+        for channel in range(3)
+    }
+    return builder.build(outputs)
+
+
+def _lower_selectivecolor(
+    invocation: FilterInvocation, index: int, layout: PixelLayout | None
+) -> Lowered:
+    names = {name for name, _, _ in _SELECTIVE_RANGES}
+    options = _check_options(invocation, names | {"correction_method", "psfile"})
+    if "psfile" in options:
+        raise LoweringError(
+            "runtime_option",
+            "psfile reads adjustments from a file, so they are not contained in the graph",
+            "psfile",
+        )
+
+    method = options.get("correction_method")
+    method_name = method.value.strip().lower() if method is not None else "absolute"
+    aliases = {"absolute": False, "0": False, "relative": True, "1": True}
+    if method_name not in aliases:
+        raise LoweringError(
+            "invalid_value",
+            f"correction_method must be absolute or relative, got {method.value!r}",  # type: ignore[union-attr]
+            "correction_method",
+        )
+    relative = aliases[method_name]
+    ranges = {
+        name: _parse_selective_adjustments(options[name].value, name)
+        for name in names
+        if name in options
+    }
+    # register_range ignores an all-zero option string.
+    ranges = {name: value for name, value in ranges.items() if any(value)}
+    depth = _depth(layout)
+    canonical = "selectivecolor=correction_method=" + (
+        "relative" if relative else "absolute"
+    )
+    for name, _, _ in _SELECTIVE_RANGES:
+        if name in ranges:
+            canonical += ":" + name + "=" + "+".join(
+                value.hex() for value in ranges[name]
+            )
+    if not ranges:
+        return Lowered(
+            _expr_operations(ExprBuilder().build({}), invocation, index, depth),
+            canonical + ":identity=1",
+        )
+
+    fused = _target_contraction()
+    program = _selectivecolor_program(
+        ranges, relative=relative, fused=fused, depth=depth
+    )
+    return Lowered(
+        _expr_operations(program, invocation, index, depth),
+        f"{canonical}:fused_multiply_add={int(fused)}",
+    )
+
+
 #: ``curves``' presets, verbatim from ``curves_presets`` in ``vf_curves.c``.
 #:
 #: A preset only fills a component the caller left unset, and it is expanded in
@@ -1492,6 +2034,9 @@ LOWERERS: dict[str, Lowerer] = {
     "colorchannelmixer": _lower_colorchannelmixer,
     "colorbalance": _lower_colorbalance,
     "colorcontrast": _lower_colorcontrast,
+    "vibrance": _lower_vibrance,
+    "colortemperature": _lower_colortemperature,
+    "selectivecolor": _lower_selectivecolor,
     "curves": _lower_curves,
 }
 
@@ -1508,14 +2053,15 @@ SUPPORTED_FILTERS = tuple(LOWERERS)
 #: advertises far more YUV ratios than the ones here, and several filters
 #: advertise float formats; those are deliberately out of scope, so callers
 #: must only consult this table for a format in
-#: :data:`lavfi_cc.layouts.LAYOUTS`.  ``colorlevels`` and ``colorchannelmixer``
-#: additionally accept the ``0rgb``/``rgb0`` family that ``negate`` and
-#: ``lutrgb`` do not, so it is outside the common subset.
+#: :data:`lavfi_cc.layouts.LAYOUTS`.  Several RGB filters additionally accept
+#: the ``0rgb``/``rgb0`` family that ``negate`` and ``lutrgb`` do not, so it is
+#: outside the common subset.
 #:
 #: The two families barely overlap: ``negate`` advertises both, while
-#: ``lutrgb``, ``colorlevels``, and ``colorchannelmixer`` are RGB-only and
-#: ``lutyuv`` is YUV-only.  A run mixing the two families is therefore not
-#: contiguous in one format and is refused rather than fused.
+#: every other accepted filter stays in RGB or YUV.  A run mixing the two
+#: families is therefore not contiguous in one format and is refused rather
+#: than fused.  ``selectivecolor`` narrows RGB again by advertising packed
+#: layouts only.
 #:
 #: The ``yuva`` trio needs no separate column at eight bits: every filter that
 #: advertises a planar YUV format there advertises its alpha-carrying twin as
@@ -1524,11 +2070,13 @@ SUPPORTED_FILTERS = tuple(LOWERERS)
 _RGB8 = frozenset(
     {"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24", "gbrp", "gbrap"}
 )
+_PACKED_RGB8 = frozenset({"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24"})
 _YUVA8 = frozenset({"yuva444p", "yuva422p", "yuva420p"})
 _YUV8 = frozenset({"yuv444p", "yuv422p", "yuv420p"}) | _YUVA8
 
-#: Planar RGB above eight bits, which every accepted RGB filter advertises
-#: identically, plus the two packed orders they do not all agree on.
+#: Planar RGB above eight bits, which every accepted RGB filter other than
+#: packed-only ``selectivecolor`` advertises identically, plus the two packed
+#: orders the remaining filters do not all agree on.
 _GBRP_HIGH = frozenset(
     {
         "gbrp9le",
@@ -1574,6 +2122,11 @@ FILTER_FORMATS: dict[str, frozenset[str]] = {
     "colorchannelmixer": _RGB8 | _RGB_HIGH,
     "colorbalance": _RGB8 | _RGB_HIGH,
     "colorcontrast": _RGB8 | _RGB_HIGH,
+    "vibrance": _RGB8 | _RGB_HIGH,
+    "colortemperature": _RGB8 | _RGB_HIGH,
+    # vf_selectivecolor.c has packed slice functions only.  Unlike the other
+    # two additions it advertises neither gbrp nor gbrap at any depth.
+    "selectivecolor": _PACKED_RGB8 | _PACKED_RGB_HIGH | _PACKED_BGR_HIGH,
     "curves": _RGB8 | _RGB_HIGH,
 }
 

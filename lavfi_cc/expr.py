@@ -12,8 +12,11 @@ filter's observable behaviour::
 
 An :class:`ExprProgram` is how the IR says that.  It is a single-assignment
 list of float32 instructions -- no branches, no loops, no memory -- plus one
-optional output per channel.  A channel with no output keeps the sample it came
-in with, which is what upstream does with alpha.
+optional output per channel.  Besides arithmetic it carries exact comparisons
+and intermediate ``lrintf`` for ``selectivecolor``, whose independently rounded
+range terms cannot be recovered by one output quantizer.  A channel with no
+output keeps the sample it came in with, which is what upstream does with
+alpha.
 
 **Why the operation order is spelled out.** Every instruction here rounds its
 result to binary32, exactly once, and the order they appear in is the order
@@ -73,6 +76,13 @@ OPCODES: dict[str, int] = {
     "channel": 1,
     "const": 1,
     "neg": 1,
+    "abs": 1,
+    "floor": 1,
+    # Round to the nearest integer under the process rounding mode, preserving
+    # the result as an exactly-representable float for later integer-style
+    # accumulation.  selectivecolor rounds each configured range before it
+    # adds the ranges together, so an output-only quantizer cannot express it.
+    "lrintf": 1,
     "add": 2,
     "sub": 2,
     "mul": 2,
@@ -81,6 +91,11 @@ OPCODES: dict[str, int] = {
     # fmaxf: the two disagree when both operands are zeros of opposite sign.
     "min": 2,
     "max": 2,
+    # Comparisons produce the float32 values 0 or 1.  Keeping predicates in
+    # the same straight-line value space lets a lowering mask a term without
+    # adding control flow to the pixel program.
+    "eq": 2,
+    "gt": 2,
     # One fused multiply-add: fma(a, b, c) rounds a * b + c once.
     "fma": 3,
 }
@@ -260,6 +275,15 @@ class ExprProgram:
             if opcode == "neg":
                 values.append(f32(-values[instruction[1]]))
                 continue
+            if opcode == "abs":
+                values.append(f32(abs(values[instruction[1]])))
+                continue
+            if opcode == "floor":
+                values.append(f32(math.floor(values[instruction[1]])))
+                continue
+            if opcode == "lrintf":
+                values.append(f32(round(values[instruction[1]])))
+                continue
             left = values[instruction[1]]
             right = values[instruction[2]]
             if opcode == "add":
@@ -274,6 +298,10 @@ class ExprProgram:
                 values.append(right if left > right else left)
             elif opcode == "max":
                 values.append(left if left > right else right)
+            elif opcode == "eq":
+                values.append(1.0 if left == right else 0.0)
+            elif opcode == "gt":
+                values.append(1.0 if left > right else 0.0)
             else:
                 # binary64 holds the exact binary32 product, and 53 >= 2 * 24 + 2
                 # makes the second rounding harmless, so this is fmaf exactly.
@@ -373,6 +401,15 @@ class ExprBuilder:
     def neg(self, value: int) -> int:
         return self._emit("neg", value)
 
+    def abs(self, value: int) -> int:
+        return self._emit("abs", value)
+
+    def floor(self, value: int) -> int:
+        return self._emit("floor", value)
+
+    def lrintf(self, value: int) -> int:
+        return self._emit("lrintf", value)
+
     def add(self, left: int, right: int) -> int:
         return self._emit("add", left, right)
 
@@ -390,6 +427,12 @@ class ExprBuilder:
 
     def max(self, left: int, right: int) -> int:
         return self._emit("max", left, right)
+
+    def eq(self, left: int, right: int) -> int:
+        return self._emit("eq", left, right)
+
+    def gt(self, left: int, right: int) -> int:
+        return self._emit("gt", left, right)
 
     def fma(self, left: int, right: int, addend: int) -> int:
         return self._emit("fma", left, right, addend)
@@ -519,6 +562,12 @@ def render_c(
             expression = f"{c_float_literal(value)} /* {value:g} */"
         elif opcode == "neg":
             expression = f"-{prefix}_{instruction[1]}"
+        elif opcode == "abs":
+            expression = f"fabsf({prefix}_{instruction[1]})"
+        elif opcode == "floor":
+            expression = f"floorf({prefix}_{instruction[1]})"
+        elif opcode == "lrintf":
+            expression = f"(float)lrintf({prefix}_{instruction[1]})"
         elif opcode == "fma":
             expression = (
                 f"fmaf({prefix}_{instruction[1]}, {prefix}_{instruction[2]}, "
@@ -531,6 +580,12 @@ def render_c(
             # same operand here as it does upstream.
             taken, otherwise = (right, left) if opcode == "min" else (left, right)
             expression = f"{left} > {right} ? {taken} : {otherwise}"
+        elif opcode in {"eq", "gt"}:
+            operator = "==" if opcode == "eq" else ">"
+            expression = (
+                f"(float)({prefix}_{instruction[1]} {operator} "
+                f"{prefix}_{instruction[2]})"
+            )
         else:
             expression = (
                 f"{prefix}_{instruction[1]} {_C_BINARY[opcode]} "

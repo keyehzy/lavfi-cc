@@ -31,6 +31,8 @@ may only be fused in a format *every* filter in it accepts:
 | `negate` | RGB and YUV, 8–16 bits | the only one in both families |
 | `lutrgb`, `colorlevels`, `colorchannelmixer` | RGB only, 8–16 bits | refused in a YUV run |
 | `colorbalance`, `colorcontrast`, `curves` | RGB only, 8–16 bits | refused in a YUV run |
+| `vibrance`, `colortemperature` | RGB only, 8–16 bits | all accepted RGB layouts |
+| `selectivecolor` | packed RGB only, 8 or 16 bits | upstream advertises no planar RGB format |
 | `lutyuv` | YUV only, 8–16 bits | above 8 bits, alpha is available only at 16 bits |
 | `hue` | YUV only, 8 and 10 bits | refused in an RGB run |
 | `eq` | YUV only, 8 bits | the one filter with no deep format at all |
@@ -54,12 +56,13 @@ chroma is still refused there, since those have no sample in common. On the
 `yuva` layouts the same rule puts alpha with luma rather than with the chroma
 it is stored after, because that is the grid it is sampled on.
 
-`colorbalance` and `colorcontrast` read all three colour channels through a
-per-pixel lightness term, which no table can express. They lower to `expr_f32`,
-a straight-line float32 expression that states every rounding upstream performs
-— including which multiply-adds its compiler fuses, because on some of these
-filters upstream's own bytes differ between an AArch64 build and a baseline
-x86-64 one. See [`docs/roadmap-status.md`](docs/roadmap-status.md).
+`colorbalance`, `colorcontrast`, `vibrance`, `colortemperature`, and
+`selectivecolor` read across the three colour channels in ways no per-channel
+table can express. They lower to `expr_f32`, a straight-line float32 expression
+that states every rounding upstream performs — including which multiply-adds
+its compiler fuses. `selectivecolor` also states its pixel classification and
+the `lrintf` boundary applied to each range before range adjustments are added.
+See [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
 Explain and lower a bounded region with:
 

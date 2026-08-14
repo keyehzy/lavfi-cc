@@ -122,6 +122,15 @@ class AdvertisedFormatTests(unittest.TestCase):
         self.assertFalse(analysis.eligible)
         self.assertEqual(analysis.diagnostics[0].code, "format_not_advertised")
 
+    def test_new_float_filters_follow_their_upstream_deep_format_lists(self) -> None:
+        for filter_name in ("vibrance", "colortemperature"):
+            for name in ("gbrp10le", "gbrap16le", "rgb48le", "bgra64le"):
+                self.assertTrue(filter_supports_format(filter_name, name), (filter_name, name))
+        for name in ("rgb48le", "rgba64le", "bgr48le", "bgra64le"):
+            self.assertTrue(filter_supports_format("selectivecolor", name), name)
+        for name in ("gbrp10le", "gbrap16le"):
+            self.assertFalse(filter_supports_format("selectivecolor", name), name)
+
 
 class UpstreamConstantTests(unittest.TestCase):
     """Where upstream's own numbers stop being the eight-bit ones."""

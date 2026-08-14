@@ -22,9 +22,10 @@ from lavfi_cc.layouts import get_layout
 
 #: One case per code-generation shape: the packed whole-pixel walk with every
 #: lowering, the one-plane-per-loop walk a subsampled layout needs, the
-#: two-planes-in-one-loop walk hue's chroma rotation forces, the inline float32
-#: expression, which is the only shape that calls libm and converts a float to
-#: an integer -- both of which UBSan has something to say about -- and the
+#: two-planes-in-one-loop walk hue's chroma rotation forces, and the inline
+#: float32 expression, including explicit fma, predicates, floor, and
+#: intermediate/final float-to-integer conversions -- operations the
+#: sanitizers have something to say about -- plus the
 #: yuva420p mix of loops at two different resolutions in one kernel, where a
 #: plane-3 pointer walked at a chroma plane's row count would run off the end of
 #: the frame. The dimensions are odd so a chroma plane's AV_CEIL_RSHIFT rounding
@@ -63,6 +64,8 @@ CASES = (
         "format=gbrap,curves=preset=vintage:interp=pchip,"
         "colorbalance=rs=.3:gm=-.2:bh=.5:bs=-.35,"
         "colorcontrast=rc=.4:gm=.25:by=-.15:rcw=.9:gmw=.7:byw=.3:pl=.35,"
+        "vibrance=intensity=.4:rbal=.8:gbal=1.2,"
+        "colortemperature=temperature=5500:mix=.8:pl=.3,"
         "format=gbrap",
         257,
         3,
@@ -78,6 +81,9 @@ CASES = (
         "format=rgba64le,negate=components=r+g+b+a,lutrgb=r=negval:g=val*1.08+2,"
         "colorbalance=rs=.3:gm=-.2:bh=.5,"
         "colorcontrast=rc=.4:gm=.25:by=-.15:rcw=.9:gmw=.7:byw=.3:pl=.35,"
+        "vibrance=intensity=-.35,colortemperature=temperature=7600:mix=.7:pl=.2,"
+        "selectivecolor=correction_method=relative:reds='.2 -.1 0 .05':"
+        "neutrals='0 .2 -.2 .3',"
         "format=rgba64le",
         129,
         3,

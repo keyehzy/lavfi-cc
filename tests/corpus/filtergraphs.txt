@@ -50,8 +50,7 @@ format=yuva422p,negate=components=y,eq=saturation=1.15,hue=h=12
 format=yuva444p,lutyuv=y=negval:u=negval:v=negval:a=negval,eq=contrast=1.2
 format=yuva420p,eq=brightness=0.06,crop=1280:720:0:0,hue=h=12:s=1.15,negate=components=a
 
-# --- RGB grading as it is actually written, now that curves, colorbalance, ---
-#     and colorcontrast lower
+# --- RGB grading as it is actually written, now that the RGB filters lower --
 format=rgba,curves=preset=vintage,colorbalance=rs=0.1:gm=-0.1:bh=0.15,format=yuv420p
 format=rgba,colorbalance=rs=0.2:bs=-0.15:rh=-0.1:bh=0.2,colorcontrast=rc=0.3:rcw=0.8:gmw=0.4,format=yuv420p
 format=rgb24,curves=m='0/0 0.5/0.55 1/1':r='0/0.05 1/1',negate,colorlevels=rimin=0.04,format=yuv420p
@@ -60,6 +59,9 @@ format=rgba,curves=preset=increase_contrast,crop=1280:720:0:0,colorbalance=bh=0.
 format=rgba,lutrgb=r=val*1.05,colorbalance=rs=0.1,curves=g='0/0 1/0.95',colorlevels=bimax=0.95,format=yuv420p
 format=rgba,colorcontrast=rc=0.25:gm=-0.15:by=0.1:rcw=0.7:gmw=0.7:byw=0.7:pl=0.5,negate,format=yuv420p
 curves=preset=darker,colorbalance=rs=0.1:bh=0.1,negate
+format=rgba,colortemperature=temperature=5500,negate,format=yuv420p
+format=rgba,vibrance=intensity=0.4,colorlevels=rimin=0.05,format=yuv420p
+format=rgba,negate,selectivecolor=reds=0.1 0 -0.1,lutrgb=r=val*1.1,format=yuv420p
 
 # --- Grading above eight bits, where broadcast and film pipelines live -------
 format=yuv420p10le,negate,lutyuv=y='clip(val,64,940)',hue=h=6:s=1.05
@@ -109,9 +111,6 @@ format=rgba,boxblur=2:1,negate,format=yuv420p
 format=rgba,negate,gblur=sigma=3,lutrgb=r=val*2,format=yuv420p
 format=rgba,unsharp=5:5:1.0,colorlevels=rimin=0.05,format=yuv420p
 drawtext=text='hello':x=10:y=10,format=yuv420p
-format=rgba,colortemperature=temperature=5500,negate,format=yuv420p
-format=rgba,vibrance=intensity=0.4,colorlevels=rimin=0.05,format=yuv420p
-format=rgba,negate,selectivecolor=reds=0.1 0 -0.1,lutrgb=r=val*1.1,format=yuv420p
 
 # --- Options inside the subset that are still rejected -----------------------
 format=rgba,colorlevels=rimin=-0.1,negate,format=yuv420p

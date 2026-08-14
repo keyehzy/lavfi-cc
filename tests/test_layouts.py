@@ -27,11 +27,8 @@ WEEK5_CANDIDATES = (
 )
 
 # One chain per accepted filter plus a combined one, so every RGB layout is
-# exercised against every lowering.  colorbalance and colorcontrast are the
-# cross-channel float32 expressions: both read all three colour channels
-# through a per-pixel lightness term, which no table can express.  curves is
-# channel-independent upstream, so it is a table, but a table built by a cubic
-# spline rather than by an expression.
+# exercised against every lowering.  The float32 filters read all three colour
+# channels, while curves is channel-independent upstream and remains a table.
 RGB_CHAINS = (
     "negate",
     "lutrgb=r=val*1.125-7:g=negval:b='clip(val,13,241)'",
@@ -39,12 +36,22 @@ RGB_CHAINS = (
     "colorchannelmixer=rr=.9:rg=.1:gg=.8:gb=.2:bb=1:aa=1:pc=none",
     "colorbalance=rs=.3:gm=-.2:bh=.5:rm=.1:gh=.4:bs=-.35",
     "colorcontrast=rc=.4:gm=.25:by=-.15:rcw=.9:gmw=.7:byw=.3:pl=.35",
+    "vibrance=intensity=.4:rbal=.8:gbal=1.2:bbal=-.4:alternate=1",
+    "colortemperature=temperature=5500:mix=.8:pl=.3",
+    "selectivecolor=reds='0.1 0 -0.1':blacks='0 .2 0 -.1'",
+    "selectivecolor=correction_method=relative:blues='-.4 .1 .2 0':"
+    "neutrals='0 .2 -.2 .3'",
+    "selectivecolor=yellows='.1 0 -.2 .05':greens='-.2 .1 0 0':"
+    "cyans='0 -.15 .2 .1':magentas='.1 .2 -.1 0':whites='-.1 0 .1 .2'",
     "curves=r='0/0 0.5/0.4 1/1':g='0/0.1 1/0.9':b='0/0 0.3/0.5 1/1'",
     "curves=preset=vintage:interp=pchip",
     "negate,lutrgb=r=val*1.08+2,colorlevels=rimin=.05,"
     "colorchannelmixer=rr=.9:rg=.1:ba=.3",
     "curves=m='0/0 0.5/0.6 1/1',colorbalance=rs=.2:bh=-.4,"
     "colorcontrast=rc=.5:rcw=1:gmw=.25,negate",
+    "vibrance=intensity=-.35,colortemperature=temperature=7600:mix=.7:pl=.2,negate",
+    "vibrance=intensity=.25,colortemperature=temperature=7200:mix=.6,"
+    "selectivecolor=reds='.15 -.1 0 .05',negate",
 )
 
 # negate, lutyuv, eq, and hue are the accepted filters that advertise YUV
@@ -104,6 +111,10 @@ HIGH_DEPTH_RGB_CHAINS = (
     "curves=r='0/0.05 1/1'",
     "lutrgb=r=negval:g='clip(val,300,3000)'",
     "colorlevels=rimin=.05:gimax=.9,colorbalance=rs=.25:bh=-.3",
+    "vibrance=intensity=-.45:rbal=.8:gbal=1.1,"
+    "colortemperature=temperature=8400:mix=.65:pl=.25,negate",
+    "vibrance=intensity=.3,colortemperature=temperature=5800:mix=.8,"
+    "selectivecolor=correction_method=relative:reds='.2 -.1 0 .05',negate",
 )
 
 
@@ -454,7 +465,9 @@ class LayoutAnalysisTests(unittest.TestCase):
         # The same negotiation argument as for yuv420p: FFmpeg would convert
         # around an RGB-only filter, so the run is not contiguous in one format.
         for name in ("lutrgb=r=val*2", "colorlevels=rimin=.05", "curves=r='0/0 1/1'",
-                     "colorbalance=rs=.2", "colorcontrast=rc=.4:rcw=.9"):
+                     "colorbalance=rs=.2", "colorcontrast=rc=.4:rcw=.9",
+                     "vibrance=intensity=.2", "colortemperature=temperature=5500",
+                     "selectivecolor=reds=.2"):
             with self.subTest(filter=name):
                 analysis = analyze_filtergraph(
                     f"format=yuva420p,{name},format=yuva420p"

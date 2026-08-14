@@ -161,6 +161,21 @@ class ExprProgramTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(builder.build({}).instructions), 3)
 
+    def test_predicates_and_intermediate_rounding_are_expression_operations(self) -> None:
+        # selectivecolor classifies a pixel, rounds each range adjustment with
+        # lrintf, then adds those rounded integers.  These operations keep that
+        # boundary inside one straight-line expr_f32 program.
+        builder = ExprBuilder()
+        value = builder.channel(0)
+        active = builder.gt(value, builder.const(10.0))
+        rounded = builder.lrintf(builder.const(2.5))
+        magnitude = builder.floor(builder.abs(builder.const(-3.75)))
+        result = builder.add(builder.mul(active, rounded), magnitude)
+        built = builder.build({0: (result, "truncate_saturate_u8")})
+        self.assertEqual(built.evaluate((9, 0, 0, 0))[0], 3)
+        # lrintf uses round-to-nearest, ties-to-even: 2.5 becomes 2.
+        self.assertEqual(built.evaluate((11, 0, 0, 0))[0], 5)
+
     def test_multiply_is_exact_only_for_a_power_of_two_that_cannot_overflow(self) -> None:
         # colorbalance's whole target-independence argument rests on this.
         self.assertTrue(multiply_is_exact(4.0, 2.0))
@@ -337,6 +352,153 @@ class ColorcontrastTests(unittest.TestCase):
                 analysis = analyze_filtergraph(rgb(f"colorcontrast={option}"))
                 self.assertFalse(analysis.eligible)
                 self.assertEqual(analysis.diagnostics[0].code, "out_of_range")
+
+
+class VibranceTests(unittest.TestCase):
+    def test_default_intensity_exposes_the_hosts_lerp_rounding(self) -> None:
+        # With FMA, luma + (input-luma)*1 is exactly input.  With separate
+        # operations the subtraction can lose a low bit before luma is added
+        # back; upstream really changes this pixel on a baseline x86 build.
+        with EnvironmentVariable(FUSED_MULTIPLY_ADD_VARIABLE, "1"):
+            fused = require_ir(rgb("vibrance"))
+        with EnvironmentVariable(FUSED_MULTIPLY_ADD_VARIABLE, "0"):
+            separate = require_ir(rgb("vibrance"))
+        self.assertTrue(program(fused).is_identity)
+        self.assertFalse(program(separate).is_identity)
+        self.assertEqual(interpret_pixel(separate, (0, 1, 63, 0)), (0, 0, 63, 0))
+        self.assertEqual(
+            [operation.kind for operation in optimize_ir(fused).ir.operations],
+            ["load_rgba8", "store_rgba8"],
+        )
+
+    def test_luma_couples_all_three_color_channels(self) -> None:
+        ir = require_ir(rgb("vibrance=intensity=.7"))
+        first = interpret_pixel(ir, (120, 70, 0, 255))
+        second = interpret_pixel(ir, (120, 70, 255, 255))
+        self.assertNotEqual(first[0], second[0])
+
+    def test_active_plans_state_the_hosts_contraction(self) -> None:
+        graph = rgb("vibrance=intensity=.4:rbal=.8:gbal=1.2:alternate=1")
+        hashes = []
+        for setting in ("1", "0"):
+            with EnvironmentVariable(FUSED_MULTIPLY_ADD_VARIABLE, setting):
+                hashes.append(require_ir(graph).plan_hash)
+        self.assertNotEqual(*hashes)
+
+    def test_alpha_is_copied_and_option_ranges_are_checked(self) -> None:
+        built = program(require_ir(rgb("vibrance=intensity=.4")))
+        self.assertEqual(built.channels_written, frozenset({0, 1, 2}))
+        for option in ("intensity=3", "rbal=11", "rlum=-.1", "alternate=2"):
+            with self.subTest(option=option):
+                analysis = analyze_filtergraph(rgb(f"vibrance={option}"))
+                self.assertFalse(analysis.eligible)
+
+
+class ColorTemperatureTests(unittest.TestCase):
+    def test_mix_zero_is_an_identity_without_a_target_claim(self) -> None:
+        graph = rgb("colortemperature=temperature=1000:mix=0:pl=1")
+        hashes = set()
+        for setting in ("1", "0"):
+            with EnvironmentVariable(FUSED_MULTIPLY_ADD_VARIABLE, setting):
+                ir = require_ir(graph)
+                self.assertTrue(program(ir).is_identity)
+                hashes.add(ir.plan_hash)
+        self.assertEqual(len(hashes), 1)
+
+    def test_temperature_and_lightness_preservation_are_cross_channel(self) -> None:
+        ir = require_ir(
+            rgb("colortemperature=temperature=5500:mix=.8:pl=.35")
+        )
+        first = interpret_pixel(ir, (120, 70, 0, 255))
+        second = interpret_pixel(ir, (120, 70, 255, 255))
+        self.assertNotEqual(first[0], second[0])
+        self.assertEqual(program(ir).channels_written, frozenset({0, 1, 2}))
+
+    def test_active_plans_state_the_hosts_contraction(self) -> None:
+        graph = rgb("colortemperature=temperature=9000:mix=.7:pl=.2")
+        hashes = []
+        for setting in ("1", "0"):
+            with EnvironmentVariable(FUSED_MULTIPLY_ADD_VARIABLE, setting):
+                hashes.append(require_ir(graph).plan_hash)
+        self.assertNotEqual(*hashes)
+
+    def test_option_ranges_are_checked(self) -> None:
+        for option in ("temperature=999", "temperature=40001", "mix=-.1", "pl=1.1"):
+            with self.subTest(option=option):
+                analysis = analyze_filtergraph(rgb(f"colortemperature={option}"))
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(analysis.diagnostics[0].code, "out_of_range")
+
+
+class SelectiveColorTests(unittest.TestCase):
+    def test_no_registered_ranges_is_an_identity(self) -> None:
+        for options in ("", "=reds='0 0 0 0'"):
+            with self.subTest(options=options):
+                ir = require_ir(rgb("selectivecolor" + options))
+                self.assertTrue(program(ir).is_identity)
+
+    def test_missing_cmyk_fields_default_to_zero(self) -> None:
+        short = require_ir(rgb("selectivecolor=reds='.2 -.1'"))
+        full = require_ir(rgb("selectivecolor=reds='.2 -.1 0 0'"))
+        self.assertEqual(short.plan_hash, full.plan_hash)
+
+    def test_each_range_is_rounded_before_ranges_are_added(self) -> None:
+        ir = require_ir(
+            rgb(
+                "selectivecolor=reds='.3 -.2 .1 .15':"
+                "neutrals='-.1 .25 -.3 .2':blacks='.2 0 -.1 .1'"
+            )
+        )
+        built = program(ir)
+        self.assertTrue(any(item[0] == "lrintf" for item in built.instructions))
+        self.assertTrue(any(item[0] == "eq" for item in built.instructions))
+        self.assertTrue(any(item[0] == "gt" for item in built.instructions))
+        self.assertEqual(built.channels_written, frozenset({0, 1, 2}))
+
+    def test_relative_and_absolute_are_distinct(self) -> None:
+        absolute = require_ir(rgb("selectivecolor=reds='.5 .2 -.1 .3'"))
+        relative = require_ir(
+            rgb("selectivecolor=correction_method=relative:reds='.5 .2 -.1 .3'")
+        )
+        self.assertEqual(
+            absolute.plan_hash,
+            require_ir(
+                rgb("selectivecolor=correction_method=0:reds='.5 .2 -.1 .3'")
+            ).plan_hash,
+        )
+        self.assertEqual(
+            relative.plan_hash,
+            require_ir(
+                rgb("selectivecolor=correction_method=1:reds='.5 .2 -.1 .3'")
+            ).plan_hash,
+        )
+        pixel = (220, 80, 30, 17)
+        self.assertNotEqual(
+            interpret_pixel(absolute, pixel), interpret_pixel(relative, pixel)
+        )
+        self.assertEqual(interpret_pixel(absolute, pixel)[3], 17)
+        self.assertEqual(interpret_pixel(relative, pixel)[3], 17)
+
+    def test_only_packed_rgb_formats_are_advertised(self) -> None:
+        self.assertTrue(
+            analyze_filtergraph(rgb("selectivecolor=reds=.2", "rgba")).eligible
+        )
+        analysis = analyze_filtergraph(rgb("selectivecolor=reds=.2", "gbrp"))
+        self.assertFalse(analysis.eligible)
+        self.assertEqual(analysis.diagnostics[0].code, "format_not_advertised")
+
+    def test_file_and_invalid_adjustments_are_refused(self) -> None:
+        analysis = analyze_filtergraph(rgb("selectivecolor=psfile=grade.asv"))
+        self.assertFalse(analysis.eligible)
+        self.assertEqual(analysis.diagnostics[0].code, "runtime_option")
+        for option in ("reds='1.1 0 0 0'", "reds='0 nope'", "reds='0 0 0 0 0'"):
+            with self.subTest(option=option):
+                analysis = analyze_filtergraph(rgb(f"selectivecolor={option}"))
+                self.assertFalse(analysis.eligible)
+                self.assertIn(
+                    analysis.diagnostics[0].code,
+                    {"invalid_value", "out_of_range"},
+                )
 
 
 class TargetFusionClaimTests(unittest.TestCase):

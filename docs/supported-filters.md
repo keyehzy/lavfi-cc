@@ -99,9 +99,10 @@ each stage declares the channel groups it reads across, and `validate_ir`
 requires each stage group to fit inside one sampling group. A LUT and the
 diagonal `levels_f32_fma` read one channel each and fit anywhere;
 `chroma_rotate_i32` reads channels 1 and 2 and fits every accepted YUV layout;
-`colorchannelmixer`'s matrix and the `expr_f32` expression read all four and
-are refused on `yuv422p` and `yuv420p`. `validate_ir` enforces this for every
-consumer of the IR, so it cannot be bypassed by building the IR directly.
+`colorchannelmixer`'s matrix and the RGB `expr_f32` expressions read across
+the colour channels and are refused on `yuv422p` and `yuv420p`. `validate_ir`
+enforces this for every consumer of the IR, so it cannot be bypassed by
+building the IR directly.
 
 The `yuva` layouts are where the partition stops being a restatement of "is
 this subsampled". Only their chroma planes shrink; alpha keeps the frame's
@@ -133,14 +134,14 @@ Two rules follow from the format lists rather than from the pixel maths:
 - A region may only be fused in a format that **every** filter in it
   advertises. Otherwise FFmpeg negotiation inserts a conversion inside the
   region and one kernel is no longer equivalent to the filters it replaced.
-  `colorlevels`, `colorchannelmixer`, `colorbalance`, `colorcontrast`, and
-  `curves` accept `0rgb`, `0bgr`, `rgb0`, and `bgr0`, which `negate` and
-  `lutrgb` do not, so that family is outside the common subset and is not
-  offered. In the other direction, `negate` is the only accepted filter that
-  advertises both families: `lutrgb`, `colorlevels`, `colorchannelmixer`,
-  `colorbalance`, `colorcontrast`, and `curves` are RGB-only and `lutyuv`,
-  `eq`, and `hue` are YUV-only, so a run mixing the two is refused rather than
-  fused.
+  `colorlevels`, `colorchannelmixer`, `colorbalance`, `colorcontrast`,
+  `curves`, `vibrance`, `colortemperature`, and `selectivecolor` accept at
+  least part of the `0rgb`/`rgb0` family, which is outside the implemented
+  layouts and is not offered. In the other direction, `negate` is the only
+  accepted filter that advertises both families: the other RGB filters are
+  RGB-only and `lutyuv`, `eq`, and `hue` are YUV-only, so a run mixing the two
+  is refused rather than fused. `selectivecolor` narrows this once more: it is
+  packed-only and therefore splits a planar RGB run.
 - A region may only be fused in a format it already works in. A pointwise
   filter is not format-agnostic: pinned `negate` over `testsrc2` does not
   produce the same bytes as `format=rgba,negate`. Fusing a run whose working
@@ -157,6 +158,8 @@ has its own format list rather than a shared one:
 | `hue` | ten bits only, including the ten-bit `yuva` trio |
 | `eq` | nothing: `vf_eq.c` is an 8-bit filter |
 | `colorlevels`, `colorchannelmixer`, `colorbalance`, `colorcontrast`, `curves` | every accepted deep RGB format |
+| `vibrance`, `colortemperature` | every accepted deep RGB format |
+| `selectivecolor` | the four packed 16-bit RGB/BGR layouts only |
 
 Two consequences are worth naming because they are refusals inside one colour
 family. `eq` leaves every run above eight bits, so a deep YUV island is built
@@ -547,6 +550,101 @@ untouched, whatever the contrast options say, and the three weights default to
 zero. The compiler emits a program that stores nothing there, which the
 identity pass removes.
 
+## `vibrance`
+
+Source: `libavfilter/vf_vibrance.c`.
+
+The filter normalizes RGB by the format maximum, measures saturation as the
+maximum channel minus the minimum, and forms a configurable luma. Each channel
+then gets its own saturation coefficient:
+
+```text
+saturation = max(r,g,b) - min(r,g,b)
+luma = g*glum + r*rlum + b*blum
+ci = 1 + (intensity*balance[i])
+             * (1 - alternate*sign(intensity*balance[i])*saturation)
+out[i] = clip((int)((luma + (in[i]/max-luma)*ci) * max), depth)
+```
+
+`alternate=0`, the default, makes the sign factor negative; `alternate=1`
+makes it positive. Options are stored as binary32 and retain upstream's ranges:
+intensity `[-2,2]`, balances `[-10,10]`, and luma coefficients `[0,1]`.
+Alpha is copied.
+
+On a fused-multiply-add target the pinned compiler contracts the two luma
+adds, the two coefficient multiply-adds per channel, and the three final
+`lerpf`s. The expression records those eleven written sites explicitly and
+uses the source's left-associative luma expression on a non-contracting target.
+With zero effective intensity, a fused `lerpf` recovers the input exactly and
+is emitted as an identity. The separate `(input-luma)+luma` can lose a low bit,
+so the same default invocation remains an expression on a non-contracting host;
+the plan states that otherwise surprising upstream difference.
+
+## `colortemperature`
+
+Source: `libavfilter/vf_colortemperature.c`.
+
+`kelvin2rgb` turns the configured 1000–40000 K temperature into three binary32
+multipliers with `logf` or `powf`. The lowering calls the host C library's
+float entry points, the same library the pinned binary uses, and includes the
+three resulting constants in the canonical plan. That makes the otherwise
+frame-constant setup calculation explicit rather than evaluating libm for
+every pixel in the generated kernel.
+
+The pixel expression multiplies RGB by those constants, blends it with the
+input by `mix`, computes input and output lightness as `max + min +
+FLT_EPSILON`, and blends the lightness-restored result by `pl`:
+
+```text
+n[c] = lerpf(in[c], in[c] * kelvin_rgb[c], mix)
+l = (max(in)+min(in)+FLT_EPSILON) / (max(n)+min(n)+FLT_EPSILON)
+out[c] = clip((int)lerpf(n[c], n[c] * l, pl), depth)
+```
+
+The six `lerpf` sites are explicit fused or separate multiply-adds according
+to the host. `mix=0` is an identity and does not consult either libm or the
+target table. Alpha is copied. All implemented RGB layouts are advertised.
+
+## `selectivecolor`
+
+Source: `libavfilter/vf_selectivecolor.c`.
+
+This filter advertises packed RGB only: the six implemented eight-bit packed
+layouts and all four packed 16-bit RGB/BGR layouts. A `gbrp` run containing it
+is therefore split by upstream negotiation and is refused here even though its
+per-pixel arithmetic could be described.
+
+Each configured option contains one to four whitespace-separated CMYK
+adjustments; omitted fields are zero. Nine ranges are visited in upstream's
+fixed order: reds, yellows, greens, cyans, blues, magentas, whites, neutrals,
+and blacks. The first six classify ties too — a grey pixel is simultaneously
+at every channel maximum and minimum — while the last three use the exact
+integer midpoint predicates from the 8- or 16-bit slice. Every active range
+computes an integer scale from the pixel's minimum, middle, and maximum.
+
+For output component value `v`, component adjustment `a`, and black adjustment
+`k`, one range contributes:
+
+```text
+res = (-1 - a) * k - a
+if correction_method == relative: res *= 1 - v/max
+term = lrintf(clip(res, -v/max, 1-v/max) * range_scale)
+```
+
+Those `term` values are added as integers only after each range has rounded;
+rounding the combined adjustment once is observably different. `expr_f32`
+therefore includes exact predicates, `abs`/`floor` for the integer range
+scales, and an intermediate `lrintf` operation. Their results remain exactly
+representable binary32 integers at these bounds. The multiply-add in `res` is
+stated as fused or separate for the host, and the final channel sum truncates
+and saturates like `av_clip_uint8`/`av_clip_uint16`. Alpha is copied.
+
+Both `absolute`/`0` and `relative`/`1` correction-method spellings are
+accepted. An all-zero range is not registered upstream and produces an
+identity here. `psfile` is rejected because it reads adjustments not contained
+in the graph; non-finite, out-of-range, malformed, or overlong CMYK lists are
+also rejected.
+
 ## Cross-stage and platform rules
 
 - Each stage reads the previous stage's four quantized samples, even inside a
@@ -561,8 +659,9 @@ identity pass removes.
 - A kernel above eight bits loads and stores native 16-bit words. Every deep
   layout is little-endian, so the generated source `#error`s on a big-endian
   host rather than byte-swapping.
-- Upstream's own bytes are not portable everywhere. `colorcontrast` and some
-  `curves` key points depend on whether the build target has a fused
+- Upstream's own bytes are not portable everywhere. `colorcontrast`,
+  `vibrance`, `colortemperature`, `selectivecolor`, and some `curves` key
+  points depend on whether the build target has a fused
   multiply-add, so the oracle is the pinned binary **on this host**, and a
   kernel that reproduces it is host-specific by the same amount. The plan hash
   carries that difference, so nothing is shared across it.
