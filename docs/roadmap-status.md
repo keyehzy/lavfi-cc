@@ -906,6 +906,75 @@ loaded via `FILTER_QUERY_FUNC2` instead of hardcoding a single format.
 It previously only copied the filter when creating the worktree, so edits were
 silently ignored on rebuild.
 
+## 7. Shutter Encoder workflow gaps
+
+The first application MVP covers the core manual-grading stages emitted by
+Shutter Encoder: highlights, midtones, and shadows through `curves`; whites and
+blacks through `colorlevels`; white balance through `colortemperature`; and the
+individual `eq`, `hue`, `colorbalance`, and `vibrance` stages. The adapter in
+`mvp/` accepts Shutter's linear `[0:v]…[out] -filter_complex` form, verifies the
+working format with pinned FFmpeg, and retains every unsupported stage.
+
+That is useful coverage, but not yet coverage of the whole colorimetry
+workflow. Shutter's construction order alternates RGB, float RGB, and YUV
+filters, then can append coordinate-dependent, neighborhood, geometry, LUT,
+color-management, metadata, or GPU operations. Supporting an individual
+filter therefore does not imply that the complete sequence can become one
+profitable island. The source of the workflow described below is Shutter's
+[`Colorimetry.java`](https://github.com/paulpacifico/shutter-encoder/blob/6a93b75bc2a5933a10efd98ed360f73b4acf5259/src/shutterencoder/functions/settings/Colorimetry.java#L50-L648).
+
+| Functionality | Current limitation | Future direction |
+|---|---|---|
+| Exposure | `exposure` is unsupported and splits the grading chain. Pinned FFmpeg advertises it only for planar float RGB, while the kernel ABI and layouts currently load and store integer samples. | Add `gbrpf32` and `gbrapf32` frame layouts and exact float load/store semantics, extend adjacent RGB grading filters to their upstream float behavior, then lower static `exposure` and `black` options. |
+| Mixed RGB/YUV grading | Shutter alternates RGB filters such as `curves` and `colorlevels` with YUV filters such as `eq` and `hue`. The compiler creates separate islands, and a one-filter island removes no pass. | Represent FFmpeg's negotiated RGB-to-YUV, YUV-to-RGB, and float/integer conversions explicitly, including intermediate clipping, rounding, range, matrix, and chroma-sampling behavior, so conversion-aware super-islands remain byte-exact. |
+| 3D LUTs | `lut3d=file=…` and Shutter's libplacebo LUT path are unsupported. An external LUT is also an input to compilation that the current graph-only plan hash does not capture. | Parse Shutter's static LUT files, include their content digest and interpolation mode in the cache key, and add exact nearest, trilinear, and tetrahedral lookup operations before considering the less common interpolation modes. |
+| Levels and color matrices | `scale=in_range/out_range`, `colorspace`, `zscale`, and HDR `tonemap` chains remain FFmpeg barriers. The current IR does not model color range, primaries, transfer functions, float HDR values, or their metadata effects. | Introduce color-managed IR operations for range mapping, matrices, transfer functions, primaries, and tone mapping. Keep resizing `scale`/`zscale` paths separate until the resampling model exists. |
+| Vignette | `vignette` depends on pixel coordinates and frame geometry; upstream also supports per-frame expressions and deterministic dithering. Current pixel IR has no `x`, `y`, width, height, or ordered random state. | Start with Shutter's static angle and mode subset, add coordinate and frame-dimension inputs, reproduce its factor map and dither order, then consider runtime expressions only as a later non-static extension. |
+| Grain and detail | Shutter maps positive grain values to `unsharp` and negative values to `bm3d`. Both read neighborhoods; BM3D additionally performs block matching and can use a reference input. | Add a tiled neighborhood backend with explicit halo regions for a bounded `unsharp` subset. Treat BM3D as a separate, later project requiring block-level IR and potentially multi-input/frame-synchronization support. |
+| Rotation and zoom | `rotate`, `scale`, and `crop` are retained rather than fused. `crop` is known to preserve format, but geometry-changing stages do not fit the same-size point-kernel ABI. | Model coordinate transforms, interpolation, output dimensions, and boundary behavior, then evaluate fusing adjacent grading into the resampling pass. Do not prioritize zero-copy crop fusion unless profiling shows a real pass to remove. |
+| Color metadata | Output `-color_primaries`, `-color_trc`, and `-colorspace` arguments already pass through unchanged, but in-graph `setparams` is an unsupported barrier even though it does not rewrite pixel bytes. | Add metadata-aware, format-transparent graph stages and preserve their exact side-data effects so `setparams` does not unnecessarily split otherwise compatible islands. |
+| Libplacebo and GPU processing | The compiler is CPU-only and cannot consume hardware frames or Shutter's consolidated libplacebo color, LUT, range, and tone-mapping path. | Reuse a color-managed IR as the source for a future GPU shader backend, or translate a carefully bounded static libplacebo subset. Keep upload/download and hardware-frame ownership explicit in the cost model. |
+
+Input decoder selection and output codec/color-tag arguments are not compiler
+gaps: the wrapper already delegates them to FFmpeg unchanged. The roadmap above
+only includes stages whose absence either breaks a potentially fusible island
+or prevents the application boundary from representing Shutter's color
+workflow faithfully.
+
+### Shutter-specific next-step recommendation order
+
+1. **Make `setparams` metadata-aware and format-transparent.** This is the
+   smallest change, removes a false island boundary, and establishes the
+   metadata-effects contract needed by later color-management work.
+2. **Add float RGB layouts and `exposure`.** Exposure's per-sample arithmetic
+   is small, but doing it correctly requires `gbrpf32`/`gbrapf32` plus the
+   float behavior of the surrounding RGB grading stages. This reconnects a
+   common Shutter slider with its preceding curves instead of approximating it
+   in an integer format.
+3. **Add static `lut3d`.** Begin with file-content cache keys and the
+   interpolation modes Shutter actually emits. This is cross-channel but still
+   pointwise, so it fits the compiler much better than neighborhood or geometry
+   filters and can join the RGB grading island.
+4. **Add Shutter's static vignette subset.** Extend the IR with coordinates and
+   frame dimensions, but retain the static-parameter rule and reproduce
+   upstream dithering before accepting it for fusion.
+5. **Build conversion-aware RGB/YUV/float super-islands.** This has the largest
+   eventual full-workflow payoff because Shutter repeatedly crosses format
+   families, but it must state every FFmpeg conversion and quantization rather
+   than silently choosing one convenient working format.
+6. **Add color-managed range, matrix, transfer, and tone-map operations.** Use
+   the conversion work as the base for `scale` range-only cases, `colorspace`,
+   non-resizing `zscale`, and CPU HDR tone mapping. Validate metadata as well as
+   decoded pixels.
+7. **Profile before adding neighborhood and geometry execution.** Start with a
+   bounded `unsharp` or resampling case only if actual Shutter captures show a
+   material pass cost. BM3D, general rotation/resizing, and multi-input graphs
+   require separate architecture rather than another pointwise lowerer.
+8. **Treat libplacebo/GPU as a distinct backend milestone.** Pursue it when
+   measurements show upload/download or CPU execution dominates; do not mix
+   hardware-frame support into the CPU correctness path merely to increase
+   filter coverage.
+
 ## Recommended order from here
 
 1. **Let a real corpus select the next pointwise filter.** The roadmap's flat
