@@ -7,15 +7,16 @@ milestones described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md), plus the reach
 work recorded in [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
-Accepted layouts are 47 formats from eight to sixteen bits per component: the
+Accepted layouts are 55 formats from eight to sixteen bits per component: the
 packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24` and their 16-bit
 `rgb48le`, `rgba64le`, `bgr48le`, and `bgra64le`; planar `gbrp` at 8, 9, 10,
 12, 14, and 16 bits and `gbrap` at 8, 10, 12, and 16 bits; planar YUV 4:4:4,
-4:2:2, and 4:2:0 at 8, 9, 10, 12, 14, and 16 bits; and their alpha-carrying
-`yuva` members at 8, 10, and 16 bits. A run is only fused when it already works
-in one of them: a pointwise filter produces different bytes in different pixel
-formats, so fusing a run into a kernel built for another format would change
-the output, and no conversion is ever introduced at an island boundary. Runs
+4:2:2, and 4:2:0 at 8, 9, 10, 12, 14, and 16 bits; 4:1:1, 4:1:0, and 4:4:0 at
+8 bits; 4:4:0 at 10 bits; the four advertised full-range YUVJ aliases; and the
+alpha-carrying `yuva` members at 8, 10, and 16 bits. A run is only fused when it
+already works in one of them: a pointwise filter produces different bytes in
+different pixel formats, so fusing a run into a kernel built for another format
+would change the output, and no conversion is ever introduced at an island boundary. Runs
 that cannot be fused are reported rather than guessed at.
 
 YUV support is native rather than converted: a `yuv420p` island is fused in

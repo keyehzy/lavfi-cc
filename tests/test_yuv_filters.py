@@ -51,6 +51,22 @@ class LutyuvTests(unittest.TestCase):
                          (16, 16, 16, 235, 235))
         self.assertEqual((u[0], u[240], u[255]), (16, 240, 240))
 
+    def test_yuvj_components_use_the_full_range(self) -> None:
+        # YUVJ formats fall through vf_lut.c's default switch arm rather than
+        # its limited-range YUV arm.  All three colour components therefore
+        # use 0..255, making clipval an identity and negval a true inversion.
+        luma, u, v, _ = tables(
+            require_ir(
+                yuv("lutyuv=y=negval:u=negval:v=negval", "yuvj420p")
+            )
+        )
+        inverse = tuple(255 - value for value in range(256))
+        self.assertEqual((luma, u, v), (inverse, inverse, inverse))
+        self.assertEqual(
+            tables(require_ir(yuv("lutyuv", "yuvj440p")))[0],
+            tuple(range(256)),
+        )
+
     def test_alpha_expression_is_accepted_and_never_stored(self) -> None:
         # yuv420p carries no alpha plane, so upstream never even evaluates the
         # expression -- config_props builds one table per component the format
@@ -249,6 +265,8 @@ class SamplingGroupTests(unittest.TestCase):
         self.assertEqual(get_layout("yuv422p").sampling_groups, ((0,), (1, 2)))
         # Nothing is subsampled here, so every channel is co-sited.
         self.assertEqual(get_layout("yuv444p").sampling_groups, ((0, 1, 2),))
+        self.assertEqual(get_layout("yuv410p").sampling_groups, ((0,), (1, 2)))
+        self.assertEqual(get_layout("yuv440p10le").sampling_groups, ((0,), (1, 2)))
         self.assertEqual(get_layout("rgba").sampling_groups, ((0, 1, 2, 3),))
 
     def test_yuva_alpha_joins_luma_rather_than_chroma(self) -> None:
@@ -297,14 +315,17 @@ class SamplingGroupTests(unittest.TestCase):
 
     def test_a_chroma_rotation_is_admissible_on_a_subsampled_layout(self) -> None:
         # Cb and Cr are sampled at the same positions, so one loop sees both.
-        for layout in ("yuv444p", "yuv422p", "yuv420p",
+        for layout in ("yuv444p", "yuv422p", "yuv420p", "yuv411p",
+                       "yuv410p", "yuv440p", "yuvj420p", "yuvj440p",
                        "yuva444p", "yuva422p", "yuva420p"):
             with self.subTest(layout=layout):
                 validate_ir(self.build(self.rotation(), "saturate_i32_to_u8", layout))
 
     def test_a_colour_matrix_is_still_refused_on_a_subsampled_layout(self) -> None:
         # Luma and chroma have no common sample, so nothing can mix them.
-        for layout in ("yuv422p", "yuv420p", "yuva422p", "yuva420p"):
+        for layout in ("yuv422p", "yuv420p", "yuv411p", "yuv410p", "yuv440p",
+                       "yuvj422p", "yuvj420p", "yuvj440p",
+                       "yuva422p", "yuva420p"):
             with self.subTest(layout=layout):
                 with self.assertRaises(InterpreterError) as caught:
                     validate_ir(

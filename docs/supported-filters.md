@@ -15,15 +15,17 @@ changes inside the region are rejected.
 
 The accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`,
 and `bgr24`, the planar RGB `gbrp` and `gbrap`, and the planar YUV `yuv444p`,
-`yuv422p`, `yuv420p`, `yuva444p`, `yuva422p`, and `yuva420p` — together with
-the deeper members of each family: the packed `rgb48le`, `rgba64le`,
+`yuv422p`, `yuv420p`, `yuv411p`, `yuv410p`, `yuv440p`, `yuvj444p`,
+`yuvj422p`, `yuvj420p`, `yuvj440p`, `yuva444p`, `yuva422p`, and `yuva420p` —
+together with the deeper members of each family: the packed `rgb48le`,
+`rgba64le`,
 `bgr48le`, and `bgra64le`; the planar RGB `gbrp9le`, `gbrp10le`, `gbrap10le`,
 `gbrp12le`, `gbrap12le`, `gbrp14le`, `gbrp16le`, and `gbrap16le`; and the
-planar YUV `yuv{444,422,420}p{9,10,12,14,16}le`, `yuva{444,422,420}p10le`, and
-`yuva{444,422,420}p16le`. They differ only in which sample holds which
-component, whether alpha exists, how wide a sample is, and — for YUV — at what
-resolution each component is stored, so the IR stays layout-independent and
-always sees four logical channels. What those channels are *called* does
+planar YUV `yuv{444,422,420}p{9,10,12,14,16}le`, `yuv440p10le`,
+`yuva{444,422,420}p10le`, and `yuva{444,422,420}p16le`. They differ only in
+which sample holds which component, whether alpha exists, how wide a sample is,
+and — for YUV — at what resolution and range each component is stored. The IR
+therefore stays layout-independent and always sees four logical channels. What those channels are *called* does
 depend on the layout: red,
 green, blue, and alpha in an RGB layout, and luma, Cb, and Cr in a YUV one.
 Filters name their options per family and upstream refuses a name the format
@@ -79,8 +81,10 @@ table, and there is nothing to be exact against.
 
 ### Chroma subsampling
 
-`yuv422p` stores its chroma planes at half width and `yuv420p` at half width
-and half height, rounded up exactly as `AV_CEIL_RSHIFT` does upstream — a
+`yuv422p` stores its chroma planes at half width, `yuv420p` at half width and
+half height, `yuv411p` at quarter width, `yuv410p` at quarter width and quarter
+height, and `yuv440p`/`yuv440p10le` at half height. Every dimension is rounded
+up exactly as `AV_CEIL_RSHIFT` does upstream — a
 `5x3` `yuv420p` frame has `3x2` chroma planes, not `2x1`. A kernel's `width`
 and `height` therefore describe plane 0 only, and the kernel derives each other
 plane's dimensions itself from the layout it was generated for.
@@ -154,8 +158,8 @@ has its own format list rather than a shared one:
 |---|---|
 | `negate` | every accepted deep format, RGB and YUV alike |
 | `lutrgb` | planar RGB and `rgb48le`/`rgba64le`, but neither `bgr` order |
-| `lutyuv` | every deep planar YUV, but alpha-carrying only at 16 bits |
-| `hue` | ten bits only, including the ten-bit `yuva` trio |
+| `lutyuv` | every deep planar YUV, including `yuv440p10le`, but alpha-carrying only at 16 bits |
+| `hue` | ten bits only, including `yuv440p10le` and the ten-bit `yuva` trio |
 | `eq` | nothing: `vf_eq.c` is an 8-bit filter |
 | `colorlevels`, `colorchannelmixer`, `colorbalance`, `colorcontrast`, `curves` | every accepted deep RGB format |
 | `vibrance`, `colortemperature` | every accepted deep RGB format |
@@ -168,9 +172,9 @@ alpha-carrying deep format — `vf_lut.c` lists the `yuva` formats at sixteen
 bits only and `vf_hue.c` at ten only — so `format=yuva420p10le,lutyuv=…,hue=…`
 is not one run.
 
-The YUVJ family and the remaining subsampling ratios
-(`yuv411p`, `yuv410p`, `yuv440p`, `yuv440p10le`) are advertised by `negate` but
-are not implemented. See [`roadmap-status.md`](roadmap-status.md).
+At eight bits the lists differ too. `negate` and `lutyuv` advertise all accepted
+YUV layouts; `eq` omits YUVJ and 4:4:0; and `hue` omits YUVJ but includes
+`yuv411p`, `yuv410p`, and `yuv440p`.
 
 Every accepted upstream filter advertises `AVFILTER_FLAG_SLICE_THREADS`. A
 fused filter must do the same. These operations are row-local in the accepted
@@ -201,7 +205,8 @@ Note that the subtrahend is the format's own maximum on YUV too, and that
 `negate` is its own filter rather than a `vf_lut.c` entry point. The planar
 path is `dst[x] = max - src[x]` over each selected plane, so `negate` does not
 clip luma to the 16–235 studio range or chroma to 16–240 the way `lutyuv`'s
-`clipval` and `negval` variables do — at any depth.
+`clipval` and `negval` variables do on limited-range YUV — at any depth. YUVJ's
+`lutyuv` variables are full-range instead.
 
 The preferred explicit alpha spelling is `components=r+g+b+a` (or
 `components=a` for alpha alone). In this pinned revision,
@@ -298,9 +303,13 @@ parser subset rather than trying to reinterpret it.
 range it picks is the whole difference between the entry points and between
 the depths:
 
-- Planar YUV, at any depth: luma `16 << (d - 8) .. 235 << (d - 8)`, each
-  chroma channel to `240 << (d - 8)`, alpha the full `0 .. (1 << d) - 1`. Alpha
-  also supplies `max_a`, the bound every component's result is clipped to.
+- Limited-range planar YUV, at any depth: luma
+  `16 << (d - 8) .. 235 << (d - 8)`, each chroma channel to
+  `240 << (d - 8)`, alpha the full `0 .. (1 << d) - 1`. Alpha also supplies
+  `max_a`, the bound every component's result is clipped to.
+- The deprecated YUVJ aliases: a true `0 .. 255` for luma and both chroma
+  components. They fall through the default switch arm in pinned `vf_lut.c`,
+  so `clipval` is an identity and `negval` is `255-val`.
 - `rgb48le` and `rgba64le`: a true `0 .. 65535`.
 - Everything else, including all the planar RGB formats: `0 .. 255 << (d - 8)`.
   So a `gbrp10le` component runs to 1020 rather than 1023, and 1020 is the clip

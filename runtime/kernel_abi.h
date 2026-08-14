@@ -78,6 +78,16 @@
 #define LAVFI_PIXEL_FORMAT_BGR48LE  46u
 #define LAVFI_PIXEL_FORMAT_BGRA64LE 47u
 
+/* Remaining planar YUV ratios and the deprecated full-range JPEG aliases. */
+#define LAVFI_PIXEL_FORMAT_YUV411P8     48u
+#define LAVFI_PIXEL_FORMAT_YUV410P8     49u
+#define LAVFI_PIXEL_FORMAT_YUV440P8     50u
+#define LAVFI_PIXEL_FORMAT_YUVJ444P8    51u
+#define LAVFI_PIXEL_FORMAT_YUVJ422P8    52u
+#define LAVFI_PIXEL_FORMAT_YUVJ420P8    53u
+#define LAVFI_PIXEL_FORMAT_YUVJ440P8    54u
+#define LAVFI_PIXEL_FORMAT_YUV440P10LE  55u
+
 #if defined(__GNUC__) || defined(__clang__)
 #define LAVFI_KERNEL_EXPORT __attribute__((visibility("default")))
 #else

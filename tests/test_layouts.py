@@ -57,9 +57,9 @@ RGB_CHAINS = (
 # negate, lutyuv, eq, and hue are the accepted filters that advertise YUV
 # upstream; lutrgb, colorlevels, and colorchannelmixer are RGB-only, so a YUV
 # run containing one of them is refused rather than fused. Component masks and
-# LUT expressions are spelled in the other family's names here, the lutyuv
-# expressions exercise the 16-235/16-240 limited range, the eq invocations
-# cover each of its three upstream code paths, hue rotates Cb into Cr so its
+# LUT expressions are spelled in the other family's names here. The lutyuv
+# expressions exercise each layout's limited or full component range, the eq
+# invocations cover each of its three upstream code paths, hue rotates Cb into Cr so its
 # two chroma planes have to be walked in one loop, and on a subsampled layout
 # each sampling group is walked at its own resolution.
 YUV_CHAINS = (
@@ -227,7 +227,10 @@ class LayoutTableTests(unittest.TestCase):
         self.assertEqual(get_layout("gbrp").plane_origin(2, 4, 2), 16)
 
     def test_yuv_layouts_use_luma_cb_cr_planes(self) -> None:
-        for name in ("yuv444p", "yuv422p", "yuv420p"):
+        for name in (
+            "yuv444p", "yuv422p", "yuv420p", "yuv411p", "yuv410p", "yuv440p",
+            "yuvj444p", "yuvj422p", "yuvj420p", "yuvj440p", "yuv440p10le",
+        ):
             with self.subTest(layout=name):
                 layout = get_layout(name)
                 self.assertEqual(layout.family, "yuv")
@@ -236,6 +239,28 @@ class LayoutTableTests(unittest.TestCase):
                 self.assertEqual(layout.step, 1)
                 self.assertFalse(layout.has_alpha)
                 self.assertEqual(set(layout.components), {"y", "u", "v"})
+
+    def test_remaining_yuv_ratios_have_their_descriptor_shifts(self) -> None:
+        expected = {
+            "yuv411p": (2, 0),
+            "yuv410p": (2, 2),
+            "yuv440p": (0, 1),
+            "yuv440p10le": (0, 1),
+        }
+        for name, chroma in expected.items():
+            with self.subTest(layout=name):
+                self.assertEqual(
+                    get_layout(name).subsampling,
+                    ((0, 0), chroma, chroma, (0, 0)),
+                )
+
+    def test_only_yuvj_layouts_are_intrinsically_full_range(self) -> None:
+        for name in ("yuvj444p", "yuvj422p", "yuvj420p", "yuvj440p"):
+            with self.subTest(layout=name):
+                self.assertTrue(get_layout(name).full_range)
+        for name in ("yuv444p", "yuv411p", "yuv410p", "yuv440p10le"):
+            with self.subTest(layout=name):
+                self.assertFalse(get_layout(name).full_range)
 
     def test_yuva_layouts_add_a_full_resolution_alpha_plane(self) -> None:
         # This table was read out of the pinned binary the way every other
@@ -302,6 +327,16 @@ class LayoutTableTests(unittest.TestCase):
         # 4:2:2 halves width only.
         self.assertEqual(get_layout("yuv422p").frame_size(5, 3), 15 + 9 + 9)
         self.assertEqual(get_layout("yuv444p").frame_size(5, 3), 45)
+
+    def test_wider_subsampling_shifts_round_up_like_ffmpeg(self) -> None:
+        # A 5x5 frame keeps two chroma columns at quarter width and two rows at
+        # quarter height.  Vertical-only 4:4:0 keeps all five columns.
+        self.assertEqual(get_layout("yuv411p").frame_size(5, 5), 25 + 10 + 10)
+        self.assertEqual(get_layout("yuv410p").frame_size(5, 5), 25 + 4 + 4)
+        self.assertEqual(get_layout("yuv440p").frame_size(5, 5), 25 + 15 + 15)
+        self.assertEqual(
+            get_layout("yuv440p10le").frame_size(5, 5), 2 * (25 + 15 + 15)
+        )
 
     def test_unknown_layout_is_rejected(self) -> None:
         with self.assertRaises(KeyError):

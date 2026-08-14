@@ -2,10 +2,11 @@
 
 The same subset serves ``lutyuv``, which is ``vf_lut.c``'s other entry point.
 The only difference is the range a component is defined over: ``lutrgb`` runs
-every channel over ``0..255``, while ``lutyuv`` gives luma ``16..235`` and each
-chroma channel ``16..240``.  That range reaches the expression as ``minval``
-and ``maxval`` and, through them, as ``clipval`` and ``negval``, so
-:func:`build_lut` takes it as a parameter rather than assuming full range.
+eight-bit channels over ``0..255``; ``lutyuv`` gives ordinary YUV luma
+``16..235`` and each chroma channel ``16..240``, while the deprecated YUVJ
+aliases use ``0..255``.  That range reaches the expression as ``minval`` and
+``maxval`` and, through them, as ``clipval`` and ``negval``, so
+:func:`build_lut` takes it as a parameter rather than assuming either range.
 """
 
 from __future__ import annotations

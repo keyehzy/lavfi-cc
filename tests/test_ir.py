@@ -100,10 +100,8 @@ class EligibilityTests(unittest.TestCase):
         self.assertIn(code, [diagnostic.code for diagnostic in analysis.diagnostics])
 
     def test_requires_both_explicit_boundaries(self) -> None:
-        # yuv410p is a real format the backend does not implement, so it can
-        # only ever close a region, never open one.
-        self.assert_code("negate,format=yuv410p", "missing_input_boundary")
-        self.assert_code("format=rgba,negate", "missing_output_boundary")
+        self.assert_code("negate,format=nv12", "missing_input_boundary")
+        self.assert_code("format=yuv410p,negate", "missing_output_boundary")
 
     def test_reports_each_unsupported_filter_in_region(self) -> None:
         analysis = analyze_filtergraph(graph("scale=2:2,fps=30"))

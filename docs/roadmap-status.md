@@ -8,8 +8,9 @@ All six have now landed. Item 3 was the last one still half-open; its RGB half
 has since landed too, together with the cross-channel float IR operation that
 was blocking it. That operation now also carries `vibrance`,
 `colortemperature`, and `selectivecolor`, completing the first recommended
-follow-up below. Item 4 was extended with the `yuva` layouts, and item 2 with
-47 layouts spanning eight through sixteen bits per component.
+follow-up below. Item 4 was extended with the `yuva`, remaining
+subsampling-ratio, and full-range YUVJ layouts, and item 2 with 55 layouts
+spanning eight through sixteen bits per component.
 
 The framing changed twice during this work. Both changes are stated first,
 because each one reorders the roadmap.
@@ -120,7 +121,7 @@ What this added over the explicit-boundary path:
 A run is only fused when its format is one the backend implements natively.
 Everything else is reported and refused — see the correctness note above.
 
-## 2. Widen pixel-format reach — done for 47 formats at 8–16 bits
+## 2. Widen pixel-format reach — done for 55 formats at 8–16 bits
 
 Supported today: fourteen eight-bit formats, 29 deep planar formats, and four
 packed 16-bit formats. In full, those are:
@@ -206,7 +207,7 @@ format's maximum. Contribution sums widen to `int32_t` above eight bits.
 
 This is checked directly in `tests/test_high_depth.py`, while
 `tests/test_layouts.py` runs the pinned FFmpeg oracle, interpreter, native
-kernel, and patched-filter paths over every one of the 47 layouts.
+kernel, and patched-filter paths over every one of the 55 layouts.
 
 ## 3. More pointwise filters — done, including the follow-up RGB trio
 
@@ -223,14 +224,15 @@ below — and the follow-up trio needed a small extension of that same operation
 
 `vf_lut.c` is one filter with two entry points. The difference at 8-bit depth
 is which branch of `config_props` sets the per-component range: `lutrgb` gets
-`0..255` for everything, `lutyuv` gets `16..235` for luma and `16..240` for
-each chroma channel. That range reaches the expression as `minval` and
-`maxval`, and through them as `clipval` and `negval`, so on luma `negval` is
+`0..255` for everything, while ordinary limited-range YUV under `lutyuv` gets
+`16..235` for luma and `16..240` for each chroma channel. YUVJ is the
+full-range exception recorded under item 4. That range reaches the expression
+as `minval` and `maxval`, and through them as `clipval` and `negval`, so on luma `negval` is
 `av_clip(16 + 235 - val, 16, 235)` rather than `255 - val`. `build_lut` takes
 the range as a parameter and the two filters share one lowering.
 
-Two consequences worth naming. `lutyuv` with no options is *not* an identity —
-the default expression is `clipval`, which clamps into the limited range. And
+Two consequences worth naming. On limited-range YUV, `lutyuv` with no options
+is *not* an identity — the default expression is `clipval`, which clamps. And
 the same expression under the two filters is two different tables, so they must
 never collide on one cached kernel; a test pins that.
 
@@ -513,7 +515,7 @@ binaries in `.build/` are GPL rather than LGPL as a result; they are local
 artifacts and are not distributed. `lutyuv` and `hue` are LGPL and were present
 all along.
 
-## 4. Avoid boundary conversion — done for 27 planar YUV formats
+## 4. Avoid boundary conversion — done for 35 planar YUV formats
 
 The roadmap offered two routes: fuse the format conversion into the island
 boundary, or introduce a YUV IR. The first should not be attempted. Fusing the
@@ -682,10 +684,30 @@ Checked once by hand, not automated:
   including `a`, `lutyuv` alpha expressions, `eq`, and `hue`) on a `129x67`
   frame: no mismatches and no refusals.
 
-**Deferred:** the `yuvj` full-range family and the remaining ratios `yuv411p`,
-`yuv410p`, `yuv440p`, and `yuv440p10le`. Each is a table entry rather than a
-design question, and only `yuv410p` appears in the corpus, as a deliberate
-unsupported-format case.
+### The remaining YUV table entries are done
+
+`yuv411p`, `yuv410p`, `yuv440p`, and `yuv440p10le` now use the same generalized
+plane walk with chroma shifts `(2,0)`, `(2,2)`, `(0,1)`, and `(0,1)`
+respectively. The two-bit vertical shift in 4:1:0 also exercises the existing
+slice rule at a four-row chroma grid rather than the two-row grid of 4:2:0.
+
+The supported deprecated full-range aliases are `yuvj444p`, `yuvj422p`,
+`yuvj420p`, and `yuvj440p`. Their geometry matches the ordinary formats, but
+their `lutyuv` semantics do not: in pinned `vf_lut.c` they miss the
+limited-range YUV switch arm and use `0..255` for luma and both chroma
+components. `PixelLayout.full_range` records that distinction, so `clipval` is
+an identity and `negval` is `255-val` on YUVJ instead of using the
+`16..235`/`16..240` studio ranges. `yuvj411p` is not included because none of
+the accepted filters advertises it in the pinned revision.
+
+The filter-format table follows the upstream lists rather than treating these
+layouts as one block: `negate` and `lutyuv` accept all eight additions; `eq`
+accepts only `yuv411p` and `yuv410p`; and `hue` accepts the four non-YUVJ
+ratios, including `yuv440p10le`. Each layout has its own kernel ABI identifier
+and patched-filter mapping. The layout differential matrix now sends every
+advertised chain through the interpreter and native kernel against pinned
+FFmpeg, while focused tests pin the full-range LUTs, filter lists, and all four
+non-JPEG layout geometries.
 
 ## 5. Analysis-only scanner — done
 
@@ -717,16 +739,15 @@ non-pointwise filters rather than filters waiting on an existing operation.
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt
   graphs scanned:            89
   islands found:             87
-  islands fusible today:     72
-  frame passes eliminated:   77
-  frame passes blocked:      12
+  islands fusible today:     73
+  frame passes eliminated:   79
+  frame passes blocked:      10
   blocked passes by working format:
     negotiated  10 passes across 14 islands
-    yuv410p      2 passes across 1 island
 
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt --entry-format yuv420p
-  frame passes eliminated:   80
-  frame passes blocked:      6
+  frame passes eliminated:   82
+  frame passes blocked:      4
 ```
 
 Blockers are ranked by the frame passes they withhold rather than by how often
@@ -848,9 +869,11 @@ all three grading graphs pin `rgba` explicitly.
 
 Item 4 removed the format barrier and named the filter subset as the next
 binding constraint. Item 3 widened the subset on both sides, then `yuva` and
-high depth widened format reach again. What binds now is the filter subset and
-the few flat format entries still missing — `yuvj*`, `yuv411p`, `yuv410p`,
-`yuv440p`, and `yuv440p10le` — none of which appears in a grading chain.
+high depth widened format reach again. The last YUV table entries remove the
+only format blocker named by this corpus: its `yuv410p` chain now eliminates
+two more passes, leaving all ten format-attributed blocked passes under
+negotiation rather than a known unsupported layout. What binds now is the
+filter subset and the caller knowledge needed to pin negotiation-decided runs.
 
 ## 6. Build-time integration — done for the compiler, unchanged for the patch
 
@@ -885,13 +908,11 @@ silently ignored on rebuild.
 
 ## Recommended order from here
 
-1. **The remaining YUV table entries** — `yuvj*`, `yuv411p`, `yuv410p`,
-   `yuv440p`, and `yuv440p10le` — if a real corpus ever asks for them. Each is a row in
-   `layouts.py` plus an ABI identifier now that subsampling is general; only
-   `yuv410p` appears in this corpus, and only as the "format the kernel cannot
-   run" case. `yuvj*` is the one with a semantic question rather than a
-   geometric one: it is full-range, which is what `lutyuv`'s `minval` and
-   `maxval` are derived from, so its tables are not the limited-range ones.
+1. **Let a real corpus select the next pointwise filter.** The roadmap's flat
+   format backlog is now empty. The scanner's remaining format-attributed
+   blockers are negotiation-decided rather than known layouts the backend lacks, while
+   its common unsupported filters (`crop`, `scale`, and `fps`) are structural
+   or frame-global rather than missing pixel operations.
 
 Six entries left this list by being done. Layout-aware lowering landed as
 part of item 4, because `negate`'s component mask could not be expressed in YUV
@@ -907,4 +928,6 @@ The former first recommendation has now landed too: `vibrance` and
 `colortemperature` use the existing arithmetic directly, while
 `selectivecolor` added exact predicates and intermediate rounding to
 `expr_f32` so its nine independently rounded range adjustments remain
-bit-exact.
+bit-exact. The former YUV-table recommendation has now landed as well: eight
+more layouts take the total to 55, with YUVJ's full-range LUT behavior recorded
+rather than inferred from its otherwise identical geometry.

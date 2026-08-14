@@ -43,8 +43,8 @@ Alpha-less layouts load ``a = 0``.  That is what upstream does: the
 unset, and the other accepted filters treat channels independently, so an alpha
 lane that is never stored cannot affect the stored components.
 
-**Chroma subsampling.** ``yuv420p`` and ``yuv422p`` store their chroma channels
-at a fraction of the frame's resolution, so a single ``width`` and ``height``
+**Chroma subsampling.** The planar YUV layouts may store chroma at half or
+quarter width and half or quarter height, so a single ``width`` and ``height``
 no longer describe every plane.  :attr:`PixelLayout.subsampling` records the
 ``log2`` shift of each channel, and the plane helpers below derive that plane's
 own dimensions with FFmpeg's ``AV_CEIL_RSHIFT`` rounding.  ``width`` and
@@ -107,6 +107,8 @@ class PixelLayout:
     subsampling: tuple[tuple[int, int], ...] = ((0, 0), (0, 0), (0, 0), (0, 0))
     #: Bits each component carries.  Every component of a format shares one.
     depth: int = 8
+    #: Whether YUV components use the full sample range rather than studio range.
+    full_range: bool = False
 
     @property
     def planar(self) -> bool:
@@ -309,6 +311,7 @@ def _yuv(
     *,
     alpha: bool = False,
     depth: int = 8,
+    full_range: bool = False,
 ) -> PixelLayout:
     """Planar YUV: plane 0 luma, 1 Cb, 2 Cr, and on ``yuva`` 3 alpha.
 
@@ -329,6 +332,7 @@ def _yuv(
         ("y", "u", "v", "a" if alpha else None),
         ((0, 0), chroma_shift, chroma_shift, (0, 0)),
         depth,
+        full_range,
     )
 
 
@@ -398,6 +402,26 @@ LAYOUTS: dict[str, PixelLayout] = {
         _packed("rgba64le", 4, (0, 1, 2, 3), 45, "LAVFI_PIXEL_FORMAT_RGBA64LE", 16),
         _packed("bgr48le", 3, (2, 1, 0, None), 46, "LAVFI_PIXEL_FORMAT_BGR48LE", 16),
         _packed("bgra64le", 4, (2, 1, 0, 3), 47, "LAVFI_PIXEL_FORMAT_BGRA64LE", 16),
+        # The remaining planar YUV sampling ratios.  The two chroma planes
+        # always share one grid: 4:1:1 quarters width, 4:1:0 quarters both
+        # dimensions, and 4:4:0 halves height only.
+        _yuv("yuv411p", (2, 0), 48, "LAVFI_PIXEL_FORMAT_YUV411P8"),
+        _yuv("yuv410p", (2, 2), 49, "LAVFI_PIXEL_FORMAT_YUV410P8"),
+        _yuv("yuv440p", (0, 1), 50, "LAVFI_PIXEL_FORMAT_YUV440P8"),
+        # Deprecated JPEG aliases have the same plane geometry as their
+        # ordinary twins, but lutyuv gives every component the full 0..255
+        # range.  YUVJ411P is not listed because none of the accepted filters
+        # in the pinned FFmpeg advertises it.
+        _yuv("yuvj444p", (0, 0), 51, "LAVFI_PIXEL_FORMAT_YUVJ444P8",
+             full_range=True),
+        _yuv("yuvj422p", (1, 0), 52, "LAVFI_PIXEL_FORMAT_YUVJ422P8",
+             full_range=True),
+        _yuv("yuvj420p", (1, 1), 53, "LAVFI_PIXEL_FORMAT_YUVJ420P8",
+             full_range=True),
+        _yuv("yuvj440p", (0, 1), 54, "LAVFI_PIXEL_FORMAT_YUVJ440P8",
+             full_range=True),
+        _yuv("yuv440p10le", (0, 1), 55, "LAVFI_PIXEL_FORMAT_YUV440P10LE",
+             depth=10),
     )
 }
 

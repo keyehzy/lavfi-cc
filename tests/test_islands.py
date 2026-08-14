@@ -6,7 +6,6 @@ from lavfi_cc.frontend import analyze_filtergraph
 from lavfi_cc.islands import (
     NATIVE,
     NEGOTIATED,
-    UNSUPPORTED_FORMAT,
     scan_chain,
     select_islands,
 )
@@ -51,7 +50,7 @@ class IslandDiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(
             [island.boundary for island in scan.islands],
-            [UNSUPPORTED_FORMAT, NATIVE],
+            [NATIVE, NATIVE],
         )
         self.assertEqual(scan.islands[0].working_format, "yuv410p")
 
@@ -76,13 +75,13 @@ class FusionSafetyTests(unittest.TestCase):
     fusing a YUV or negotiated run into an RGBA kernel would change the output.
     """
 
-    def test_refuses_a_run_pinned_to_an_unsupported_format(self) -> None:
+    def test_refuses_an_rgb_filter_inside_a_supported_yuv410_run(self) -> None:
         analysis = analyze_filtergraph(
             "format=yuv410p,negate,lutrgb=r=val*2", auto_islands=True
         )
         self.assertFalse(analysis.eligible)
         self.assertEqual(analysis.diagnostics[0].code, "no_profitable_island")
-        self.assertIn("yuv410p", analysis.diagnostics[0].message)
+        self.assertIn("removes no frame pass", analysis.diagnostics[0].message)
 
     def test_refuses_a_yuv_run_containing_an_rgb_only_filter(self) -> None:
         # lutrgb is RGB-only upstream, so FFmpeg converts around it and the run

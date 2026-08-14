@@ -79,10 +79,30 @@ class AdvertisedFormatTests(unittest.TestCase):
         self.assertEqual(analysis.diagnostics[0].code, "format_not_advertised")
 
     def test_hue_advertises_ten_bits_and_nothing_else_above_eight(self) -> None:
-        for name in ("yuv420p10le", "yuv444p10le", "yuva420p10le"):
+        for name in (
+            "yuv420p10le", "yuv444p10le", "yuv440p10le", "yuva420p10le"
+        ):
             self.assertTrue(filter_supports_format("hue", name), name)
         for name in ("yuv420p9le", "yuv420p12le", "yuv420p16le", "yuva420p16le"):
             self.assertFalse(filter_supports_format("hue", name), name)
+
+    def test_remaining_yuv_formats_follow_each_upstream_filter_list(self) -> None:
+        yuvj = ("yuvj444p", "yuvj422p", "yuvj420p", "yuvj440p")
+        for name in yuvj:
+            with self.subTest(layout=name):
+                self.assertTrue(filter_supports_format("negate", name))
+                self.assertTrue(filter_supports_format("lutyuv", name))
+                self.assertFalse(filter_supports_format("eq", name))
+                self.assertFalse(filter_supports_format("hue", name))
+        for name in ("yuv411p", "yuv410p"):
+            with self.subTest(layout=name):
+                for filter_name in ("negate", "lutyuv", "eq", "hue"):
+                    self.assertTrue(filter_supports_format(filter_name, name))
+        for filter_name in ("negate", "lutyuv", "hue"):
+            self.assertTrue(filter_supports_format(filter_name, "yuv440p"))
+            self.assertTrue(filter_supports_format(filter_name, "yuv440p10le"))
+        self.assertFalse(filter_supports_format("eq", "yuv440p"))
+        self.assertFalse(filter_supports_format("eq", "yuv440p10le"))
 
     def test_lutyuv_and_hue_disagree_about_the_deep_yuva_formats(self) -> None:
         # vf_lut.c lists the alpha-bearing planar YUV formats at sixteen bits

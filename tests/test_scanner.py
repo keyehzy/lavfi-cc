@@ -25,10 +25,10 @@ class ScanGraphTests(unittest.TestCase):
         self.assertEqual(scan.eliminated_passes, 2)
         self.assertEqual(scan.blocked_passes, 0)
 
-    def test_attributes_a_blocked_island_to_its_working_format(self) -> None:
+    def test_a_non_advertised_filter_splits_a_supported_yuv_island(self) -> None:
         scan = scan_graph("format=yuv410p,negate,lutrgb=r=val*2,negate")
         self.assertEqual(scan.eliminated_passes, 0)
-        self.assertEqual(scan.blocked_passes, 2)
+        self.assertEqual(scan.blocked_passes, 0)
         self.assertEqual(scan.islands[0].island.working_format, "yuv410p")
 
     def test_a_supported_yuv_island_is_fusible(self) -> None:
@@ -47,8 +47,8 @@ class ScanGraphTests(unittest.TestCase):
         )
         self.assertEqual(len(scan.chains), 3)
         self.assertEqual([r.island.chain_index for r in scan.islands], [0, 1])
-        self.assertEqual(scan.eliminated_passes, 1)
-        self.assertEqual(scan.blocked_passes, 1)
+        self.assertEqual(scan.eliminated_passes, 2)
+        self.assertEqual(scan.blocked_passes, 0)
 
     def test_an_unreadable_option_does_not_fail_the_scan(self) -> None:
         scan = scan_graph("negate,lutrgb=r=val:r=negval,negate")
@@ -83,18 +83,29 @@ class SummaryTests(unittest.TestCase):
     def test_ranks_blockers_by_the_passes_they_withhold(self) -> None:
         summary = summarize(
             [
+                scan_graph("format=nv12,negate,negate,negate,negate"),
+                scan_graph("format=gray,negate,negate"),
+                scan_graph("format=rgba,negate,negate"),
+            ]
+        )
+        self.assertEqual(summary.eliminated_passes, 1)
+        self.assertEqual(summary.blocked_passes, 4)
+        self.assertEqual(
+            summary.blocked_passes_by_format.most_common(1), [("nv12", 3)]
+        )
+
+    def test_new_yuv_ratios_are_no_longer_blockers(self) -> None:
+        summary = summarize(
+            [
                 scan_graph("format=yuv410p,negate,negate,negate,negate"),
                 scan_graph("format=yuv411p,negate,negate"),
                 scan_graph("format=rgba,negate,negate"),
             ]
         )
         self.assertEqual(summary.graphs, 3)
-        self.assertEqual(summary.eliminated_passes, 1)
-        self.assertEqual(summary.blocked_passes, 4)
-        # yuv410p withholds three passes against yuv411p's one, so it ranks first.
-        self.assertEqual(
-            summary.blocked_passes_by_format.most_common(1), [("yuv410p", 3)]
-        )
+        self.assertEqual(summary.eliminated_passes, 5)
+        self.assertEqual(summary.blocked_passes, 0)
+        self.assertEqual(summary.blocked_passes_by_format, {})
 
     def test_counts_unsupported_filters_and_rejected_options_apart(self) -> None:
         summary = summarize(

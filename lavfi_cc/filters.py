@@ -414,8 +414,8 @@ _LUT_VARIANTS: dict[str, tuple[str, ...]] = {
     "lutyuv": ("y", "u", "v", "a"),
 }
 
-#: The two formats ``config_props`` gives a full 16-bit range rather than the
-#: scaled 8-bit one.  They are the only members of their switch case.
+#: The two RGB formats ``config_props`` gives a full 16-bit range rather than
+#: the scaled 8-bit one.  They are the only members of their switch case.
 _LUT_FULL_RANGE_FORMATS = frozenset({"rgb48le", "rgba64le"})
 
 
@@ -439,6 +439,10 @@ def _lut_ranges(
     scale = 1 << (depth - 8)
     if name == "lutyuv":
         full = (1 << depth) - 1
+        # The deprecated YUVJ formats deliberately miss the limited-range
+        # switch arm in vf_lut.c and land in its 0..255 default arm.
+        if layout is not None and layout.full_range:
+            return (((0, full),) * 4, full)
         return (
             ((16 * scale, 235 * scale), (16 * scale, 240 * scale),
              (16 * scale, 240 * scale), (0, full)),
@@ -2063,16 +2067,20 @@ SUPPORTED_FILTERS = tuple(LOWERERS)
 #: than fused.  ``selectivecolor`` narrows RGB again by advertising packed
 #: layouts only.
 #:
-#: The ``yuva`` trio needs no separate column at eight bits: every filter that
-#: advertises a planar YUV format there advertises its alpha-carrying twin as
-#: well, so the two move together.  Above eight bits that stops being true, and
-#: the alpha-bearing sets below are separate columns because of it.
+#: The ``yuva`` trio needs no separate column from its three ordinary twins at
+#: eight bits: every filter that advertises one advertises the other.  The
+#: additional ratios and YUVJ aliases do have distinct upstream lists, and
+#: above eight bits the alpha-bearing sets become separate columns too.
 _RGB8 = frozenset(
     {"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24", "gbrp", "gbrap"}
 )
 _PACKED_RGB8 = frozenset({"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24"})
 _YUVA8 = frozenset({"yuva444p", "yuva422p", "yuva420p"})
-_YUV8 = frozenset({"yuv444p", "yuv422p", "yuv420p"}) | _YUVA8
+_YUV8_LIMITED = frozenset(
+    {"yuv444p", "yuv422p", "yuv420p", "yuv411p", "yuv410p", "yuv440p"}
+)
+_YUVJ8 = frozenset({"yuvj444p", "yuvj422p", "yuvj420p", "yuvj440p"})
+_YUV8 = _YUV8_LIMITED | _YUVJ8 | _YUVA8
 
 #: Planar RGB above eight bits, which every accepted RGB filter other than
 #: packed-only ``selectivecolor`` advertises identically, plus the two packed
@@ -2104,20 +2112,32 @@ _YUV_HIGH = frozenset(
     for depth in (9, 10, 12, 14, 16)
     for ratio in (444, 422, 420)
 )
+_YUV440_HIGH_10 = frozenset({"yuv440p10le"})
 _YUVA_HIGH_10 = frozenset({"yuva444p10le", "yuva422p10le", "yuva420p10le"})
 _YUVA_HIGH_16 = frozenset({"yuva444p16le", "yuva422p16le", "yuva420p16le"})
 
 FILTER_FORMATS: dict[str, frozenset[str]] = {
-    "negate": _RGB8 | _YUV8 | _RGB_HIGH | _YUV_HIGH | _YUVA_HIGH_10 | _YUVA_HIGH_16,
+    "negate": (
+        _RGB8
+        | _YUV8
+        | _RGB_HIGH
+        | _YUV_HIGH
+        | _YUV440_HIGH_10
+        | _YUVA_HIGH_10
+        | _YUVA_HIGH_16
+    ),
     "lutrgb": _RGB8 | _GBRP_HIGH | _PACKED_RGB_HIGH,
-    "lutyuv": _YUV8 | _YUV_HIGH | _YUVA_HIGH_16,
+    "lutyuv": _YUV8 | _YUV_HIGH | _YUV440_HIGH_10 | _YUVA_HIGH_16,
     # vf_eq.c is 8-bit only, so it is the one accepted filter that a deep YUV
     # island cannot contain.
-    "eq": _YUV8,
+    "eq": (_YUV8_LIMITED - {"yuv440p"}) | _YUVA8,
     # vf_hue.c advertises ten bits and nothing else above eight.
-    "hue": _YUV8
-    | frozenset({"yuv444p10le", "yuv422p10le", "yuv420p10le"})
-    | _YUVA_HIGH_10,
+    "hue": (
+        (_YUV8 - _YUVJ8)
+        | frozenset({"yuv444p10le", "yuv422p10le", "yuv420p10le"})
+        | _YUV440_HIGH_10
+        | _YUVA_HIGH_10
+    ),
     "colorlevels": _RGB8 | _RGB_HIGH,
     "colorchannelmixer": _RGB8 | _RGB_HIGH,
     "colorbalance": _RGB8 | _RGB_HIGH,
