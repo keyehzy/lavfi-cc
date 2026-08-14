@@ -7,6 +7,13 @@ milestones described in
 [`ffmpeg-filter-compiler-mvp.md`](ffmpeg-filter-compiler-mvp.md), plus the reach
 work recorded in [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
+The first application integration is
+[`mvp/`](mvp/README.md): **Accelerated CPU color grading for Shutter Encoder
+exports.** It accepts Shutter's linear labeled `-filter_complex` form,
+normalizes its positional grading options, verifies and pins FFmpeg's negotiated
+format, fuses maximal compatible islands, and retains unsupported filters with
+safe fallback to the original command.
+
 Accepted layouts are 55 formats from eight to sixteen bits per component: the
 packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and `bgr24` and their 16-bit
 `rgb48le`, `rgba64le`, `bgr48le`, and `bgra64le`; planar `gbrp` at 8, 9, 10,
