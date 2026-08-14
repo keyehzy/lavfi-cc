@@ -28,6 +28,12 @@
 #define LAVFI_PIXEL_FORMAT_YUV422P8 10u
 #define LAVFI_PIXEL_FORMAT_YUV420P8 11u
 
+/* The same three with an alpha plane 3, which is never subsampled: only planes
+ * 1 and 2 shrink, so plane 3 is sized like plane 0. */
+#define LAVFI_PIXEL_FORMAT_YUVA444P8 12u
+#define LAVFI_PIXEL_FORMAT_YUVA422P8 13u
+#define LAVFI_PIXEL_FORMAT_YUVA420P8 14u
+
 #if defined(__GNUC__) || defined(__clang__)
 #define LAVFI_KERNEL_EXPORT __attribute__((visibility("default")))
 #else

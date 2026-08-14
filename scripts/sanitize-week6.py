@@ -22,10 +22,13 @@ from lavfi_cc.layouts import get_layout
 
 #: One case per code-generation shape: the packed whole-pixel walk with every
 #: lowering, the one-plane-per-loop walk a subsampled layout needs, the
-#: two-planes-in-one-loop walk hue's chroma rotation forces, and the inline
-#: float32 expression, which is the only shape that calls libm and converts a
-#: float to an integer -- both of which UBSan has something to say about. The
-#: dimensions are odd so a chroma plane's AV_CEIL_RSHIFT rounding is exercised.
+#: two-planes-in-one-loop walk hue's chroma rotation forces, the inline float32
+#: expression, which is the only shape that calls libm and converts a float to
+#: an integer -- both of which UBSan has something to say about -- and the
+#: yuva420p mix of loops at two different resolutions in one kernel, where a
+#: plane-3 pointer walked at a chroma plane's row count would run off the end of
+#: the frame. The dimensions are odd so a chroma plane's AV_CEIL_RSHIFT rounding
+#: is exercised.
 CASES = (
     (
         "format=rgba,negate=components=r+g+b+a,"
@@ -56,6 +59,13 @@ CASES = (
         "format=gbrap",
         257,
         3,
+    ),
+    (
+        "format=yuva420p,lutyuv=y=negval:a=val*0.75+16,"
+        "eq=contrast=1.3:saturation=0.8,hue=h=37.5:s=1.4:b=-0.35,"
+        "negate=components=y+u+v+a,format=yuva420p",
+        257,
+        5,
     ),
 )
 

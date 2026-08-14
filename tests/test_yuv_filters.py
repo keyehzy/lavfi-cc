@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import unittest
 
+from lavfi_cc.expr import ExprBuilder
 from lavfi_cc.frontend import analyze_filtergraph, require_ir
 from lavfi_cc.interpreter import InterpreterError, interpret_pixel, validate_ir
 from lavfi_cc.ir import Operation, PixelIR
@@ -51,11 +52,32 @@ class LutyuvTests(unittest.TestCase):
         self.assertEqual((u[0], u[240], u[255]), (16, 240, 240))
 
     def test_alpha_expression_is_accepted_and_never_stored(self) -> None:
-        # The accepted YUV layouts carry no alpha plane, so upstream never even
-        # evaluates the expression; the channel is simply not written.
+        # yuv420p carries no alpha plane, so upstream never even evaluates the
+        # expression -- config_props builds one table per component the format
+        # has -- and the channel is simply not written.
         analysis = analyze_filtergraph(yuv("lutyuv=y=negval:a=negval"))
         self.assertTrue(analysis.eligible, analysis.diagnostics)
         self.assertEqual(get_layout("yuv420p").stored_channels, (0, 1, 2))
+
+    def test_alpha_is_full_range_where_the_layout_carries_it(self) -> None:
+        # On yuva420p the alpha table is applied. Its range is the one
+        # config_props gives component A -- 0..255 -- rather than luma's
+        # 16..235, so the same negval expression is two different tables.
+        luma, _, _, alpha = tables(
+            require_ir(yuv("lutyuv=y=negval:a=negval", "yuva420p"))
+        )
+        self.assertEqual((alpha[0], alpha[128], alpha[255]), (255, 127, 0))
+        self.assertEqual((luma[0], luma[128], luma[255]), (235, 123, 16))
+        self.assertEqual(get_layout("yuva420p").stored_channels, (0, 1, 2, 3))
+
+    def test_the_default_alpha_expression_is_an_identity(self) -> None:
+        # clipval over 0..255 clamps nothing, so lutyuv leaves alpha alone
+        # unless the caller asks for it -- which is what upstream's copy of the
+        # plane through its own table amounts to.
+        self.assertEqual(
+            tables(require_ir(yuv("lutyuv=y=negval", "yuva420p")))[3],
+            tuple(range(256)),
+        )
 
     def test_gamma_functions_are_refused(self) -> None:
         # gammaval and gammaval709 are vf_lut.c's own funcs1 entries, which
@@ -229,6 +251,11 @@ class SamplingGroupTests(unittest.TestCase):
         self.assertEqual(get_layout("yuv444p").sampling_groups, ((0, 1, 2),))
         self.assertEqual(get_layout("rgba").sampling_groups, ((0, 1, 2, 3),))
 
+    def test_yuva_alpha_joins_luma_rather_than_chroma(self) -> None:
+        # yuva420p keeps alpha at the frame's resolution, so it is co-sited
+        # with luma and not with the chroma it is stored after.
+        self.assertEqual(get_layout("yuva420p").sampling_groups, ((0, 3), (1, 2)))
+
     def build(self, transform: Operation, mode: str, layout: str) -> PixelIR:
         return PixelIR(
             (
@@ -258,21 +285,52 @@ class SamplingGroupTests(unittest.TestCase):
             },
         )
 
+    def luma_alpha_expression(self) -> Operation:
+        """An expression reading luma and alpha together and writing luma."""
+
+        builder = ExprBuilder()
+        mixed = builder.add(builder.channel(0), builder.channel(3))
+        program = builder.build(
+            {0: (builder.min(mixed, builder.const(255.0)), "truncate_saturate_u8")}
+        )
+        return Operation("expr_f32", {"program": program.as_dict()})
+
     def test_a_chroma_rotation_is_admissible_on_a_subsampled_layout(self) -> None:
         # Cb and Cr are sampled at the same positions, so one loop sees both.
-        for layout in ("yuv444p", "yuv422p", "yuv420p"):
+        for layout in ("yuv444p", "yuv422p", "yuv420p",
+                       "yuva444p", "yuva422p", "yuva420p"):
             with self.subTest(layout=layout):
                 validate_ir(self.build(self.rotation(), "saturate_i32_to_u8", layout))
 
     def test_a_colour_matrix_is_still_refused_on_a_subsampled_layout(self) -> None:
         # Luma and chroma have no common sample, so nothing can mix them.
-        for layout in ("yuv422p", "yuv420p"):
+        for layout in ("yuv422p", "yuv420p", "yuva422p", "yuva420p"):
             with self.subTest(layout=layout):
                 with self.assertRaises(InterpreterError) as caught:
                     validate_ir(
                         self.build(self.mixer(), "saturate_i32_to_u8", layout)
                     )
                 self.assertIn("different resolutions", str(caught.exception))
+
+    def test_luma_and_alpha_may_mix_where_chroma_still_may_not(self) -> None:
+        # What decides this is the partition, not whether the layout subsamples
+        # anything: yuva420p subsamples chroma, but luma and alpha are both
+        # full resolution and so share a sample grid. No accepted filter writes
+        # such a program today, so it is built by hand -- the rule admits it for
+        # exactly the reason it admits hue's chroma rotation.
+        for layout in ("yuva444p", "yuva422p", "yuva420p"):
+            with self.subTest(layout=layout):
+                validate_ir(
+                    self.build(
+                        self.luma_alpha_expression(), "expression_outputs", layout
+                    )
+                )
+        # Reaching across the same layout's chroma is still refused, so this is
+        # a property of which channels are mixed rather than of the layout.
+        with self.assertRaises(InterpreterError):
+            validate_ir(
+                self.build(self.mixer(), "saturate_i32_to_u8", "yuva420p")
+            )
 
     def test_the_rule_reaches_ir_built_by_hand(self) -> None:
         # Constructing the IR directly must not dodge the check.

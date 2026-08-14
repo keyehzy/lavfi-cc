@@ -72,9 +72,29 @@ YUV_CHAINS = (
     "hue=h=25:s=1.2:b=-0.3,negate=components=v",
 )
 
+# The yuva layouts run everything above plus the chains that reach alpha, which
+# the alpha-less trio cannot express at all: negate=components=…a is a hard
+# configuration failure there, and lutyuv's alpha table is never applied because
+# upstream only builds one per component the format actually carries. Alpha is
+# full resolution while chroma need not be, so these also put a stored channel
+# in a sampling group that is neither luma's plane nor the chroma pair.
+YUVA_CHAINS = YUV_CHAINS + (
+    "negate=components=a",
+    "negate=components=y+u+v+a",
+    "lutyuv=y=negval:a=negval",
+    "lutyuv=a='clip(val,16,235)':u=val*0.9+12",
+    "eq=contrast=1.4:saturation=0.7,negate=components=a",
+    "hue=h=35:s=1.3:b=0.2,lutyuv=a=negval",
+    "negate,lutyuv=y=negval:a=val*0.75+16,eq=contrast=1.3:saturation=0.8,"
+    "hue=h=25:s=1.2:b=-0.3,negate=components=v+a",
+)
+
 
 def chains_for(name: str) -> tuple[str, ...]:
-    return YUV_CHAINS if get_layout(name).family == "yuv" else RGB_CHAINS
+    layout = get_layout(name)
+    if layout.family != "yuv":
+        return RGB_CHAINS
+    return YUVA_CHAINS if layout.has_alpha else YUV_CHAINS
 
 
 def _executable(candidates: tuple[Path, ...], override: str | None) -> Path | None:
@@ -143,6 +163,53 @@ class LayoutTableTests(unittest.TestCase):
                 self.assertEqual(layout.step, 1)
                 self.assertFalse(layout.has_alpha)
                 self.assertEqual(set(layout.components), {"y", "u", "v"})
+
+    def test_yuva_layouts_add_a_full_resolution_alpha_plane(self) -> None:
+        # This table was read out of the pinned binary the way every other
+        # layout's was: one negate per component over a frame of four distinct
+        # plane values moves plane 0 for y, 1 for u, 2 for v, and 3 for a. The
+        # differential tests below are what hold it to the oracle.
+        for name, chroma in (("yuva444p", (0, 0)), ("yuva422p", (1, 0)),
+                             ("yuva420p", (1, 1))):
+            with self.subTest(layout=name):
+                layout = get_layout(name)
+                self.assertEqual(layout.family, "yuv")
+                self.assertEqual(layout.planes, (0, 1, 2, 3))
+                self.assertEqual(layout.plane_count, 4)
+                self.assertEqual(layout.step, 1)
+                self.assertTrue(layout.has_alpha)
+                self.assertEqual(set(layout.components), {"y", "u", "v", "a"})
+                # Only chroma shrinks; alpha is sized like luma.
+                self.assertEqual(
+                    layout.subsampling, ((0, 0), chroma, chroma, (0, 0))
+                )
+                self.assertEqual(layout.plane_shift(3), (0, 0))
+
+    def test_yuva_alpha_shares_lumas_sampling_group(self) -> None:
+        # Alpha and luma have a sample at exactly the same positions, so they
+        # are one group; chroma is the other. This is the first layout where a
+        # group spans two planes that are not adjacent, and the first that is
+        # subsampled and carries alpha at the same time.
+        self.assertEqual(get_layout("yuva420p").sampling_groups, ((0, 3), (1, 2)))
+        self.assertEqual(get_layout("yuva422p").sampling_groups, ((0, 3), (1, 2)))
+        # yuva444p subsamples nothing, so every channel is co-sited.
+        self.assertEqual(get_layout("yuva444p").sampling_groups, ((0, 1, 2, 3),))
+        self.assertFalse(get_layout("yuva444p").subsampled)
+        self.assertTrue(get_layout("yuva420p").subsampled)
+
+    def test_yuva_frame_sizes_shrink_only_the_chroma_planes(self) -> None:
+        yuva420p = get_layout("yuva420p")
+        self.assertEqual(
+            [yuva420p.plane_width(plane, 5) for plane in range(4)], [5, 3, 3, 5]
+        )
+        self.assertEqual(
+            [yuva420p.plane_height(plane, 3) for plane in range(4)], [3, 2, 2, 3]
+        )
+        self.assertEqual(yuva420p.frame_size(5, 3), 15 + 6 + 6 + 15)
+        # The alpha plane sits after both chroma planes.
+        self.assertEqual(yuva420p.plane_origin(3, 5, 3), 15 + 6 + 6)
+        self.assertEqual(get_layout("yuva422p").frame_size(5, 3), 15 + 9 + 9 + 15)
+        self.assertEqual(get_layout("yuva444p").frame_size(5, 3), 60)
 
     def test_chroma_planes_round_up_like_ffmpeg(self) -> None:
         # AV_CEIL_RSHIFT: an odd dimension keeps a whole trailing chroma
@@ -265,12 +332,24 @@ class LayoutAnalysisTests(unittest.TestCase):
 
     def test_negate_alpha_is_refused_where_it_would_negate_alpha(self) -> None:
         # A plane mask means the legacy option really does negate alpha on
-        # planar RGB, unlike packed RGB where the component mask wins.
-        analysis = analyze_filtergraph(
-            "format=gbrap,negate=negate_alpha=1,negate,format=gbrap"
-        )
-        self.assertFalse(analysis.eligible)
-        self.assertEqual(analysis.diagnostics[0].code, "planar_negate_alpha")
+        # planar RGB, unlike packed RGB where the component mask wins. The
+        # yuva layouts are planar with an alpha plane, so it lands on them the
+        # same way -- and the spelling suggested has to be in their own family.
+        for name, spelling in (
+            ("gbrap", "components=r+g+b+a"),
+            ("yuva444p", "components=y+u+v+a"),
+            ("yuva422p", "components=y+u+v+a"),
+            ("yuva420p", "components=y+u+v+a"),
+        ):
+            with self.subTest(layout=name):
+                analysis = analyze_filtergraph(
+                    f"format={name},negate=negate_alpha=1,negate,format={name}"
+                )
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(
+                    analysis.diagnostics[0].code, "planar_negate_alpha"
+                )
+                self.assertIn(spelling, analysis.diagnostics[0].message)
         # Packed RGB ignores it, and gbrp has no alpha plane to negate.
         for layout in ("rgba", "gbrp"):
             with self.subTest(layout=layout):
@@ -279,6 +358,48 @@ class LayoutAnalysisTests(unittest.TestCase):
                         f"format={layout},negate=negate_alpha=1,negate,"
                         f"format={layout}"
                     ).eligible
+                )
+
+    def test_alpha_components_follow_the_plane_the_layout_carries(self) -> None:
+        # Upstream builds the available-component mask from the descriptor, so
+        # naming alpha is a hard configuration failure exactly where there is
+        # no alpha plane -- which within the YUV family is what separates
+        # yuv420p from yuva420p.
+        self.assertTrue(
+            analyze_filtergraph(
+                "format=yuva420p,negate=components=y+u+v+a,negate,format=yuva420p"
+            ).eligible
+        )
+        analysis = analyze_filtergraph(
+            "format=yuv420p,negate=components=y+u+v+a,negate,format=yuv420p"
+        )
+        self.assertFalse(analysis.eligible)
+        self.assertEqual(analysis.diagnostics[0].code, "component_not_available")
+
+    def test_yuva_layouts_still_refuse_the_rgb_component_names(self) -> None:
+        # Carrying alpha does not make a YUV layout accept the RGB family.
+        for name in ("yuva444p", "yuva422p", "yuva420p"):
+            with self.subTest(layout=name):
+                analysis = analyze_filtergraph(
+                    f"format={name},negate=components=r+g+b,negate,format={name}"
+                )
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(
+                    analysis.diagnostics[0].code, "component_not_available"
+                )
+
+    def test_yuva_layouts_refuse_the_rgb_only_filters(self) -> None:
+        # The same negotiation argument as for yuv420p: FFmpeg would convert
+        # around an RGB-only filter, so the run is not contiguous in one format.
+        for name in ("lutrgb=r=val*2", "colorlevels=rimin=.05", "curves=r='0/0 1/1'",
+                     "colorbalance=rs=.2", "colorcontrast=rc=.4:rcw=.9"):
+            with self.subTest(filter=name):
+                analysis = analyze_filtergraph(
+                    f"format=yuva420p,{name},format=yuva420p"
+                )
+                self.assertFalse(analysis.eligible)
+                self.assertEqual(
+                    analysis.diagnostics[0].code, "format_not_advertised"
                 )
 
     def test_negate_alpha_is_refused_on_an_alpha_less_layout(self) -> None:

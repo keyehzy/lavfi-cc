@@ -9,14 +9,17 @@ work recorded in [`docs/roadmap-status.md`](docs/roadmap-status.md).
 
 Accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, and
 `bgr24`, the planar RGB `gbrp` and `gbrap`, and the planar YUV `yuv444p`,
-`yuv422p`, and `yuv420p`. A run is only fused when it already works in one of
+`yuv422p`, `yuv420p`, `yuva444p`, `yuva422p`, and `yuva420p`. A run is only
+fused when it already works in one of
 them: a pointwise filter produces different bytes in different pixel formats,
 so fusing a run into a kernel built for another format would change the output,
 and no conversion is ever introduced at an island boundary. Runs that cannot be
 fused are reported rather than guessed at.
 
 YUV support is native rather than converted: a `yuv420p` island is fused in
-`yuv420p`, with the chroma planes walked at their own resolution.
+`yuv420p`, with the chroma planes walked at their own resolution. The `yuva`
+layouts subsample chroma while keeping alpha at the frame's full resolution, so
+one kernel walks loops of two different resolutions.
 
 The accepted filters split by the formats they advertise upstream, and a run
 may only be fused in a format *every* filter in it accepts:
@@ -34,7 +37,9 @@ filter out, so no single kernel is equivalent to it.
 `hue` rotates Cb into Cr, so it is the one accepted YUV filter that reads across
 channels on a subsampled layout. That is admissible because the two chroma
 channels are sampled at the same positions; a colour matrix mixing luma with
-chroma is still refused there, since those have no sample in common.
+chroma is still refused there, since those have no sample in common. On the
+`yuva` layouts the same rule puts alpha with luma rather than with the chroma
+it is stored after, because that is the grid it is sampled on.
 
 `colorbalance` and `colorcontrast` read all three colour channels through a
 per-pixel lightness term, which no table can express. They lower to `expr_f32`,
@@ -129,9 +134,10 @@ layout the chain pins:
 
 Omit `--input` or `--output` to use standard input or standard output. Input
 must contain only complete frames, sized for that layout — `width * height * 4`
-for `rgba`, and `width * height * 3 / 2` for `yuv420p`, whose planes sit back to
-back with chroma dimensions rounded up. The Python API also supports padded and
-negative frame strides, per plane, through `interpret_into`.
+for `rgba`, `width * height * 3 / 2` for `yuv420p`, and `width * height * 5 / 2`
+for `yuva420p`, whose planes sit back to back with chroma dimensions rounded up
+and alpha at full resolution. The Python API also supports padded and negative
+frame strides, per plane, through `interpret_into`.
 
 Compile and run the same stream through a cached, checked native kernel:
 

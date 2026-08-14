@@ -14,7 +14,8 @@ changes inside the region are rejected.
 
 The accepted layouts are the packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`,
 and `bgr24`, the planar RGB `gbrp` and `gbrap`, and the planar YUV `yuv444p`,
-`yuv422p`, and `yuv420p`. They differ only in which byte holds which component,
+`yuv422p`, `yuv420p`, `yuva444p`, `yuva422p`, and `yuva420p`. They differ only
+in which byte holds which component,
 whether alpha exists, and — for YUV — at what resolution each component is
 stored, so the IR stays layout-independent and always sees four logical
 channels. What those channels are *called* does depend on the layout: red,
@@ -36,7 +37,10 @@ every offset zero. `lavfi_cc/layouts.py` records both, read out of the pinned
 binary by converting one known `0x11223344` RGBA pixel into each format; that
 is where `gbrp`'s green, blue, red plane order comes from. YUV's luma, Cb, Cr
 plane order was read out the same way, with a component-selective `negate`:
-`negate=components=u` changes the second plane and nothing else.
+`negate=components=u` changes the second plane and nothing else. `yuva`'s
+fourth plane was read out by the same probe, one component at a time:
+`negate=components=a` changes the last plane, which is `width * height` bytes
+rather than a chroma plane's size.
 
 ### Chroma subsampling
 
@@ -64,16 +68,30 @@ diagonal `levels_f32_fma` read one channel each and fit anywhere;
 are refused on `yuv422p` and `yuv420p`. `validate_ir` enforces this for every
 consumer of the IR, so it cannot be bypassed by building the IR directly.
 
+The `yuva` layouts are where the partition stops being a restatement of "is
+this subsampled". Only their chroma planes shrink; alpha keeps the frame's
+resolution, exactly as luma does — upstream sets `height[0] = height[3] =
+inlink->h` and sizes only planes 1 and 2 with `AV_CEIL_RSHIFT`. So `yuva420p`
+partitions into `(luma, alpha)` and `(Cb, Cr)`: two groups whose members are
+not adjacent planes, in a layout that subsamples *and* carries alpha at once.
+An operation reading luma together with alpha is admissible there for the same
+reason `hue`'s rotation is admissible — they share a sample grid — while a
+colour matrix reaching across luma and chroma is still refused.
+
 Code generation and the interpreter follow the same split: a layout whose
 planes share the frame's resolution is walked one pixel at a time with all four
 channels loaded, and a subsampled layout is walked one sampling group at a time
-at that group's own resolution.
+at that group's own resolution. A `yuva420p` kernel therefore contains loops of
+two different resolutions, with plane 3 walked at plane 0's row count.
 
 An alpha-less layout loads `a = 0` and stores only the three colour channels.
 That matches upstream: the packed `colorchannelmixer` path omits every alpha
 term when `have_alpha` is unset, and the other accepted filters treat
 components independently, so an alpha lane that is never stored cannot change a
-stored one.
+stored one. Where alpha *is* stored, the accepted YUV filters pass it through
+rather than compute it: `eq` copies plane 3 outright, `hue` copies it, `negate`
+touches it only when asked, and `lutyuv` applies a table whose default
+expression is the identity over alpha's full `0..255` range.
 
 Two rules follow from the format lists rather than from the pixel maths:
 
@@ -93,9 +111,9 @@ Two rules follow from the format lists rather than from the pixel maths:
   produce the same bytes as `format=rgba,negate`. Fusing a run whose working
   format is unknown or unsupported would change output, so it is refused.
 
-The 9–16-bit formats, the YUVA and YUVJ families, and the remaining
-subsampling ratios (`yuv411p`, `yuv410p`, `yuv440p`) are advertised by
-`negate` but are not implemented. See [`roadmap-status.md`](roadmap-status.md).
+The 9–16-bit formats, the YUVJ family, and the remaining subsampling ratios
+(`yuv411p`, `yuv410p`, `yuv440p`) are advertised by `negate` but are not
+implemented. See [`roadmap-status.md`](roadmap-status.md).
 
 Every accepted upstream filter advertises `AVFILTER_FLAG_SLICE_THREADS`. A
 fused filter must do the same. These operations are row-local in the accepted subset,
@@ -142,10 +160,14 @@ time, and a request for a component the format lacks fails the graph outright
 consequences, both reproduced by the compiler so it accepts exactly the graphs
 upstream accepts:
 
-- `components=…a` is rejected on `rgb24`, `bgr24`, `gbrp`, and every accepted
-  YUV layout, rather than treated as a no-op.
-- The families are mutually exclusive. `components=r+g+b` fails on `yuv420p`
-  and `components=y+u+v` fails on `rgba`, both with the same upstream error.
+- `components=…a` is rejected on `rgb24`, `bgr24`, `gbrp`, `yuv444p`,
+  `yuv422p`, and `yuv420p`, rather than treated as a no-op. It is accepted on
+  the `yuva` layouts, which do carry the plane; that is the whole difference
+  between `yuv420p` and `yuva420p` as far as this option is concerned.
+- The families are mutually exclusive, and carrying alpha does not change
+  which family a format belongs to. `components=r+g+b` fails on `yuv420p` and
+  on `yuva420p`, and `components=y+u+v` fails on `rgba`, all with the same
+  upstream error.
 
 Within a format the mapping is positional and the same for both families: `r`
 and `y` select channel 0, `g` and `u` channel 1, `b` and `v` channel 2, and `a`
@@ -166,11 +188,23 @@ gbrap  negate                -> dd cc ee 44     alpha unchanged
 gbrap  negate=negate_alpha=1 -> dd cc ee bb     alpha negated
 ```
 
+Planar YUV with alpha behaves like `gbrap` rather than like packed RGB, since
+what decides it is `is_packed` and not the family. Over one frame whose four
+planes hold `Y=0x11 U=0x22 V=0x33 A=0x44`:
+
+```text
+yuv420p  negate=negate_alpha=1 -> ee dd cc        no alpha plane to select
+yuva420p negate                -> ee dd cc 44     alpha unchanged
+yuva420p negate=negate_alpha=1 -> ee dd cc bb     alpha negated
+```
+
 The compiler accepts the option on packed layouts, where it provably has no
 alpha effect, and on layouts with no alpha plane for it to select — `gbrp` and
-the accepted YUV formats, whose three planes are all selected either way. It
-rejects it on `gbrap`, where honouring it would negate alpha;
-`components=r+g+b+a` states that intent unambiguously and is accepted.
+the alpha-less YUV formats, whose three planes are all selected either way. It
+rejects it on `gbrap` and on the three `yuva` layouts, where honouring it would
+negate alpha. The suggested spelling is in the layout's own family, since
+naming the other one is itself a configuration failure: `components=r+g+b+a` on
+`gbrap` and `components=y+u+v+a` on `yuva420p`.
 
 Accepted MVP constraints:
 

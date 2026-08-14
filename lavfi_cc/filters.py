@@ -270,9 +270,10 @@ def _check_negate_alpha(
 
     ``negate_alpha`` sets a *plane* mask.  Packed RGB ignores it in favour of
     its component mask, and a layout without an alpha plane has nothing for it
-    to select, so in both cases it is inert.  On ``gbrap`` it does negate alpha,
-    which is a different meaning for the same option.  An explicit ``components``
-    replaces the plane mask outright, so the option cannot matter there either.
+    to select, so in both cases it is inert.  On ``gbrap`` and on the ``yuva``
+    layouts it does negate alpha, which is a different meaning for the same
+    option.  An explicit ``components`` replaces the plane mask outright, so the
+    option cannot matter there either.
     """
 
     options = invocation.named_options()
@@ -287,11 +288,14 @@ def _check_negate_alpha(
         and layout.planar
         and layout.has_alpha
     ):
+        # The suggested spelling has to be in this layout's own family, since
+        # naming the other one is itself a configuration failure upstream.
+        spelling = "+".join(layout.components)
         raise LoweringError(
             "planar_negate_alpha",
             f"negate_alpha sets a plane mask, so it negates alpha in "
             f"{layout.name!r} unlike in packed RGB; spell the intent as "
-            "components=r+g+b+a instead",
+            f"components={spelling} instead",
             "negate_alpha",
         )
 
@@ -1359,10 +1363,16 @@ SUPPORTED_FILTERS = tuple(LOWERERS)
 #: ``lutrgb``, ``colorlevels``, and ``colorchannelmixer`` are RGB-only and
 #: ``lutyuv`` is YUV-only.  A run mixing the two families is therefore not
 #: contiguous in one format and is refused rather than fused.
+#:
+#: The ``yuva`` trio needs no separate column: every filter that advertises a
+#: planar YUV format at this depth advertises its alpha-carrying twin as well,
+#: so the two move together and nothing can be fusible in ``yuv420p`` but not
+#: in ``yuva420p``.
 _RGB8 = frozenset(
     {"rgba", "bgra", "argb", "abgr", "rgb24", "bgr24", "gbrp", "gbrap"}
 )
-_YUV8 = frozenset({"yuv444p", "yuv422p", "yuv420p"})
+_YUVA8 = frozenset({"yuva444p", "yuva422p", "yuva420p"})
+_YUV8 = frozenset({"yuv444p", "yuv422p", "yuv420p"}) | _YUVA8
 
 FILTER_FORMATS: dict[str, frozenset[str]] = {
     "negate": _RGB8 | _YUV8,

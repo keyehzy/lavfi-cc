@@ -38,9 +38,15 @@ own dimensions with FFmpeg's ``AV_CEIL_RSHIFT`` rounding.  ``width`` and
 
 A subsampled layout no longer has one loop iteration per pixel: a chroma sample
 covers several luma samples, so an operation that mixes channels has no single
-sample to mix.  Callers must therefore restrict subsampled layouts to
-channel-independent operations, which the interpreter enforces for every
-consumer of the IR.
+sample to mix.  What such a layout *can* express is a mix confined to channels
+that share a sample grid, which :attr:`PixelLayout.sampling_groups` partitions
+out and every consumer of the IR is checked against.
+
+The ``yuva`` layouts are what make that partition more than a formality.  Their
+alpha plane is full resolution while their chroma planes may not be, so the
+groups are ``(luma, alpha)`` and ``(Cb, Cr)``: two groups whose members are not
+adjacent planes, in a layout that is subsampled and carries alpha at once.
+Every earlier layout had alpha only where nothing was subsampled.
 """
 
 from __future__ import annotations
@@ -246,18 +252,26 @@ def _yuv(
     chroma_shift: tuple[int, int],
     abi_id: int,
     abi_macro: str,
+    *,
+    alpha: bool = False,
 ) -> PixelLayout:
-    """Planar 8-bit YUV: plane 0 luma, 1 Cb, 2 Cr, no alpha."""
+    """Planar 8-bit YUV: plane 0 luma, 1 Cb, 2 Cr, and on ``yuva`` 3 alpha.
+
+    Only the chroma planes are subsampled.  Alpha keeps the frame's full
+    resolution, exactly as luma does, which is what upstream's ``height[0] =
+    height[3] = inlink->h`` says and what the pinned binary's frame sizes
+    confirm.
+    """
 
     return PixelLayout(
         name,
-        3,
+        4 if alpha else 3,
         1,
-        (0, 1, 2, None),
-        (0, 0, 0, None),
+        (0, 1, 2, 3 if alpha else None),
+        (0, 0, 0, 0 if alpha else None),
         abi_id,
         abi_macro,
-        ("y", "u", "v", None),
+        ("y", "u", "v", "a" if alpha else None),
         ((0, 0), chroma_shift, chroma_shift, (0, 0)),
     )
 
@@ -277,6 +291,10 @@ LAYOUTS: dict[str, PixelLayout] = {
         _yuv("yuv444p", (0, 0), 9, "LAVFI_PIXEL_FORMAT_YUV444P8"),
         _yuv("yuv422p", (1, 0), 10, "LAVFI_PIXEL_FORMAT_YUV422P8"),
         _yuv("yuv420p", (1, 1), 11, "LAVFI_PIXEL_FORMAT_YUV420P8"),
+        # Plane 3 is alpha, at the frame's full resolution in all three.
+        _yuv("yuva444p", (0, 0), 12, "LAVFI_PIXEL_FORMAT_YUVA444P8", alpha=True),
+        _yuv("yuva422p", (1, 0), 13, "LAVFI_PIXEL_FORMAT_YUVA422P8", alpha=True),
+        _yuv("yuva420p", (1, 1), 14, "LAVFI_PIXEL_FORMAT_YUVA420P8", alpha=True),
     )
 }
 

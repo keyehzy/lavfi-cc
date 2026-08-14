@@ -6,7 +6,8 @@ specific finding that determines how much work is left.
 
 All six have now landed. Item 3 was the last one still half-open; its RGB half
 has since landed too, together with the cross-channel float IR operation that
-was blocking it.
+was blocking it. Item 4 has since been extended once more, with the `yuva`
+layouts that were the first entry on the recommended-order list below.
 
 The framing changed twice during this work. Both changes are stated first,
 because each one reorders the roadmap.
@@ -116,8 +117,8 @@ Everything else is reported and refused — see the correctness note above.
 ## 2. Widen pixel-format reach — done for 8-bit RGB and planar YUV, deferred above that
 
 Supported today: packed `rgba`, `bgra`, `argb`, `abgr`, `rgb24`, `bgr24`,
-planar RGB `gbrp`, `gbrap`, and planar YUV `yuv444p`, `yuv422p`, `yuv420p`
-(item 4).
+planar RGB `gbrp`, `gbrap`, and planar YUV `yuv444p`, `yuv422p`, `yuv420p`,
+`yuva444p`, `yuva422p`, `yuva420p` (item 4).
 
 The byte offsets and the planar plane order in `lavfi_cc/layouts.py` were taken
 from the pinned binary rather than from format descriptors, by converting one
@@ -152,7 +153,9 @@ Three format-dependent constraints were found and are enforced:
   effect and rejects it on `gbrap`, pointing at `components=r+g+b+a` instead.
   Item 4 made the lowering layout-aware, so honouring it on `gbrap` is now a
   small change; it is still refused because refusing it is not wrong and
-  `components=r+g+b+a` already states the intent.
+  `components=r+g+b+a` already states the intent. The `yuva` layouts landed on
+  the same side of this rule for the same reason — what decides it upstream is
+  `is_packed`, not the colour family.
 
 **Deferred:** the 9–16-bit formats, which need 65536-entry tables and a
 re-derivation of every quantization rule at that depth. That framing is now
@@ -412,7 +415,7 @@ binaries in `.build/` are GPL rather than LGPL as a result; they are local
 artifacts and are not distributed. `lutyuv` and `hue` are LGPL and were present
 all along.
 
-## 4. Avoid boundary conversion — done for `yuv444p`, `yuv422p`, `yuv420p`
+## 4. Avoid boundary conversion — done for the six planar YUV formats
 
 The roadmap offered two routes: fuse the format conversion into the island
 boundary, or introduce a YUV IR. The first should not be attempted. Fusing the
@@ -500,14 +503,89 @@ sizes are the standing guard; that sweep was how the slice alignment was
 convinced to be right at job counts the suite does not reach.
 
 Generated C for the pre-existing layouts was byte-identical to before item 4
-across all 40 layout-and-chain combinations, and item 3 preserved that property
-across all 55 that existed by then, so no cached or bundled kernel was
-invalidated by either.
+across all 40 layout-and-chain combinations, item 3 preserved that property
+across all 55 that existed by then, and `yuva` preserved it across all 125, so
+no cached or bundled kernel was invalidated by any of them.
 
-**Deferred:** `yuva*` (alpha at full resolution alongside subsampled chroma),
-the `yuvj` full-range family, and the remaining ratios `yuv411p`, `yuv410p`,
-and `yuv440p`. Each is a table entry rather than a design question, but none of
-them appears in the corpus.
+### `yuva*` was the prediction the sampling-group rule was waiting for
+
+`yuva444p`, `yuva422p`, and `yuva420p` are now supported too, and they are the
+first layouts that subsample *and* carry alpha. Every earlier layout had alpha
+only where nothing was subsampled, so "does this layout subsample?" and "may an
+operation read across channels?" had never come apart.
+
+Only chroma shrinks. Alpha keeps the frame's resolution — upstream's `negate`
+writes `height[0] = height[3] = inlink->h` and applies `AV_CEIL_RSHIFT` to
+planes 1 and 2 only — so `yuva420p` partitions into `(luma, alpha)` and
+`(Cb, Cr)`. The roadmap predicted three sampling groups; there are two, because
+alpha is co-sited with luma rather than being a grid of its own. That is the
+one thing about this item that was called wrong in advance, and it makes the
+layout *more* expressive than expected rather than less: an operation reading
+luma together with alpha is admissible on `yuva420p`, for exactly the reason
+`hue`'s rotation is. No accepted filter writes one, so the rule is pinned by IR
+built by hand.
+
+What did need care is that the two groups are not adjacent planes. A kernel
+therefore contains loops at two different resolutions, with plane 3 walked at
+plane 0's row count; a plane-3 pointer advanced by a chroma plane's row count
+would run off the end of the frame. `vf_fused.c`'s slice loop needed no change
+for that — it already offset planes 1 and 2 by the chroma grid and 0 and 3 by
+the full one, which was written for the alpha-less case and turns out to be the
+general rule. The filter's only change is three more format identifiers.
+
+The filter subset needed no widening either: every filter that advertises a
+planar YUV format at this depth advertises its alpha-carrying twin, so `negate`,
+`lutyuv`, `eq`, and `hue` all reach `yuva` unchanged. What changed is what
+alpha *means* to them, and each one had to be read rather than assumed. `eq`
+copies plane 3 outright (`if (i == 3 || !adjust)`), `hue` copies it, and
+`lutyuv` applies a real table to it — built from component A's `0..255` range
+rather than luma's `16..235`, so the same `negval` expression is two different
+tables in one filter invocation. All three were already lowered that way; what
+was new is that the alpha channel is now stored, so being wrong would show.
+
+Two `negate` option rules move with the alpha plane, and both are ones `gbrap`
+already had:
+
+- `negate=components=…a` is a hard configuration failure on `yuv420p` and
+  accepted on `yuva420p`. That is the entire difference between the two
+  formats as far as the option is concerned.
+- `negate_alpha=1` really does negate alpha here, exactly as on `gbrap`, since
+  what decides it upstream is `is_packed` rather than the colour family. It is
+  refused, and the refusal now names a spelling in the layout's own family:
+  `components=y+u+v+a`, because suggesting `components=r+g+b+a` on a YUV format
+  would be suggesting another configuration failure.
+
+#### What the `yuva` half is checked against
+
+The plane order was read out of the pinned binary rather than from a
+descriptor, the same way every other layout was: one `negate` per component
+over a frame of four distinct plane values moves plane 0 for `y`, 1 for `u`, 2
+for `v`, and 3 for `a`, and plane 3 is `width * height` bytes rather than a
+chroma plane's size.
+
+In the suite: `tests/test_layouts.py` runs twenty-two chains across the three
+new layouts — the fifteen YUV chains plus seven that reach alpha, which the
+alpha-less trio cannot express at all — through the interpreter, the compiled
+kernel, and patched FFmpeg at `-filter_threads 4`. `tests/test_yuv_filters.py`
+pins the reasoning: the `(luma, alpha)` partition, that a luma-and-alpha
+expression is admissible where a colour matrix still is not, `lutyuv`'s alpha
+range, and both alpha option refusals with the family-correct spelling. The
+ASan/UBSan gate gained a fifth case for the two-resolution kernel shape.
+
+Checked once by hand, not automated:
+
+- The size-and-threads sweep above, repeated for the three `yuva` formats: 63
+  runs over `1x1`, `2x3`, `3x2`, `17x9`, `64x33`, `65x64`, and `127x71` at one,
+  three, and eight filter threads, all byte-identical to the oracle through
+  patched FFmpeg. This is what convinces the full-resolution alpha plane to
+  tile correctly against chroma-aligned slice boundaries.
+- 75 randomized alpha-touching option sets (25 per layout, over `negate` masks
+  including `a`, `lutyuv` alpha expressions, `eq`, and `hue`) on a `129x67`
+  frame: no mismatches and no refusals.
+
+**Deferred:** the `yuvj` full-range family and the remaining ratios `yuv411p`,
+`yuv410p`, and `yuv440p`. Each is a table entry rather than a design question,
+and none of them appears in the corpus.
 
 ## 5. Analysis-only scanner — done
 
@@ -517,7 +595,9 @@ compiles or runs anything. A lenient parser records per-filter option problems
 instead of failing the graph, so a scan still explains what blocked an island.
 
 The corpus in `tests/corpus/filtergraphs.txt` grew from 40 graphs to 45 in item
-4, to 58 in item 3's YUV half, and to 69 in its RGB half. The YUV additions are
+4, to 58 in item 3's YUV half, to 69 in its RGB half, and to 77 with `yuva` —
+five grading chains on video that carries an alpha plane, and three graphs
+where the alpha plane itself decides the refusal. The YUV additions are
 seven grading chains of the shape people actually write — `eq` and `hue`
 together, sometimes with `lutyuv` or a `crop` between them — four graphs where
 an accepted filter is pinned to a format it does not advertise, and three where
@@ -532,17 +612,17 @@ filters that really are outside the subset rather than by ones waiting on it.
 
 ```console
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt
-  graphs scanned:            69
-  islands found:             66
-  islands fusible today:     52
-  frame passes eliminated:   47
+  graphs scanned:            77
+  islands found:             75
+  islands fusible today:     60
+  frame passes eliminated:   54
   frame passes blocked:      11
   blocked passes by working format:
-    negotiated   9 passes across 13 islands
+    negotiated   9 passes across 14 islands
     yuv410p      2 passes across 1 island
 
 $ ./lavfi-cc scan --file tests/corpus/filtergraphs.txt --entry-format yuv420p
-  frame passes eliminated:   50
+  frame passes eliminated:   57
   frame passes blocked:      5
 ```
 
@@ -613,10 +693,39 @@ one filter with one kernel removes no frame pass. It is a useful reminder of
 what the scanner's headline number measures: not how many filters are
 supported, but how many frame passes a run of them removes.
 
+`yuva` is measured the same way again, on the 77-graph corpus with and without
+the three new layouts in the backend:
+
+| the same 77 graphs | eliminated | blocked |
+|---|---:|---:|
+| before `yuva444p`, `yuva422p`, `yuva420p` | 47 | 20 |
+| after | 54 | 11 |
+| after, `--entry-format yuv420p` | 57 | 5 |
+
+Seven more frame passes eliminated, but nine fewer blocked, and the gap is the
+interesting part. Two of those nine were never removable, and neither was
+visible as such until the scanner could see the format:
+
+- `format=yuva420p,curves=…,negate` was reported as one two-filter island.
+  `curves` is RGB-only, so FFmpeg converts around it and the run was never
+  contiguous — the same correction `format=yuv420p,negate,lutrgb,colorlevels`
+  produced in item 4, arriving for the same reason.
+- `format=yuva420p,negate=negate_alpha=1,negate` is a genuine two-filter run in
+  one format, and this compiler refuses it rather than honour a plane mask that
+  means something different here than in packed RGB. That pass is withheld by a
+  decision recorded above, not by FFmpeg, and it is the one place where the
+  numbers move because of a refusal rather than a fact.
+
+Measured on the *unchanged* 69-graph corpus the movement is 47 to 47: no gain,
+because that corpus contained no alpha-carrying YUV graph at all. As with the
+RGB half, the headline number measures runs removed, not formats supported.
+
 Item 4 removed the format barrier and named the filter subset as the next
-binding constraint. Item 3 has now widened the subset on both sides. What binds
-now is neither: it is the formats still outside the backend, where `yuva*` is
-the next real step.
+binding constraint. Item 3 widened the subset on both sides, and `yuva` has now
+widened the format reach again. What binds now is the remaining formats: the
+high-depth families, which are the widest change left, and the flat table
+entries — `yuvj*`, `yuv411p`, `yuv410p`, `yuv440p` — none of which the corpus
+asks for.
 
 ## 6. Build-time integration — done for the compiler, unchanged for the patch
 
@@ -651,29 +760,29 @@ silently ignored on rebuild.
 
 ## Recommended order from here
 
-1. **`yuva*` support**, which is a bigger step than the other deferred table
-   entries and worth separating from them. Alpha at full resolution alongside
-   subsampled chroma gives a layout with three sampling groups rather than two,
-   which is the first real exercise of the partition that `hue` made general.
-2. **High-depth formats**: the widest change for the least corpus reach. Note
+1. **High-depth formats**: the widest change for the least corpus reach. Note
    that `expr_f32` makes this cheaper than it was. The 9–16-bit paths of these
    filters are the same expressions with a different `max`, so they need a
    wider quantizer and a wider channel load rather than 65536-entry tables —
    which is the opposite of the situation for `lutrgb` and `negate`.
-3. **More filters on the operation that now exists.** `vibrance`,
+2. **More filters on the operation that now exists.** `vibrance`,
    `colortemperature`, and `selectivecolor` are all pixel-local float
    expressions of the shape `expr_f32` already carries, and each is now a
    transcription rather than a design question. They are in the corpus as
    refusals, so their reach can be measured before any of them is written.
-4. **The remaining YUV table entries** — `yuvj*`, `yuv411p`, `yuv410p`,
+3. **The remaining YUV table entries** — `yuvj*`, `yuv411p`, `yuv410p`,
    `yuv440p` — if a real corpus ever asks for them. Each is a row in
    `layouts.py` plus an ABI identifier now that subsampling is general; only
    `yuv410p` appears in this corpus, and only as the "format the kernel cannot
-   run" case.
+   run" case. `yuvj*` is the one with a semantic question rather than a
+   geometric one: it is full-range, which is what `lutyuv`'s `minval` and
+   `maxval` are derived from, so its tables are not the limited-range ones.
 
-Three entries left this list by being done. Layout-aware lowering landed as
+Four entries left this list by being done. Layout-aware lowering landed as
 part of item 4, because `negate`'s component mask could not be expressed in YUV
 without it. `lutyuv`, `eq`, and `hue` landed as item 3's YUV half. The
 cross-channel float operation landed as `expr_f32`, with `colorbalance`,
 `colorcontrast`, and `curves` on top of it — and `curves`, which was expected
-to need it, turned out not to.
+to need it, turned out not to. `yuva*` landed as part of item 4, and was the
+one entry whose predicted shape was wrong: two sampling groups rather than
+three, because alpha is co-sited with luma.

@@ -48,6 +48,9 @@
 #define LAVFI_PIXEL_FORMAT_YUV444P8  9u
 #define LAVFI_PIXEL_FORMAT_YUV422P8 10u
 #define LAVFI_PIXEL_FORMAT_YUV420P8 11u
+#define LAVFI_PIXEL_FORMAT_YUVA444P8 12u
+#define LAVFI_PIXEL_FORMAT_YUVA422P8 13u
+#define LAVFI_PIXEL_FORMAT_YUVA420P8 14u
 
 static enum AVPixelFormat kernel_pixel_format(uint32_t identifier)
 {
@@ -63,6 +66,9 @@ static enum AVPixelFormat kernel_pixel_format(uint32_t identifier)
     case LAVFI_PIXEL_FORMAT_YUV444P8:  return AV_PIX_FMT_YUV444P;
     case LAVFI_PIXEL_FORMAT_YUV422P8:  return AV_PIX_FMT_YUV422P;
     case LAVFI_PIXEL_FORMAT_YUV420P8:  return AV_PIX_FMT_YUV420P;
+    case LAVFI_PIXEL_FORMAT_YUVA444P8: return AV_PIX_FMT_YUVA444P;
+    case LAVFI_PIXEL_FORMAT_YUVA422P8: return AV_PIX_FMT_YUVA422P;
+    case LAVFI_PIXEL_FORMAT_YUVA420P8: return AV_PIX_FMT_YUVA420P;
     default:                           return AV_PIX_FMT_NONE;
     }
 }

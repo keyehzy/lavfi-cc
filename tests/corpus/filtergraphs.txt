@@ -43,6 +43,13 @@ format=yuv444p,lutyuv=y=val*1.05:u=val*0.95+6:v=val*0.95+6,hue=h=-8
 fps=30,eq=brightness=0.05:contrast=1.1,hue=s=1.2
 format=yuv420p,eq=brightness=0.06,crop=1280:720:0:0,hue=h=12:s=1.15,negate
 
+# --- The same grading on video that carries an alpha plane -------------------
+format=yuva420p,eq=contrast=1.1:brightness=0.03:saturation=1.2,hue=h=6:s=1.05
+format=yuva420p,lutyuv=y='clip(val,16,235)':a=val*0.9,negate=components=y+u+v,hue=s=1.1
+format=yuva422p,negate=components=y,eq=saturation=1.15,hue=h=12
+format=yuva444p,lutyuv=y=negval:u=negval:v=negval:a=negval,eq=contrast=1.2
+format=yuva420p,eq=brightness=0.06,crop=1280:720:0:0,hue=h=12:s=1.15,negate=components=a
+
 # --- RGB grading as it is actually written, now that curves, colorbalance, ---
 #     and colorcontrast lower
 format=rgba,curves=preset=vintage,colorbalance=rs=0.1:gm=-0.1:bh=0.15,format=yuv420p
@@ -61,11 +68,16 @@ format=rgba,eq=brightness=0.06:saturation=1.2,format=yuv420p
 format=rgba,hue=h=90:s=1.2,format=yuv420p
 format=yuv420p,lutrgb=r=val*1.2,eq=contrast=1.1
 format=rgba,negate,lutyuv=y=negval,format=yuv420p
+format=yuva420p,curves=preset=darker,negate
 
 # --- YUV options inside the subset that are still rejected -------------------
 format=yuv420p,eq=eval=frame:contrast=1.4,negate
 format=yuv420p,hue=h='2*PI*t',negate
 format=yuv420p,eq=contrast='1+0.1*n',hue=s=1.2
+# The alpha plane decides both of these: the first negates alpha here but not
+# in packed RGB, and the second names a component the format does not carry.
+format=yuva420p,negate=negate_alpha=1,negate
+format=yuv420p,negate=components=y+u+v+a,negate
 
 # --- Ordinary CPU transcodes with a little colour work -----------------------
 scale=1280:720:flags=bicubic,format=yuv420p
